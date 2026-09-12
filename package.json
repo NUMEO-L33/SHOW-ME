@@ -18,6 +18,7 @@
     "processor:test": "tsx --test processor/tests/**/*.test.ts",
     "client:test": "tsx --test lib/**/*.test.ts",
     "processor:typecheck": "tsc --project processor/tsconfig.json --noEmit",
+    "processor:gemini:smoke": "node --env-file-if-exists=processor/.env --import tsx processor/src/gemini/smoke.ts",
     "processor:db:generate": "drizzle-kit generate --config processor/drizzle.config.ts",
     "processor:db:migrate": "drizzle-kit migrate --config processor/drizzle.config.ts",
     "processor:deploy-build": "npm run install:ci && npm run processor:build",

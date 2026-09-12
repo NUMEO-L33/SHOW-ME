@@ -20,6 +20,13 @@ export class AnalysisContractError extends Error {
   constructor() { super("Invalid analysis contract."); }
 }
 
+/** A provider exposes only safe, persistable failure categories to the runner. */
+export class AnalysisProviderFailure extends Error {
+  constructor(readonly analysisCode: "AI_TIMEOUT" | "AI_INVALID_OUTPUT" | "AI_PROVIDER_FAILED", message: string) {
+    super(message);
+  }
+}
+
 const id = z.string().min(1).max(128);
 const plainText = (max: number) => z.string().trim().min(1).max(max)
   .refine((value) => !/[<>\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value));
@@ -199,7 +206,7 @@ export function draftFromAnalysis(document: DraftDocument, result: AnalysisOutpu
   };
 }
 
-/** No production adapter is registered in Gate 3A. Fake implementations live in tests. */
+/** Gemini is currently opt-in for synthetic smoke tests only; public APIs do not register it. */
 export interface AnalysisProvider {
   readonly name: string;
   readonly model: string;

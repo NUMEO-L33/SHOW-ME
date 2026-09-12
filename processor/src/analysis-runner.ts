@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { GuideRepository } from "./domain.js";
 import {
-  ANALYSIS_LIMITS, AnalysisContractError, analysisBatches, analysisManifest, parseAnalysisOutput,
+  ANALYSIS_LIMITS, AnalysisContractError, AnalysisProviderFailure, analysisBatches, analysisManifest, parseAnalysisOutput,
   type AnalysisOutput, type AnalysisProvider,
 } from "./analysis-contract.js";
 import type { AnalysisErrorCode } from "./analysis-state.js";
@@ -95,6 +95,7 @@ export async function executeAnalysisAttempt(options: {
   } catch (error) {
     const code = error instanceof AnalysisRunFailure ? error.code
       : error instanceof AnalysisContractError ? "AI_INVALID_OUTPUT"
+      : error instanceof AnalysisProviderFailure ? error.analysisCode
       : controller.signal.aborted ? "AI_TIMEOUT" : "AI_PROVIDER_FAILED";
     return repository.executeAnalysisCommand(guideId, { type: "fail", ...identity, errorCode: code });
   } finally {

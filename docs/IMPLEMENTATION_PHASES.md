@@ -44,12 +44,12 @@
 
 ## Gate 3 — AI 초안 생성 ⏭️
 
-- provider interface 뒤에서 OpenAI Vision structured output을 호출한다.
+- provider interface 뒤에서 Gemini 이미지 입력·구조화 출력을 호출한다(2026-09-12 사용자 선택).
 - 각 단계의 한국어 설명, 클릭 위치, 개인정보 후보를 percent 좌표로 반환한다.
 - schema validation, timeout, retry, 비용·프레임 상한을 적용한다.
 - AI 실패가 미디어 처리 결과나 원본을 손상시키지 않는다.
 
-진행 상황: **3A 계약·저장 기반 구현 및 로컬 검증 완료**. 입력/출력 검증, 별도 초안 revision, 분석 실행 소유권, JSON/PostgreSQL 저장 구현과 추가 migration, 테스트 전용 공급자를 통한 실행기가 있다. 실제 OpenAI 어댑터·유료 호출·분석 API·사용자 동의 화면·예산 집행·자동 dispatcher는 아직 연결하지 않았다. PostgreSQL 실환경 경합 검증도 남아 있으므로 Gate 3 전체 완료는 아니다. 자세한 범위는 [Gate 3A 체크포인트](GATE_3A_CHECKPOINT.md)를 참고한다.
+진행 상황: **3A 계약·저장 기반 완료, 3B-1 Gemini 어댑터와 가상 화면 시험 경로 구현**. `gemini-3.8-flash`의 입력/출력 검증, 제한된 재시도·타임아웃, 로컬 시험용 하루 10회 예약 한도를 추가했다. 기본 시험은 외부 통신을 하지 않으며 실제 호출은 키와 무료 등급 확인·가상 화면 전송 동의가 필요하다. 현재 키가 없어 실제 AI 응답은 미검증이다. 분석 API·제품 내 동의 화면·운영 예산·자동 dispatcher·PostgreSQL 실환경 경합 검증은 여전히 남아 있으므로 Gate 3 전체 완료는 아니다. [3A 기록](GATE_3A_CHECKPOINT.md), [Gemini 설정과 범위](GEMINI_SETUP.md)를 참고한다.
 
 ## Gate 4 — 서버 저장 편집기
 
