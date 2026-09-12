@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import type { AnalysisCommand, AnalysisState } from "./analysis-state.js";
 
 export const GUIDE_STATUSES = [
   "uploading",
@@ -233,6 +234,9 @@ export type CompleteProcessingAttemptInput = {
 };
 
 export interface GuideRepository {
+  /** Internal-only Gate 3A commands; callers must authenticate before exposing an API. */
+  executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null>;
+  getAnalysisState(guideId: string): Promise<AnalysisState | null>;
   createGuide(input: CreateGuideInput): Promise<Guide>;
   getGuideById(id: string): Promise<GuideWithSteps | null>;
   getGuideBySlug(slug: string): Promise<GuideWithSteps | null>;

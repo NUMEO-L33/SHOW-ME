@@ -6,6 +6,7 @@ import {
   jsonb,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -16,6 +17,8 @@ import {
   type GuideStatus,
   type SceneGraphElement,
 } from "../domain.js";
+import type { AnalysisRun } from "../analysis-state.js";
+import type { DraftDocument } from "../analysis-contract.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -91,6 +94,25 @@ export const guideSteps = pgTable(
     index("guide_steps_guide_id_idx").on(table.guideId),
   ],
 );
+
+export const guideDrafts = pgTable("guide_drafts", {
+  guideId: text("guide_id").primaryKey().references(() => guides.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  inputFingerprint: text("input_fingerprint").notNull(),
+  document: jsonb("document").$type<DraftDocument>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).notNull(),
+});
+
+export const analysisRuns = pgTable("analysis_runs", {
+  guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "cascade" }),
+  id: text("id").notNull(),
+  status: text("status").$type<AnalysisRun["status"]>().notNull(),
+  payload: jsonb("payload").$type<Omit<AnalysisRun, "id" | "status">>().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.guideId, table.id] }),
+  index("analysis_runs_guide_status_idx").on(table.guideId, table.status),
+]);
 
 export type GuideRow = typeof guides.$inferSelect;
 export type NewGuideRow = typeof guides.$inferInsert;

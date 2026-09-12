@@ -15,6 +15,13 @@
       "when": 1789124611249,
       "tag": "0001_fair_harrier",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789177083144,
+      "tag": "0002_analysis_foundation",
+      "breakpoints": true
     }
   ]
 }

@@ -27,6 +27,8 @@ import {
   type GuideWithSteps,
 } from "./domain.js";
 import {
+  analysisRuns,
+  guideDrafts,
   guideSteps,
   guides,
   type GuideRow,
@@ -35,6 +37,10 @@ import {
   type NewGuideStepRow,
 } from "./db/schema.js";
 import * as processorSchema from "./db/schema.js";
+import {
+  emptyAnalysisState, parseAnalysisState, transitionAnalysis,
+  type AnalysisCommand, type AnalysisState,
+} from "./analysis-state.js";
 
 const JSON_REPOSITORY_VERSION = 1 as const;
 const DEFAULT_LIST_LIMIT = 100;
@@ -44,6 +50,7 @@ type JsonRepositoryState = {
   version: typeof JSON_REPOSITORY_VERSION;
   guides: Guide[];
   steps: GuideStep[];
+  analysis: Array<{ guideId: string; state: AnalysisState }>;
 };
 
 export type ProcessorDatabase = NodePgDatabase<typeof processorSchema>;
@@ -68,7 +75,7 @@ export class GuideNotFoundError extends Error {
 }
 
 function emptyJsonState(): JsonRepositoryState {
-  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [] };
+  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [] };
 }
 
 function clone<T>(value: T): T {
@@ -428,6 +435,16 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   }
 
   const state = parsed as JsonRepositoryState;
+  // Additive upgrade of legacy v1 files; never silently discard malformed state.
+  if (state.analysis === undefined) state.analysis = [];
+  if (!Array.isArray(state.analysis) || state.analysis.some((entry) => !entry || typeof entry.guideId !== "string") ||
+      new Set(state.analysis.map((entry) => entry.guideId)).size !== state.analysis.length) {
+    throw new RepositoryDataError("Invalid persisted analysis state.");
+  }
+  state.analysis = state.analysis.map((entry) => {
+    if (!state.guides.some((guide) => guide.id === entry.guideId)) throw new RepositoryDataError("Orphaned analysis state.");
+    return { guideId: entry.guideId, state: parseAnalysisState(entry.state) };
+  });
   if (state.guides.some((guide) => !isGuideStatus(guide.status))) {
     throw new RepositoryDataError(`JSON repository at ${filePath} contains an invalid guide status.`);
   }
@@ -502,6 +519,29 @@ export class JsonGuideRepository implements GuideRepository {
       await handle?.close().catch(() => undefined);
       await rm(temporaryPath, { force: true }).catch(() => undefined);
     }
+  }
+
+  async getAnalysisState(guideId: string): Promise<AnalysisState | null> {
+    return this.serialize(async () => {
+      const state = await this.readState();
+      if (!state.guides.some((guide) => guide.id === guideId)) return null;
+      return clone(state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState());
+    });
+  }
+
+  async executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null> {
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const guide = state.guides.find((candidate) => candidate.id === guideId);
+      if (!guide) return null;
+      const previous = state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState();
+      const next = transitionAnalysis({ ...guide, steps: state.steps.filter((step) => step.guideId === guideId) }, previous, command);
+      if (!next) return null;
+      const validated = parseAnalysisState(next);
+      state.analysis = [...state.analysis.filter((entry) => entry.guideId !== guideId), { guideId, state: validated }];
+      await this.writeState(state);
+      return clone(validated);
+    });
   }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {
@@ -712,6 +752,7 @@ export class JsonGuideRepository implements GuideRepository {
 
       state.guides = state.guides.filter((candidate) => candidate.id !== guideId);
       state.steps = state.steps.filter((step) => step.guideId !== guideId);
+      state.analysis = state.analysis.filter((entry) => entry.guideId !== guideId);
       await this.writeState(state);
       return true;
     });
@@ -855,6 +896,47 @@ export class PostgresGuideRepository implements GuideRepository {
 
   async close(): Promise<void> {
     await this.closeDatabase?.();
+  }
+
+  private async analysisTransaction(guideId: string, command?: AnalysisCommand): Promise<AnalysisState | null> {
+    return this.database.transaction(async (transaction) => {
+      // Same parent lock as media completion and deletion: no check/write gap.
+      const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for(command ? "update" : "share");
+      if (!guide) return null;
+      const [draft] = await transaction.select().from(guideDrafts).where(eq(guideDrafts.guideId, guideId)).limit(1);
+      const runs = await transaction.select().from(analysisRuns).where(eq(analysisRuns.guideId, guideId));
+      const previous = parseAnalysisState({
+        draft: draft ? {
+          revision: draft.revision, inputFingerprint: draft.inputFingerprint, document: draft.document,
+          createdAt: draft.createdAt.toISOString(), updatedAt: draft.updatedAt.toISOString(),
+        } : null,
+        runs: runs.map((run) => ({ ...run.payload, id: run.id, status: run.status })),
+      });
+      if (!command) return previous;
+      const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const next = transitionAnalysis({ ...guideFromRow(guide), steps: steps.map(stepFromRow) }, previous, command);
+      if (!next) return null;
+      const validated = parseAnalysisState(next);
+      if (validated.draft && JSON.stringify(validated.draft) !== JSON.stringify(previous.draft)) {
+        const values = {
+          ...validated.draft, guideId,
+          createdAt: new Date(validated.draft.createdAt), updatedAt: new Date(validated.draft.updatedAt),
+        };
+        await transaction.insert(guideDrafts).values(values).onConflictDoUpdate({ target: guideDrafts.guideId, set: values });
+      }
+      for (const run of validated.runs) {
+        if (JSON.stringify(run) === JSON.stringify(previous.runs.find((candidate) => candidate.id === run.id))) continue;
+        const { id, status, ...payload } = run;
+        await transaction.insert(analysisRuns).values({ guideId, id, status, payload })
+          .onConflictDoUpdate({ target: [analysisRuns.guideId, analysisRuns.id], set: { status, payload } });
+      }
+      return validated;
+    });
+  }
+
+  getAnalysisState(guideId: string): Promise<AnalysisState | null> { return this.analysisTransaction(guideId); }
+  executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null> {
+    return this.analysisTransaction(guideId, command);
   }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {
