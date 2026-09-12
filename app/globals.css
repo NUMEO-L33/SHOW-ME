@@ -116,6 +116,11 @@ button:focus-visible, [role="button"]:focus-visible, a:focus-visible {
   min-width: 148px;
 }
 
+.viewer-landscape {
+  width: min(96%, 680px);
+  min-width: 240px;
+}
+
 @keyframes tap-pulse {
   0% { transform: scale(.72); opacity: 0; }
   30% { opacity: 1; }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   BadgeCheck,
@@ -33,6 +33,7 @@ import { toast } from "sonner";
 
 import { GuideScreen } from "@/components/guide-screen";
 import { PublicGuide } from "@/components/public-guide";
+import { ScreenRecorder } from "@/components/screen-recorder";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -49,9 +50,103 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Toaster } from "@/components/ui/sonner";
 import { GUIDE_TITLE, INITIAL_GUIDE_STEPS, type GuideStep } from "@/lib/showme-data";
+import {
+  configuredProcessorUrl,
+  createGuide,
+  createUploadIdentity,
+  deleteGuide,
+  getGuide,
+  persistRecoverableCredentials,
+  ProcessorClientError,
+  RECOVERABLE_CREDENTIAL_KEY_PREFIX,
+  recoverableCredentialKey,
+  retryGuide,
+} from "@/lib/processor-client";
 
 type AppMode = "upload" | "processing" | "review" | "viewer" | "published";
 type SaveState = "saved" | "saving";
+type StartRequest = { kind: "sample" } | { kind: "video"; file: File };
+type ActiveJob = {
+  guideId: string;
+  editToken: string;
+  baseUrl: string;
+  phase: "uploading" | "processing" | "failed" | "deleting";
+  startedAt: number;
+  deletionMissingGraceUntil?: number;
+};
+const LEGACY_ACTIVE_JOB_STORAGE_KEY = "showme:active-processing-job";
+const ACTIVE_JOB_SESSION_KEY = "showme:active-processing-guide-id";
+const UPLOAD_RECOVERY_GRACE_MS = 20 * 60_000;
+
+type PersistedActiveJob = ActiveJob & { fileName: string };
+
+function parsePersistedActiveJob(value: string | null): PersistedActiveJob | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PersistedActiveJob>;
+    if (
+      typeof parsed.guideId !== "string" ||
+      typeof parsed.editToken !== "string" ||
+      typeof parsed.baseUrl !== "string"
+    ) return null;
+    return {
+      guideId: parsed.guideId,
+      editToken: parsed.editToken,
+      baseUrl: parsed.baseUrl,
+      phase: parsed.phase === "deleting" ? "deleting" : parsed.phase === "uploading" ? "uploading" : parsed.phase === "failed" ? "failed" : "processing",
+      startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : Date.now() - UPLOAD_RECOVERY_GRACE_MS,
+      deletionMissingGraceUntil: typeof parsed.deletionMissingGraceUntil === "number" ? parsed.deletionMissingGraceUntil : undefined,
+      fileName: typeof parsed.fileName === "string" ? parsed.fileName : "화면 녹화 영상",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveJob(job: ActiveJob, fileName: string): void {
+  persistRecoverableCredentials(
+    window.localStorage,
+    recoverableCredentialKey(job.guideId),
+    JSON.stringify({ ...job, fileName }),
+  );
+  try { window.sessionStorage.setItem(ACTIVE_JOB_SESSION_KEY, job.guideId); } catch { /* local recovery remains available */ }
+}
+
+function clearActiveJobCredentials(guideId: string): void {
+  try { window.localStorage.removeItem(recoverableCredentialKey(guideId)); } catch { /* no-op */ }
+  try {
+    if (window.sessionStorage.getItem(ACTIVE_JOB_SESSION_KEY) === guideId) {
+      window.sessionStorage.removeItem(ACTIVE_JOB_SESSION_KEY);
+    }
+  } catch { /* no-op */ }
+}
+
+function recoverActiveJob(): PersistedActiveJob | null {
+  let preferredGuideId: string | null = null;
+  try { preferredGuideId = window.sessionStorage.getItem(ACTIVE_JOB_SESSION_KEY); } catch { /* scan durable jobs */ }
+  if (preferredGuideId) {
+    const preferred = parsePersistedActiveJob(
+      window.localStorage.getItem(recoverableCredentialKey(preferredGuideId)),
+    );
+    if (preferred) return preferred;
+  }
+
+  const candidates: PersistedActiveJob[] = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (!key?.startsWith(RECOVERABLE_CREDENTIAL_KEY_PREFIX)) continue;
+    const candidate = parsePersistedActiveJob(window.localStorage.getItem(key));
+    if (candidate) candidates.push(candidate);
+  }
+  candidates.sort((left, right) => right.startedAt - left.startedAt);
+  if (candidates[0]) return candidates[0];
+
+  const legacy = parsePersistedActiveJob(window.localStorage.getItem(LEGACY_ACTIVE_JOB_STORAGE_KEY));
+  if (!legacy) return null;
+  persistActiveJob(legacy, legacy.fileName);
+  window.localStorage.removeItem(LEGACY_ACTIVE_JOB_STORAGE_KEY);
+  return legacy;
+}
 
 function Logo({ compact = false }: { compact?: boolean }) {
   return (
@@ -68,7 +163,7 @@ function formatFileSize(bytes: number) {
   return `${Math.max(0.1, bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
-function UploadScreen({ onStart }: { onStart: (name: string) => void }) {
+function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -94,7 +189,7 @@ function UploadScreen({ onStart }: { onStart: (name: string) => void }) {
         <div className="flex items-center gap-3">
           <button
             className="hidden h-10 items-center gap-2 rounded-full px-4 text-sm font-extrabold text-[#526078] transition-colors hover:bg-white sm:flex"
-            onClick={() => onStart("showme-example.mp4")}
+            onClick={() => onStart({ kind: "sample" })}
           >
             <Eye className="size-4" />
             예시로 둘러보기
@@ -168,10 +263,19 @@ function UploadScreen({ onStart }: { onStart: (name: string) => void }) {
                 </>
               )}
             </div>
+            <div className="mt-3">
+              <ScreenRecorder
+                onRecorded={(recordedFile) => {
+                  chooseFile(recordedFile);
+                  toast.success("화면 녹화를 마쳤어요. 영상을 확인한 뒤 가이드를 만들어 주세요.");
+                }}
+                onError={(message) => toast.error(message)}
+              />
+            </div>
             {!file && (
               <button
                 className="mx-auto mt-3 block min-h-11 px-3 text-sm font-extrabold text-[#5069d9] underline decoration-[#bfc8f3] underline-offset-4 sm:hidden"
-                onClick={() => onStart("showme-example.mp4")}
+                onClick={() => onStart({ kind: "sample" })}
               >
                 예시 화면으로 둘러보기
               </button>
@@ -185,7 +289,7 @@ function UploadScreen({ onStart }: { onStart: (name: string) => void }) {
                 size="lg"
                 disabled={!file}
                 className="h-12 rounded-[14px] px-6 text-[15px] font-extrabold shadow-[0_10px_24px_rgba(255,105,78,.22)]"
-                onClick={() => file && onStart(file.name)}
+                onClick={() => file && onStart({ kind: "video", file })}
               >
                 가이드 만들기
                 <ArrowRight className="size-4" />
@@ -230,7 +334,25 @@ const PROCESSING_STEPS = [
   { label: "개인정보 가림 준비", threshold: 82 },
 ];
 
-function ProcessingScreen({ progress, fileName, onCancel }: { progress: number; fileName: string; onCancel: () => void }) {
+function ProcessingScreen({
+  progress,
+  fileName,
+  statusMessage,
+  errorMessage,
+  onCancel,
+  onRetry,
+  retrying = false,
+  cancelLabel = "다른 영상 선택",
+}: {
+  progress: number;
+  fileName: string;
+  statusMessage?: string;
+  errorMessage?: string | null;
+  onCancel: () => void;
+  onRetry?: () => void;
+  retrying?: boolean;
+  cancelLabel?: string;
+}) {
   const activeIndex = Math.min(PROCESSING_STEPS.length - 1, PROCESSING_STEPS.filter((item) => progress >= item.threshold).length);
 
   return (
@@ -245,17 +367,27 @@ function ProcessingScreen({ progress, fileName, onCancel }: { progress: number; 
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-bold text-[#758097]">{fileName}</p>
-              <h1 className="mt-1 text-[clamp(1.65rem,5vw,2.25rem)] font-black tracking-[-0.045em]">AI가 화면을 살펴보고 있어요</h1>
-              <p className="mt-2 text-[15px] font-medium leading-6 text-muted-foreground">창을 닫아도 작업은 이어집니다. 보통 1분 안에 끝나요.</p>
+              <h1 className="mt-1 text-[clamp(1.65rem,5vw,2.25rem)] font-black tracking-[-0.045em]">
+                {errorMessage ? "영상을 처리하지 못했어요" : "화면 녹화를 단계로 나누고 있어요"}
+              </h1>
+              <p className="mt-2 text-[15px] font-medium leading-6 text-muted-foreground">
+                {errorMessage ?? statusMessage ?? "업로드 뒤에는 창을 닫아도 서버에서 처리가 이어집니다."}
+              </p>
             </div>
           </div>
 
           <div className="py-7">
             <div className="mb-3 flex items-end justify-between"><p className="text-sm font-extrabold text-[#4f5a71]">전체 진행</p><p className="text-2xl font-black tabular-nums text-[#4f6df5]">{Math.round(progress)}%</p></div>
-            <Progress value={progress} className="h-3 bg-[#e8ebf5] [&_[data-slot=progress-indicator]]:bg-[#4f6df5]" aria-label={`가이드 생성 ${Math.round(progress)}%`} />
+            <Progress value={progress} className={`h-3 bg-[#e8ebf5] ${errorMessage ? "[&_[data-slot=progress-indicator]]:bg-[#d75c4d]" : "[&_[data-slot=progress-indicator]]:bg-[#4f6df5]"}`} aria-label={`가이드 생성 ${Math.round(progress)}%`} />
           </div>
 
-          <div className="space-y-2.5" aria-live="polite">
+          {errorMessage ? (
+            <div className="rounded-[16px] border border-[#f0cdc7] bg-[#fff7f5] p-4 text-sm font-semibold leading-6 text-[#854a40]" role="alert">
+              {onRetry
+                ? "원본 영상은 7일간 보관돼요. 같은 파일을 다시 올리지 않고 처리를 재시도할 수 있습니다."
+                : "영상 선택 화면으로 돌아가 파일과 연결 상태를 확인해 주세요."}
+            </div>
+          ) : <div className="space-y-2.5" aria-live="polite">
             {PROCESSING_STEPS.map((item, index) => {
               const done = index < activeIndex || progress >= 100;
               const active = index === activeIndex && progress < 100;
@@ -270,11 +402,14 @@ function ProcessingScreen({ progress, fileName, onCancel }: { progress: number; 
                 </div>
               );
             })}
-          </div>
+          </div>}
 
           <div className="mt-7 flex items-center justify-between rounded-[16px] bg-[#f6f7fa] px-4 py-3 text-sm">
-            <p className="flex items-center gap-2 font-semibold text-[#6e788d]"><Clock3 className="size-4" />남은 시간 약 {progress > 78 ? "10초" : progress > 42 ? "25초" : "45초"}</p>
-            <button className="font-extrabold text-[#68738b] hover:text-[#172033]" onClick={onCancel}>다른 영상 선택</button>
+            <p className="flex items-center gap-2 font-semibold text-[#6e788d]"><Clock3 className="size-4" />{errorMessage ? "처리 기록을 안전하게 남겼어요" : `진행률 ${Math.round(progress)}%`}</p>
+            <div className="flex items-center gap-3">
+              {errorMessage && onRetry && <button className="font-extrabold text-primary hover:text-[#d94f38] disabled:opacity-50" onClick={onRetry} disabled={retrying}>{retrying ? "다시 준비 중" : "다시 시도"}</button>}
+              <button className="font-extrabold text-[#68738b] hover:text-[#172033]" onClick={onCancel}>{cancelLabel}</button>
+            </div>
           </div>
         </div>
       </section>
@@ -291,16 +426,21 @@ type ReviewScreenProps = {
   setActiveIndex: (index: number) => void;
   onPreview: () => void;
   onPublished: () => void;
+  onDeleteDraft?: () => void;
+  isLiveDraft: boolean;
+  onFrameError?: () => void;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [privacyConfirmed, setPrivacyConfirmed] = useState(false);
   const [shareOriginal, setShareOriginal] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeStep = steps[activeIndex] ?? steps[0];
+  const isLandscapeFrame = Boolean(activeStep.frameWidth && activeStep.frameHeight && activeStep.frameWidth > activeStep.frameHeight);
   const enabledMasks = steps.reduce((sum, step) => sum + (step.privacyEnabled ? step.privacyCount : 0), 0);
   const disabledMasks = steps.reduce((sum, step) => sum + (!step.privacyEnabled ? step.privacyCount : 0), 0);
 
@@ -369,6 +509,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
   };
 
   const regenerate = () => {
+    if (isLiveDraft) return;
     setRegenerating(true);
     setTimeout(() => {
       const rewritten: Record<GuideStep["screen"], string> = {
@@ -377,6 +518,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
         recipient: "은행을 고른 뒤, 받는 분 계좌번호를 입력하세요.",
         amount: "보낼 금액을 입력하고 화면 아래 ‘다음’을 누르세요.",
         confirm: "받는 분과 금액이 맞으면 ‘이체하기’를 누르세요.",
+        frame: "표시된 화면을 확인하고 다음 동작을 진행하세요.",
       };
       updateActiveStep({ instruction: rewritten[activeStep.screen] });
       setRegenerating(false);
@@ -400,10 +542,33 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           </div>
           <div className="ml-auto flex items-center gap-2">
             <span className="hidden items-center gap-1.5 px-2 text-xs font-bold text-[#748096] md:flex" aria-live="polite">
-              {saveState === "saving" ? <><LoaderCircle className="size-3.5 animate-spin" />저장 중</> : <><CheckCircle2 className="size-3.5 text-[#2f876b]" />저장됨</>}
+              {isLiveDraft
+                ? <><Clock3 className="size-3.5 text-[#7a6a45]" />편집 저장 연결 전</>
+                : saveState === "saving" ? <><LoaderCircle className="size-3.5 animate-spin" />저장 중</> : <><CheckCircle2 className="size-3.5 text-[#2f876b]" />저장됨</>}
             </span>
+            {isLiveDraft && onDeleteDraft && (
+              <Button
+                variant="ghost"
+                className="h-10 rounded-[12px] px-3 font-extrabold text-[#a7463a] hover:bg-[#fff1ef] hover:text-[#92382e]"
+                onClick={() => setDeleteOpen(true)}
+              >
+                <Trash2 className="size-4" /><span className="hidden lg:inline">전체 삭제</span>
+              </Button>
+            )}
             <Button variant="outline" className="h-10 rounded-[12px] border-[#dce1ea] px-3 font-extrabold sm:px-4" onClick={onPreview}><Eye className="size-4" /><span className="hidden sm:inline">받는 화면</span></Button>
-            <Button className="h-10 rounded-[12px] px-4 font-extrabold shadow-[0_8px_20px_rgba(255,105,78,.2)]" onClick={() => { setPrivacyConfirmed(false); setPublishOpen(true); }}>공개하기<ArrowRight className="size-4" /></Button>
+            <Button
+              className="h-10 rounded-[12px] px-4 font-extrabold shadow-[0_8px_20px_rgba(255,105,78,.2)]"
+              onClick={() => {
+                if (isLiveDraft) {
+                  toast.info("개인정보 영구 가림과 서버 저장을 연결한 뒤 공개할 수 있어요.");
+                  return;
+                }
+                setPrivacyConfirmed(false);
+                setPublishOpen(true);
+              }}
+            >
+              {isLiveDraft ? "공개 준비 중" : "공개하기"}<ArrowRight className="size-4" />
+            </Button>
           </div>
         </div>
       </header>
@@ -419,7 +584,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
                 className={`group flex min-w-[188px] items-center gap-3 rounded-[15px] border p-2 text-left transition-all lg:min-w-0 lg:w-full ${index === activeIndex ? "border-[#cfd6ff] bg-[#f3f5ff] shadow-[0_5px_15px_rgba(65,83,155,.08)]" : "border-transparent hover:border-[#e5e8ef] hover:bg-[#fafbfc]"}`}
                 onClick={() => setActiveIndex(index)}
               >
-                <span className="relative w-11 shrink-0 overflow-hidden rounded-[9px] bg-[#172033] p-1"><GuideScreen step={step} compact showTarget={false} /></span>
+                <span className="relative w-11 shrink-0 overflow-hidden rounded-[9px] bg-[#172033] p-1"><GuideScreen step={step} compact showTarget={false} onFrameError={onFrameError} /></span>
                 <span className="min-w-0 flex-1">
                   <span className={`text-[11px] font-black ${index === activeIndex ? "text-[#4f6df5]" : "text-[#8992a4]"}`}>{index + 1}단계</span>
                   <span className="mt-0.5 block truncate text-[13px] font-extrabold text-[#303a50]">{step.shortLabel}</span>
@@ -429,16 +594,24 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
             ))}
           </div>
           <div className="mx-4 my-4 hidden rounded-[15px] bg-[#f5f7fa] p-3 lg:block">
-            <p className="flex items-center gap-1.5 text-xs font-extrabold text-[#5e6980]"><Sparkles className="size-3.5 text-[#4f6df5]" />AI가 초안을 만들었어요</p>
-            <p className="mt-1.5 text-[11px] font-semibold leading-4 text-[#8992a4]">고칠 곳만 확인하면 됩니다.</p>
+            <p className="flex items-center gap-1.5 text-xs font-extrabold text-[#5e6980]"><Sparkles className="size-3.5 text-[#4f6df5]" />{isLiveDraft ? "영상에서 화면을 추출했어요" : "예시 가이드 초안"}</p>
+            <p className="mt-1.5 text-xs font-semibold leading-5 text-[#8992a4]">{isLiveDraft ? "설명과 누를 위치는 임시 표시예요. AI 분석은 아직 적용되지 않았어요." : "예시로 검토 흐름을 체험해 보세요."}</p>
+            {isLiveDraft && <p className="mt-2 text-[11px] font-semibold leading-4 text-[#8a6a63]">미공개 초안과 원본은 7일 뒤 자동 삭제돼요.</p>}
           </div>
         </aside>
 
         <section className="min-w-0 bg-[#eef1f6] px-4 py-5 sm:px-6 lg:py-7">
           <div className="mx-auto flex h-full max-w-[800px] flex-col">
+            {isLiveDraft && (
+              <p role="note" className="mb-3 rounded-xl border border-[#e3d6ad] bg-[#fffbeb] p-3 text-sm font-semibold leading-6 text-[#786238]">
+                화면 추출 결과를 확인하는 단계예요. 설명·누를 위치·개인정보는 아직 분석하지 않았으며, 지금 수정한 내용은 새로고침하면 사라져요.
+              </p>
+            )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <span className="rounded-full bg-white px-3 py-1.5 text-xs font-extrabold text-[#69748b] shadow-sm">휴대폰 화면 · 세로</span>
+                <span className="rounded-full bg-white px-3 py-1.5 text-xs font-extrabold text-[#69748b] shadow-sm">
+                  {isLandscapeFrame ? "PC 화면 · 가로" : "휴대폰 화면 · 세로"}
+                </span>
                 <span className="hidden items-center gap-1.5 rounded-full bg-[#e6f4ee] px-3 py-1.5 text-xs font-extrabold text-[#287a61] sm:flex"><ShieldCheck className="size-3.5" />개인정보 확인 가능</span>
               </div>
               <p className="text-xs font-bold text-[#7c869a]">화면을 눌러 표시 위치를 옮기세요</p>
@@ -448,14 +621,14 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
               <div className="pointer-events-none absolute inset-0 opacity-20 [background-image:linear-gradient(rgba(255,255,255,.07)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.07)_1px,transparent_1px)] [background-size:32px_32px]" />
               <div className="absolute left-5 top-4 flex items-center gap-2 rounded-full bg-white/10 px-3 py-1.5 text-[11px] font-bold text-white/70 backdrop-blur"><MousePointerClick className="size-3.5" />누를 곳</div>
               <div
-                className="relative w-[min(68%,282px)] cursor-crosshair rounded-[8%]"
+                className={`relative cursor-crosshair rounded-[8%] ${isLandscapeFrame ? "w-[min(94%,720px)]" : "w-[min(68%,282px)]"}`}
                 onPointerDown={moveTarget}
                 onKeyDown={moveTargetByKey}
                 role="button"
                 tabIndex={0}
                 aria-label="누를 위치 옮기기. 방향키로 1퍼센트씩 이동"
               >
-                <GuideScreen step={activeStep} />
+                <GuideScreen step={activeStep} onFrameError={onFrameError} />
               </div>
               {regenerating && (
                 <div className="absolute inset-0 grid place-items-center bg-[#111827]/75 backdrop-blur-sm" aria-live="polite">
@@ -486,8 +659,10 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           </div>
 
           <div className="border-b border-[#e8ebf1] px-5 py-5">
-            <div className="flex items-center justify-between"><div><p className="flex items-center gap-1.5 text-sm font-black"><LockKeyhole className="size-4 text-[#74539b]" />개인정보 가림</p><p className="mt-1 text-xs font-semibold text-[#8b94a6]">이 단계에서 {activeStep.privacyCount}곳 발견</p></div><span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${activeStep.privacyEnabled ? "bg-[#ece8f5] text-[#6c4b91]" : "bg-[#fff0ed] text-[#bc503c]"}`}>{activeStep.privacyEnabled ? "적용 중" : "가림 해제"}</span></div>
-            {activeStep.privacyCount > 0 ? (
+            <div className="flex items-center justify-between"><div><p className="flex items-center gap-1.5 text-sm font-black"><LockKeyhole className="size-4 text-[#74539b]" />개인정보 가림</p><p className="mt-1 text-xs font-semibold text-[#8b94a6]">{isLiveDraft ? "개인정보 탐지·가림 준비 중" : `이 단계에서 ${activeStep.privacyCount}곳 발견`}</p></div>{!isLiveDraft && <span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${activeStep.privacyEnabled ? "bg-[#ece8f5] text-[#6c4b91]" : "bg-[#fff0ed] text-[#bc503c]"}`}>{activeStep.privacyEnabled ? "적용 중" : "가림 해제"}</span>}</div>
+            {isLiveDraft ? (
+              <p className="mt-4 rounded-[14px] bg-[#fff8ed] p-3.5 text-sm font-semibold leading-6 text-[#84653e]">현재 화면에는 개인정보가 가려져 있지 않아요. 탐지와 영구 가림을 연결한 뒤 공개할 수 있어요.</p>
+            ) : activeStep.privacyCount > 0 ? (
               <div className="mt-4 flex items-center justify-between rounded-[14px] border border-[#e5e0ee] bg-[#faf8fd] p-3.5">
                 <div><p className="text-[13px] font-extrabold text-[#423651]">계좌 정보 가리기</p><p className="mt-0.5 text-[11px] font-semibold text-[#897b99]">게시 이미지에 영구 적용</p></div>
                 <Switch checked={activeStep.privacyEnabled} onCheckedChange={(checked) => updateActiveStep({ privacyEnabled: checked }, true)} aria-label="계좌 정보 가리기" className="data-[state=checked]:bg-[#76549d]" />
@@ -495,11 +670,11 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
             ) : (
               <div className="mt-4 flex items-center gap-2.5 rounded-[14px] bg-[#f5f7fa] p-3.5 text-xs font-semibold text-[#768197]"><BadgeCheck className="size-4 text-[#2b8568]" />개인정보로 보이는 내용이 없어요.</div>
             )}
-            <Button variant="outline" className="mt-3 h-10 w-full rounded-[12px] border-dashed border-[#cfc5dc] font-extrabold text-[#6f538e]" onClick={() => updateActiveStep({ privacyCount: activeStep.privacyCount + 1, privacyEnabled: true }, true)}><Plus className="size-4" />가림 영역 추가</Button>
+            <Button variant="outline" disabled={isLiveDraft} className="mt-3 h-10 w-full rounded-[12px] border-dashed border-[#cfc5dc] font-extrabold text-[#6f538e]" onClick={() => updateActiveStep({ privacyCount: activeStep.privacyCount + 1, privacyEnabled: true }, true)}><Plus className="size-4" />{isLiveDraft ? "가림 영역 편집 준비 중" : "가림 영역 추가"}</Button>
           </div>
 
           <div className="space-y-2 px-5 py-5">
-            <Button variant="outline" className="h-11 w-full justify-start rounded-[12px] border-[#dfe3eb] font-extrabold" onClick={regenerate} disabled={regenerating}><RefreshCcw className="size-4 text-[#4f6df5]" />이 단계 다시 만들기</Button>
+            <Button variant="outline" className="h-11 w-full justify-start rounded-[12px] border-[#dfe3eb] font-extrabold" onClick={regenerate} disabled={isLiveDraft || regenerating}><RefreshCcw className="size-4 text-[#4f6df5]" />{isLiveDraft ? "AI 설명 생성 준비 중" : "이 단계 다시 만들기"}</Button>
             <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#626d82]" onClick={mergeStep} disabled={activeIndex === 0}><GitMerge className="size-4" />이전 단계와 합치기</Button>
             <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#b64444] hover:bg-[#fff1f1] hover:text-[#a73838]" onClick={removeStep} disabled={steps.length <= 1}><Trash2 className="size-4" />이 단계 삭제</Button>
           </div>
@@ -547,6 +722,24 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <DialogContent className="max-w-[460px] rounded-[22px]">
+          <DialogHeader>
+            <DialogTitle>이 영상 초안을 모두 삭제할까요?</DialogTitle>
+            <DialogDescription>원본 영상과 추출한 모든 화면이 삭제되며 되돌릴 수 없습니다.</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setDeleteOpen(false)}>취소</Button>
+            <Button
+              className="bg-[#b94b3d] text-white hover:bg-[#9f3e33]"
+              onClick={() => { setDeleteOpen(false); onDeleteDraft?.(); }}
+            >
+              원본과 초안 삭제
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </main>
   );
 }
@@ -555,10 +748,13 @@ function PublishedScreen({ title, onOpenGuide, onBackToEdit }: { title: string; 
   const [baseUrl, setBaseUrl] = useState("");
   const publicPath = "/g/mobile-bank-7k2m";
 
-  useEffect(() => setBaseUrl(window.location.origin), []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setBaseUrl(window.location.origin), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const publicLink = `${baseUrl}${publicPath}`;
-  const editLink = `${baseUrl}/?edit=sk_live_x7m2p9`;
+  const editLink = `${baseUrl}/?edit=demo_edit_x7m2p9`;
   const copyLink = async (value: string, message: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -602,7 +798,7 @@ function PublishedScreen({ title, onOpenGuide, onBackToEdit }: { title: string; 
 
         <div className="mt-4 rounded-[22px] border border-[#e7e2ef] bg-[#fcfaff] p-5">
           <div className="flex items-start gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#eee9f5] text-[#725295]"><LockKeyhole className="size-4" /></span><div><p className="text-sm font-black text-[#4a3b5a]">내 편집 링크</p><p className="mt-1 text-xs font-semibold leading-5 text-[#847690]">이 링크가 있으면 다시 편집할 수 있어요. 다른 사람에게 보내지 마세요.</p></div></div>
-          <div className="mt-4 flex items-center gap-2 rounded-[13px] bg-white p-2 pl-3"><p className="min-w-0 flex-1 truncate text-xs font-bold text-[#756a80]">{editLink || "/?edit=sk_live_x7m2p9"}</p><Button variant="ghost" size="icon-sm" onClick={() => copyLink(editLink, "내 편집 링크를 복사했어요.")} aria-label="내 편집 링크 복사"><Copy className="size-3.5" /></Button></div>
+          <div className="mt-4 flex items-center gap-2 rounded-[13px] bg-white p-2 pl-3"><p className="min-w-0 flex-1 truncate text-xs font-bold text-[#756a80]">{editLink || "/?edit=demo_edit_x7m2p9"}</p><Button variant="ghost" size="icon-sm" onClick={() => copyLink(editLink, "내 편집 링크를 복사했어요.")} aria-label="내 편집 링크 복사"><Copy className="size-3.5" /></Button></div>
         </div>
       </section>
     </main>
@@ -612,16 +808,39 @@ function PublishedScreen({ title, onOpenGuide, onBackToEdit }: { title: string; 
 export default function Home() {
   const [mode, setMode] = useState<AppMode>("upload");
   const [progress, setProgress] = useState(0);
+  const [processingKind, setProcessingKind] = useState<"sample" | "video">("sample");
+  const [processingMessage, setProcessingMessage] = useState<string>();
+  const [processingError, setProcessingError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [processingRetryable, setProcessingRetryable] = useState(false);
+  const [activeJob, setActiveJob] = useState<ActiveJob | null>(null);
   const [fileName, setFileName] = useState("screen-recording.mp4");
   const [title, setTitle] = useState(GUIDE_TITLE);
   const [steps, setSteps] = useState<GuideStep[]>(INITIAL_GUIDE_STEPS);
   const [activeIndex, setActiveIndex] = useState(0);
   const previousMode = useRef<AppMode>("review");
   const stepsRef = useRef(steps);
-  stepsRef.current = steps;
+  const activeJobRef = useRef(activeJob);
+  const processingErrorRef = useRef(processingError);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const retryAbortRef = useRef<AbortController | null>(null);
+  const refreshingAssetsRef = useRef(false);
+  const lastAssetRefreshAtRef = useRef(0);
 
   useEffect(() => {
-    if (mode !== "processing") return;
+    stepsRef.current = steps;
+  }, [steps]);
+
+  useEffect(() => {
+    activeJobRef.current = activeJob;
+  }, [activeJob]);
+
+  useEffect(() => {
+    processingErrorRef.current = processingError;
+  }, [processingError]);
+
+  useEffect(() => {
+    if (mode !== "processing" || processingKind !== "sample") return;
     const milestones = [
       { after: 350, value: 18 },
       { after: 900, value: 37 },
@@ -633,7 +852,207 @@ export default function Home() {
     const timers = milestones.map(({ after, value }) => setTimeout(() => setProgress(value), after));
     const finish = setTimeout(() => { setMode("review"); toast.success("가이드 초안이 완성됐어요."); }, 4250);
     return () => { timers.forEach(clearTimeout); clearTimeout(finish); };
-  }, [mode]);
+  }, [mode, processingKind]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const parsed = recoverActiveJob();
+        if (!parsed) return;
+        const restoredFileName = parsed.fileName;
+        const restoredJob: ActiveJob = {
+          guideId: parsed.guideId,
+          editToken: parsed.editToken,
+          baseUrl: parsed.baseUrl,
+          phase: parsed.phase === "deleting" ? "deleting" : "processing",
+          startedAt: parsed.startedAt,
+          deletionMissingGraceUntil: parsed.deletionMissingGraceUntil,
+        };
+        if (parsed.phase === "uploading") {
+          // The File object cannot survive a reload. Grant exactly one fresh
+          // reconciliation window, then persist the normalized phase so later
+          // reloads cannot renew that grace indefinitely.
+          restoredJob.startedAt = Date.now();
+          try { persistActiveJob(restoredJob, restoredFileName); } catch { /* original credential remains */ }
+        } else {
+          try { window.sessionStorage.setItem(ACTIVE_JOB_SESSION_KEY, restoredJob.guideId); } catch { /* no-op */ }
+        }
+        setFileName(restoredFileName);
+        setProcessingKind("video");
+        setProcessingMessage("이전에 올린 영상의 처리 상태를 확인하고 있어요.");
+        setProgress(12);
+        setActiveJob(restoredJob);
+        setMode("processing");
+      } catch { /* browser storage can be unavailable */ }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (mode !== "processing" || processingKind !== "video" || !activeJob || activeJob.phase !== "deleting") return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+    let pendingChecks = 0;
+    const requestAbort = new AbortController();
+
+    const remove = async () => {
+      try {
+        const result = await deleteGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, requestAbort.signal);
+        if (stopped) return;
+        failures = 0;
+        if (result.missing && Date.now() < (activeJob.deletionMissingGraceUntil ?? 0)) {
+          setProcessingMessage("업로드 취소가 서버에 반영됐는지 다시 확인하고 있어요.");
+          timer = setTimeout(remove, 1_500);
+          return;
+        }
+        if (!result.pending) {
+          clearActiveJobCredentials(activeJob.guideId);
+          setActiveJob(null);
+          setProcessingError(null);
+          setProcessingRetryable(false);
+          setMode("upload");
+          toast.success("원본 영상과 추출 화면을 삭제했어요.");
+          return;
+        }
+        setProcessingMessage("서버 작업을 멈추고 개인 영상을 안전하게 삭제하고 있어요.");
+        const pendingDelay = Math.min(60_000, 1_500 * 2 ** Math.min(pendingChecks, 6));
+        pendingChecks += 1;
+        timer = setTimeout(remove, pendingDelay);
+      } catch (error) {
+        if (stopped || requestAbort.signal.aborted) return;
+        failures += 1;
+        setProcessingMessage(error instanceof Error ? error.message : "개인 영상 삭제를 다시 시도하고 있어요.");
+        timer = setTimeout(remove, Math.min(30_000, 1_500 * 2 ** failures));
+      }
+    };
+
+    void remove();
+    return () => {
+      stopped = true;
+      requestAbort.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeJob, mode, processingKind]);
+
+  useEffect(() => {
+    if (mode !== "processing" || processingKind !== "video" || !activeJob || activeJob.phase !== "processing") return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveFailures = 0;
+    const requestAbort = new AbortController();
+
+    const poll = async () => {
+      try {
+        const guide = await getGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, requestAbort.signal);
+        if (
+          stopped ||
+          activeJobRef.current?.guideId !== activeJob.guideId ||
+          activeJobRef.current.phase === "deleting"
+        ) return;
+        consecutiveFailures = 0;
+        setProgress(guide.progress);
+        setProcessingMessage(guide.statusMessage);
+        if (guide.status === "ready") {
+          setTitle(guide.title || fileName.replace(/\.[^.]+$/, ""));
+          setSteps(guide.steps);
+          setActiveIndex(0);
+          setProcessingError(null);
+          setMode("review");
+          toast.success("실제 화면 녹화에서 단계별 화면을 추출했어요.");
+          return;
+        }
+        if (guide.status === "failed") {
+          setProcessingRetryable(Boolean(guide.retryable));
+          setProcessingError(guide.errorMessage || "영상 처리 중 문제가 생겼어요.");
+          const failedJob: ActiveJob = { ...activeJob, phase: "failed" };
+          setActiveJob(failedJob);
+          try {
+            persistActiveJob(failedJob, fileName);
+          } catch { /* no-op */ }
+          return;
+        }
+        timer = setTimeout(poll, 1_200);
+      } catch (error) {
+        if (
+          stopped ||
+          requestAbort.signal.aborted ||
+          activeJobRef.current?.guideId !== activeJob.guideId ||
+          activeJobRef.current.phase === "deleting"
+        ) return;
+        if (error instanceof ProcessorClientError && error.status === 404) {
+          if (Date.now() - activeJob.startedAt < UPLOAD_RECOVERY_GRACE_MS) {
+            setProcessingMessage("업로드 결과를 확인하고 있어요. 잠시만 기다려 주세요.");
+            consecutiveFailures += 1;
+            timer = setTimeout(poll, Math.min(10_000, 1_500 * 2 ** consecutiveFailures));
+            return;
+          }
+          clearActiveJobCredentials(activeJob.guideId);
+          setActiveJob(null);
+          setProcessingError("이 작업의 편집 링크가 만료됐거나 올바르지 않아요.");
+          return;
+        }
+        const message = error instanceof Error ? error.message : "처리 상태를 확인하지 못했어요.";
+        setProcessingMessage(`${message} 잠시 뒤 다시 확인할게요.`);
+        consecutiveFailures += 1;
+        timer = setTimeout(poll, Math.min(30_000, 1_500 * 2 ** consecutiveFailures));
+      }
+    };
+
+    void poll();
+    return () => {
+      stopped = true;
+      requestAbort.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeJob, fileName, mode, processingKind]);
+
+  const refreshFrameTickets = useCallback(async () => {
+    const now = Date.now();
+    if (
+      !activeJob ||
+      activeJob.phase === "uploading" ||
+      refreshingAssetsRef.current ||
+      now - lastAssetRefreshAtRef.current < 30_000
+    ) return;
+    lastAssetRefreshAtRef.current = now;
+    refreshingAssetsRef.current = true;
+    try {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          const latest = await getGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken);
+          const byId = new Map(latest.steps.map((step) => [step.id, step]));
+          setSteps((current) => current.map((step) => {
+            const renewed = byId.get(step.id);
+            return renewed ? {
+              ...step,
+              frameUrl: renewed.frameUrl,
+              thumbnailUrl: renewed.thumbnailUrl,
+            } : step;
+          }));
+          return;
+        } catch {
+          if (attempt === 5) return;
+          await new Promise((resolve) => window.setTimeout(resolve, Math.min(30_000, 1_000 * 2 ** attempt)));
+        }
+      }
+    } finally {
+      refreshingAssetsRef.current = false;
+    }
+  }, [activeJob]);
+
+  useEffect(() => {
+    if (mode !== "review" || processingKind !== "video" || !activeJob) return;
+    const refresh = () => { void refreshFrameTickets(); };
+    const timer = window.setInterval(refresh, 5 * 60_000);
+    window.addEventListener("focus", refresh);
+    window.addEventListener("online", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("online", refresh);
+    };
+  }, [activeJob, mode, processingKind, refreshFrameTickets]);
 
   useEffect(() => {
     type ToolDefinition = {
@@ -665,7 +1084,14 @@ export default function Home() {
           if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input as object).length > 0) {
             throw new Error("입력은 빈 객체여야 합니다.");
           }
+          if (activeJobRef.current) {
+            throw new Error("먼저 현재 영상 작업을 완료하거나 안전하게 삭제해 주세요.");
+          }
           setFileName("showme-example.mp4");
+          setProcessingKind("sample");
+          setProcessingMessage("예시 흐름을 준비하고 있어요.");
+          setProcessingError(null);
+          setActiveJob(null);
           setProgress(4);
           setMode("processing");
           return { status: "processing", fileName: "showme-example.mp4" };
@@ -701,10 +1127,177 @@ export default function Home() {
     return () => lifecycle.abort();
   }, []);
 
-  const start = (name: string) => {
-    setFileName(name);
-    setProgress(4);
+  const start = (request: StartRequest) => {
+    if (activeJob) {
+      setMode("processing");
+      toast.info(activeJob.phase === "deleting" ? "이전 영상 삭제가 끝날 때까지 기다려 주세요." : "먼저 현재 영상 작업을 확인해 주세요.");
+      return;
+    }
+    if (request.kind === "sample") {
+      setFileName("showme-example.mp4");
+      setSteps(INITIAL_GUIDE_STEPS);
+      setProcessingKind("sample");
+      setProcessingMessage("예시 흐름을 준비하고 있어요.");
+      setProcessingError(null);
+      setActiveJob(null);
+      setProgress(4);
+      setMode("processing");
+      return;
+    }
+
+    const baseUrl = configuredProcessorUrl();
+    if (!baseUrl) {
+      toast.error("실제 영상 처리 서버를 연결한 뒤 사용할 수 있어요.");
+      return;
+    }
+
+    uploadAbortRef.current?.abort();
+    const uploadAbort = new AbortController();
+    uploadAbortRef.current = uploadAbort;
+    const identity = createUploadIdentity();
+    const uploadJob: ActiveJob = {
+      ...identity,
+      baseUrl,
+      phase: "uploading",
+      startedAt: Date.now(),
+    };
+    const persistedUploadJob = JSON.stringify({ ...uploadJob, fileName: request.file.name });
+    try {
+      persistRecoverableCredentials(
+        window.localStorage,
+        recoverableCredentialKey(uploadJob.guideId),
+        persistedUploadJob,
+      );
+      try { window.sessionStorage.setItem(ACTIVE_JOB_SESSION_KEY, uploadJob.guideId); } catch { /* durable credential is sufficient */ }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "복구 키를 저장할 수 없어 업로드하지 않았어요.");
+      return;
+    }
+
+    setFileName(request.file.name);
+    setProcessingKind("video");
+    setProcessingMessage("화면 녹화 영상을 안전하게 올리고 있어요.");
+    setProcessingError(null);
+    setProcessingRetryable(false);
+    setActiveJob(uploadJob);
+    setProgress(2);
     setMode("processing");
+
+    void createGuide(
+      baseUrl,
+      request.file,
+      identity,
+      (uploadPercent) => setProgress(Math.max(2, Math.min(12, uploadPercent * 0.12))),
+      uploadAbort.signal,
+    ).then((created) => {
+      if (created.guideId !== identity.guideId) throw new Error("업로드 식별자가 일치하지 않아요.");
+      if (activeJobRef.current?.guideId === identity.guideId && activeJobRef.current.phase === "deleting") return;
+      uploadAbortRef.current = null;
+      const job: ActiveJob = { ...uploadJob, phase: "processing" };
+      setActiveJob(job);
+      setProgress(14);
+      setProcessingMessage("업로드가 끝났어요. 영상 방향과 장면을 확인하고 있어요.");
+      try {
+        persistActiveJob(job, request.file.name);
+      } catch {
+        // The server still owns the durable job even when device storage is blocked.
+      }
+    }).catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (activeJobRef.current?.guideId === identity.guideId && activeJobRef.current.phase === "deleting") return;
+      uploadAbortRef.current = null;
+      const definitiveRejection = error instanceof ProcessorClientError && (
+        (error.status !== undefined && error.status < 500) ||
+        error.code === "SERVICE_STARTING" ||
+        error.code === "QUEUE_FULL_BEFORE_UPLOAD"
+      );
+      if (definitiveRejection && error instanceof ProcessorClientError) {
+        clearActiveJobCredentials(identity.guideId);
+        setActiveJob(null);
+        setProcessingError(error.message);
+        return;
+      }
+      const uncertainJob: ActiveJob = { ...uploadJob, phase: "processing", startedAt: Date.now() };
+      setActiveJob(uncertainJob);
+      setProcessingMessage("업로드 응답이 끊겨 서버의 작업 상태를 다시 확인하고 있어요.");
+      try {
+        persistActiveJob(uncertainJob, request.file.name);
+      } catch { /* no-op */ }
+    });
+  };
+
+  const cancelProcessing = () => {
+    if (!activeJob) {
+      setMode("upload");
+      return;
+    }
+    if (activeJob.phase === "deleting") {
+      toast.info("개인 영상을 안전하게 삭제하고 있어요.");
+      return;
+    }
+    const deletingJob: ActiveJob = {
+      ...activeJob,
+      phase: "deleting",
+      deletionMissingGraceUntil: activeJob.phase === "uploading" ? Date.now() + 30_000 : undefined,
+    };
+    activeJobRef.current = deletingJob;
+    if (activeJob.phase === "uploading") uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+    retryAbortRef.current?.abort();
+    retryAbortRef.current = null;
+    setProcessingError(null);
+    setProcessingRetryable(false);
+    setActiveJob(deletingJob);
+    setProgress((current) => Math.max(current, 12));
+    setProcessingMessage("서버 작업을 멈추고 개인 영상을 안전하게 삭제하고 있어요.");
+    try {
+      persistRecoverableCredentials(
+        window.localStorage,
+        recoverableCredentialKey(deletingJob.guideId),
+        JSON.stringify({ ...deletingJob, fileName }),
+      );
+      try { window.sessionStorage.setItem(ACTIVE_JOB_SESSION_KEY, deletingJob.guideId); } catch { /* durable credential is sufficient */ }
+    } catch {
+      // The original persisted credential remains recoverable when an update cannot be written.
+    }
+    setMode("processing");
+  };
+
+  const retryProcessing = async () => {
+    if (retrying) return;
+    if (!activeJob) {
+      setMode("upload");
+      return;
+    }
+    setRetrying(true);
+    const timeoutAbort = new AbortController();
+    retryAbortRef.current = timeoutAbort;
+    const timeout = window.setTimeout(() => timeoutAbort.abort(), 15_000);
+    try {
+      await retryGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, timeoutAbort.signal);
+      if (
+        activeJobRef.current?.guideId !== activeJob.guideId ||
+        activeJobRef.current.phase === "deleting"
+      ) return;
+      setProcessingError(null);
+      setProcessingRetryable(false);
+      setProcessingMessage("원본 영상으로 다시 처리하고 있어요.");
+      setProgress(16);
+      setActiveJob({ ...activeJob, phase: "processing" });
+    } catch (error) {
+      if (
+        activeJobRef.current?.guideId !== activeJob.guideId ||
+        activeJobRef.current.phase === "deleting"
+      ) return;
+      toast.error(error instanceof Error ? error.message : "다시 시도하지 못했어요.");
+      setProcessingError(null);
+      setProcessingMessage("서버의 재처리 상태를 다시 확인하고 있어요.");
+      setActiveJob({ ...activeJob, phase: "processing" });
+    } finally {
+      window.clearTimeout(timeout);
+      if (retryAbortRef.current === timeoutAbort) retryAbortRef.current = null;
+      setRetrying(false);
+    }
   };
 
   const publishGuide = () => {
@@ -725,7 +1318,18 @@ export default function Home() {
   return (
     <>
       {mode === "upload" && <UploadScreen onStart={start} />}
-      {mode === "processing" && <ProcessingScreen progress={progress} fileName={fileName} onCancel={() => setMode("upload")} />}
+      {mode === "processing" && (
+        <ProcessingScreen
+          progress={progress}
+          fileName={fileName}
+          statusMessage={processingMessage}
+          errorMessage={processingError}
+          onCancel={cancelProcessing}
+          onRetry={processingError && activeJob && processingRetryable ? retryProcessing : undefined}
+          retrying={retrying}
+          cancelLabel={activeJob?.phase === "deleting" ? "삭제 중…" : activeJob?.phase === "processing" ? "삭제하고 나가기" : "다른 영상 선택"}
+        />
+      )}
       {mode === "review" && (
         <ReviewScreen
           title={title}
@@ -736,6 +1340,9 @@ export default function Home() {
           setActiveIndex={setActiveIndex}
           onPreview={() => { previousMode.current = "review"; setMode("viewer"); }}
           onPublished={publishGuide}
+          onDeleteDraft={cancelProcessing}
+          isLiveDraft={processingKind === "video"}
+          onFrameError={() => { void refreshFrameTickets(); }}
         />
       )}
       {mode === "published" && (

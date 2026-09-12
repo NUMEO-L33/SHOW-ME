@@ -1,11 +1,17 @@
 export type GuideStep = {
-  id: number;
+  id: number | string;
   shortLabel: string;
   instruction: string;
-  screen: "home" | "account" | "recipient" | "amount" | "confirm";
+  screen: "home" | "account" | "recipient" | "amount" | "confirm" | "frame";
   target: { x: number; y: number };
   privacyCount: number;
   privacyEnabled: boolean;
+  frameUrl?: string;
+  thumbnailUrl?: string;
+  frameWidth?: number;
+  frameHeight?: number;
+  startMs?: number;
+  endMs?: number;
 };
 
 export const INITIAL_GUIDE_STEPS: GuideStep[] = [

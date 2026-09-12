@@ -1,3 +1,16 @@
+# ShowMe
+
+화면 녹화 영상을 올리면 단계별 대표 화면으로 바꾸는 한국어 안내서 제작기입니다.
+
+현재 저장소는 순서상 Phase 0–2를 구현합니다.
+
+- Sites 앱: 업로드 UI, 처리 상태 폴링, 실제 추출 프레임 검토
+- Node 프로세서: 스트리밍 업로드, edit token, 상태 복구, ffprobe/ffmpeg 장면 감지와 회전 안전 프레임 추출
+- 영속 계층: 로컬 개발용 JSON/파일 어댑터, 배포용 PostgreSQL/Drizzle + Replit App Storage 어댑터
+- 아직 다음 단계: AI 설명·클릭 위치·개인정보 탐지, StepCanvas 편집, 비가역 개인정보 가림, 서버 기반 공개 링크
+
+웹 UI는 `npm run dev`, 미디어 서비스 개발 모드는 `npm run processor:dev`로 각각 실행합니다. 컴파일된 프로세서는 `npm run processor:build` 후 `npm run processor:start`로 실행합니다. 로컬 UI는 기본적으로 `http://127.0.0.1:8788`의 프로세서를 찾습니다. 전체 검증은 `npm run check`입니다. 단계별 완료 조건은 [`docs/IMPLEMENTATION_PHASES.md`](docs/IMPLEMENTATION_PHASES.md), 배포 구조와 환경 변수는 [`processor/README.md`](processor/README.md)를 참고하세요.
+
 # vinext-starter
 
 A clean full-stack starter running on [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and Drizzle support.

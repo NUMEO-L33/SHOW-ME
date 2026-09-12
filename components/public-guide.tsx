@@ -36,22 +36,26 @@ export function PublicGuide({ onExit, title: suppliedTitle, steps: suppliedSteps
   const title = suppliedTitle ?? storedGuide.title;
   const steps = suppliedSteps ?? storedGuide.steps;
   const step = steps[stepIndex] ?? steps[0];
+  const isLandscapeFrame = Boolean(step.frameWidth && step.frameHeight && step.frameWidth > step.frameHeight);
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-    if (!suppliedSteps) {
-      try {
-        const saved = window.localStorage.getItem("showme:published-guide");
-        if (saved) {
-          const parsed = JSON.parse(saved) as { title?: unknown; steps?: unknown };
-          if (typeof parsed.title === "string" && Array.isArray(parsed.steps) && parsed.steps.length > 0) {
-            setStoredGuide({ title: parsed.title, steps: parsed.steps as GuideStep[] });
+    const timer = window.setTimeout(() => {
+      if (!suppliedSteps) {
+        try {
+          const saved = window.localStorage.getItem("showme:published-guide");
+          if (saved) {
+            const parsed = JSON.parse(saved) as { title?: unknown; steps?: unknown };
+            if (typeof parsed.title === "string" && Array.isArray(parsed.steps) && parsed.steps.length > 0) {
+              setStoredGuide({ title: parsed.title, steps: parsed.steps as GuideStep[] });
+            }
           }
+        } catch {
+          // The bundled sample remains available when browser storage is blocked.
         }
-      } catch {
-        // The bundled sample remains available when browser storage is blocked.
       }
-    }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [suppliedSteps]);
 
   const goTo = (index: number) => {
@@ -157,7 +161,7 @@ export function PublicGuide({ onExit, title: suppliedTitle, steps: suppliedSteps
         </div>
 
         <div className="relative mt-4 flex min-h-[330px] flex-1 items-center justify-center overflow-hidden rounded-[28px] bg-[#121a2a] px-7 py-4 shadow-inner sm:min-h-[350px] sm:px-12 sm:py-5">
-          <div className={`viewer-phone transition-transform duration-300 ${zoomed ? "scale-[1.55]" : "scale-100"}`} style={{ transformOrigin: `${step.target.x}% ${step.target.y}%` }} onDoubleClick={() => setZoomed((current) => !current)}>
+          <div className={`${isLandscapeFrame ? "viewer-landscape" : "viewer-phone"} transition-transform duration-300 ${zoomed ? "scale-[1.55]" : "scale-100"}`} style={{ transformOrigin: `${step.target.x}% ${step.target.y}%` }} onDoubleClick={() => setZoomed((current) => !current)}>
             <GuideScreen step={step} />
           </div>
           <button

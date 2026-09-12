@@ -1,0 +1,11 @@
+entrypoint = "processor/src/index.ts"
+modules = ["nodejs-22"]
+run = "npm run processor:dev"
+
+[nix]
+channel = "stable-26_05"
+packages = ["ffmpeg-full"]
+
+[deployment]
+build = "npm run processor:deploy-build"
+run = "npm run processor:deploy-start"

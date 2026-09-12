@@ -23,6 +23,7 @@ type GuideScreenProps = {
   compact?: boolean;
   showTarget?: boolean;
   className?: string;
+  onFrameError?: () => void;
 };
 
 function PrivacyMask({ className = "" }: { className?: string }) {
@@ -233,21 +234,35 @@ function ConfirmScreen({ masked }: { masked: boolean }) {
   );
 }
 
-export function GuideScreen({ step, compact = false, showTarget = true, className = "" }: GuideScreenProps) {
+export function GuideScreen({ step, compact = false, showTarget = true, className = "", onFrameError }: GuideScreenProps) {
   const masked = step.privacyCount > 0 && step.privacyEnabled;
+  const frameSource = compact ? step.thumbnailUrl ?? step.frameUrl : step.frameUrl;
+  const hasFrame = Boolean(frameSource);
+  const frameAspect = step.frameWidth && step.frameHeight
+    ? `${step.frameWidth} / ${step.frameHeight}`
+    : "9 / 19.5";
 
   return (
     <div
-      className={`relative aspect-[9/19.5] w-full overflow-hidden bg-white text-[#172033] [container-type:inline-size] ${compact ? "rounded-[8%]" : "rounded-[8%] shadow-[0_24px_70px_rgba(4,9,22,.28)]"} ${className}`}
+      className={`relative w-full overflow-hidden bg-white text-[#172033] [container-type:inline-size] ${compact ? "rounded-[8%]" : "rounded-[8%] shadow-[0_24px_70px_rgba(4,9,22,.28)]"} ${className}`}
+      style={{ aspectRatio: frameAspect }}
       role="img"
       aria-label={`${step.shortLabel} 화면 예시`}
     >
-      <TopBar />
-      {step.screen === "home" && <HomeScreen masked={masked} />}
-      {step.screen === "account" && <AccountScreen masked={masked} />}
-      {step.screen === "recipient" && <RecipientScreen masked={masked} />}
-      {step.screen === "amount" && <AmountScreen />}
-      {step.screen === "confirm" && <ConfirmScreen masked={masked} />}
+      {hasFrame ? (
+        // The URL is an authenticated derived frame, never the original video.
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={frameSource} alt="" className="size-full object-contain" draggable={false} onError={onFrameError} />
+      ) : (
+        <>
+          <TopBar />
+          {step.screen === "home" && <HomeScreen masked={masked} />}
+          {step.screen === "account" && <AccountScreen masked={masked} />}
+          {step.screen === "recipient" && <RecipientScreen masked={masked} />}
+          {step.screen === "amount" && <AmountScreen />}
+          {step.screen === "confirm" && <ConfirmScreen masked={masked} />}
+        </>
+      )}
       {showTarget && (
         <span
           aria-hidden="true"
