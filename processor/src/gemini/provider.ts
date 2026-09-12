@@ -6,22 +6,27 @@ import { buildGeminiRequest, GEMINI_ENDPOINT, GEMINI_MODEL, type AnalysisInput }
 
 export class GeminiError extends AnalysisProviderFailure {
   override name = "GeminiError";
+  readonly httpStatus?: number;
   constructor(readonly code: "GEMINI_DISABLED" | "GEMINI_KEY_MISSING" | "GEMINI_AUTH_FAILED" |
     "GEMINI_QUOTA_LIMIT" | "GEMINI_HTTP_FAILED" | "GEMINI_TIMEOUT" | "GEMINI_CANCELLED" |
-    "GEMINI_RESPONSE_INVALID" | "GEMINI_LOCAL_LIMIT") {
+    "GEMINI_RESPONSE_INVALID" | "GEMINI_LOCAL_LIMIT", httpStatus?: number) {
     super(code === "GEMINI_TIMEOUT" ? "AI_TIMEOUT" : code === "GEMINI_RESPONSE_INVALID" ? "AI_INVALID_OUTPUT" : "AI_PROVIDER_FAILED", code);
+    // A bounded numeric status is safe to report; never attach provider bodies or credentials.
+    this.httpStatus = Number.isInteger(httpStatus) && httpStatus! >= 400 && httpStatus! <= 599 ? httpStatus : undefined;
   }
 }
 
 export type RequestPermit = (signal: AbortSignal) => Promise<void>;
 const counter = z.number().int().nonnegative().safe();
 const envelopeSchema = z.object({
-  status: z.string(), model: z.string(),
-  steps: z.array(z.object({ type: z.string(), content: z.unknown().optional() })).max(32).optional(),
-  usage: z.object({
-    total_input_tokens: counter, total_output_tokens: counter, total_thought_tokens: counter,
-    total_tool_use_tokens: counter.optional(), total_tokens: counter,
-  }).optional(),
+  modelVersion: z.string().optional(),
+  candidates: z.array(z.object({ finishReason: z.string(), content: z.unknown().optional() })).max(1).optional(),
+  promptFeedback: z.object({ blockReason: z.string().optional() }).optional(),
+  usageMetadata: z.unknown().optional(),
+});
+const usageSchema = z.object({
+  promptTokenCount: counter, candidatesTokenCount: counter, thoughtsTokenCount: counter.optional(),
+  toolUsePromptTokenCount: counter.optional(), totalTokenCount: counter,
 });
 const MAX_RESPONSE_BYTES = 512 * 1024;
 
@@ -55,32 +60,43 @@ async function readResponse(response: Response, signal: AbortSignal): Promise<un
 
 export function parseGeminiResponse(raw: unknown, input: AnalysisInput): Awaited<ReturnType<AnalysisProvider["analyzeFrames"]>> {
   const parsed = envelopeSchema.safeParse(raw);
-  if (!parsed.success || parsed.data.model !== GEMINI_MODEL) throw new GeminiError("GEMINI_RESPONSE_INVALID");
-  const response = parsed.data;
-  if (["incomplete", "budget_exceeded", "cancelled"].includes(response.status)) return { status: "incomplete" };
-  if (response.status !== "completed") throw new GeminiError("GEMINI_HTTP_FAILED");
-  if (!response.steps || !response.usage) throw new GeminiError("GEMINI_RESPONSE_INVALID");
-  const text: string[] = [];
-  for (const step of response.steps) {
-    // Never extract hidden reasoning or echoed input as the user's result.
-    if (step.type === "thought" || step.type === "user_input") continue;
-    if (step.type !== "model_output") throw new GeminiError("GEMINI_RESPONSE_INVALID");
-    const content = z.array(z.object({ type: z.literal("text"), text: z.string() })).min(1).max(8).safeParse(step.content);
-    if (!content.success) throw new GeminiError("GEMINI_RESPONSE_INVALID");
-    text.push(...content.data.map((part) => part.text));
+  if (!parsed.success || (parsed.data.modelVersion !== undefined && parsed.data.modelVersion !== GEMINI_MODEL)) {
+    throw new GeminiError("GEMINI_RESPONSE_INVALID");
   }
+  const response = parsed.data;
+  const block = response.promptFeedback?.blockReason;
+  if (block && block !== "BLOCK_REASON_UNSPECIFIED") {
+    if (!["SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"].includes(block) || response.candidates?.length) {
+      throw new GeminiError("GEMINI_RESPONSE_INVALID");
+    }
+    return { status: "refused" };
+  }
+  const candidate = response.candidates?.[0];
+  if (!candidate) throw new GeminiError("GEMINI_RESPONSE_INVALID");
+  if (candidate.finishReason === "MAX_TOKENS") return { status: "incomplete" };
+  if (["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "ESCALATION"].includes(candidate.finishReason)) return { status: "refused" };
+  if (candidate.finishReason !== "STOP" || response.modelVersion !== GEMINI_MODEL) throw new GeminiError("GEMINI_RESPONSE_INVALID");
+  const content = z.object({
+    role: z.literal("model").optional(),
+    parts: z.array(z.object({ text: z.string(), thought: z.boolean().optional(), thoughtSignature: z.string().optional() }).strict()).min(1).max(8),
+  }).safeParse(candidate.content);
+  const parsedUsage = usageSchema.safeParse(response.usageMetadata);
+  if (!content.success || !parsedUsage.success) throw new GeminiError("GEMINI_RESPONSE_INVALID");
+  // Never extract or persist reasoning/signatures; tool and other non-text parts fail closed.
+  const text = content.data.parts.filter((part) => !part.thought).map((part) => part.text);
   if (!text.length) throw new GeminiError("GEMINI_RESPONSE_INVALID");
   let output: unknown;
   try { output = JSON.parse(text.join("")) as unknown; } catch { throw new AnalysisContractError(); }
   const validated = parseAnalysisOutput(output, input.targets.map((frame) => frame.stepId));
   if (validated.steps.some((step) => step.mergeWithNext)) throw new AnalysisContractError();
-  const usage = response.usage;
-  const outputTokens = usage.total_output_tokens + usage.total_thought_tokens;
-  if (!Number.isSafeInteger(outputTokens) || !Number.isSafeInteger(outputTokens + usage.total_input_tokens) ||
-      usage.total_tokens < outputTokens + usage.total_input_tokens || (usage.total_tool_use_tokens ?? 0) !== 0) {
+  const usage = parsedUsage.data;
+  const outputTokens = usage.candidatesTokenCount + (usage.thoughtsTokenCount ?? 0);
+  if (!Number.isSafeInteger(outputTokens) || !Number.isSafeInteger(outputTokens + usage.promptTokenCount) ||
+      usage.totalTokenCount < outputTokens + usage.promptTokenCount || (usage.toolUsePromptTokenCount ?? 0) !== 0) {
     throw new GeminiError("GEMINI_RESPONSE_INVALID");
   }
-  return { status: "completed", output: validated, inputTokens: usage.total_input_tokens, outputTokens };
+  return { status: "completed", output: validated, inputTokens: usage.promptTokenCount, outputTokens };
 }
 
 /** Internal adapter only. Startup and public upload endpoints never register this automatically. */
@@ -134,14 +150,14 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
         }
         if (!response.ok) {
           void response.body?.cancel().catch(() => {});
-          if (response.status === 401 || response.status === 403) throw new GeminiError("GEMINI_AUTH_FAILED");
+          if (response.status === 401 || response.status === 403) throw new GeminiError("GEMINI_AUTH_FAILED", response.status);
           // Free daily quota failures must not trigger an automatic retry loop.
-          if (response.status === 429) throw new GeminiError("GEMINI_QUOTA_LIMIT");
+          if (response.status === 429) throw new GeminiError("GEMINI_QUOTA_LIMIT", response.status);
           if ([500, 502, 503, 504].includes(response.status) && attempt < (this.#options.transientRetries ?? 1)) {
             await delay(500, undefined, { signal: controller.signal });
             continue;
           }
-          throw new GeminiError("GEMINI_HTTP_FAILED");
+          throw new GeminiError("GEMINI_HTTP_FAILED", response.status);
         }
         return parseGeminiResponse(await readResponse(response, controller.signal), input);
       }

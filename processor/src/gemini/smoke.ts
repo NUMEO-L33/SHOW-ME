@@ -24,12 +24,12 @@ export function smokeMode(args: string[], env: NodeJS.ProcessEnv): "dry-run" | "
 export async function runSmoke(args: string[], env: NodeJS.ProcessEnv) {
   const mode = smokeMode(args, env);
   const input = await syntheticAnalysisInput();
-  const request = buildGeminiRequest(input);
+  buildGeminiRequest(input);
   await mkdir(outputDirectory, { recursive: true });
   const runDirectory = await mkdtemp(join(outputDirectory, `${mode}-`));
   for (const image of input.images) await writeFile(join(runDirectory, `${image.stepId}.jpg`), image.bytes, { flag: "wx" });
   if (mode === "dry-run") return {
-    status: "prepared-not-analyzed", model: request.model, frames: input.images.length,
+    status: "prepared-not-analyzed", model: GEMINI_MODEL, frames: input.images.length,
     networkCalls: 0, dailyLocalRequestLimit: GEMINI_SMOKE_DAILY_REQUESTS, directory: runDirectory,
   };
   const provider = new GeminiAnalysisProvider({
@@ -40,7 +40,7 @@ export async function runSmoke(args: string[], env: NodeJS.ProcessEnv) {
   if (result.status !== "completed") throw new GeminiError("GEMINI_RESPONSE_INVALID");
   // Only validated synthetic output and aggregate usage; no key, raw response or reasoning.
   await writeFile(join(runDirectory, "result.json"), JSON.stringify({
-    model: GEMINI_MODEL, promptVersion: GEMINI_PROMPT_VERSION, syntheticOnly: true, ...result,
+    model: GEMINI_MODEL, api: "generateContent", promptVersion: GEMINI_PROMPT_VERSION, syntheticOnly: true, ...result,
   }, null, 2), { flag: "wx", mode: 0o600 });
   return { status: "analyzed-synthetic-only", inputTokens: result.inputTokens,
     outputTokensIncludingThinking: result.outputTokens, directory: runDirectory };
@@ -51,7 +51,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     console.log(JSON.stringify(result, null, 2));
   }).catch((error: unknown) => {
     console.error(JSON.stringify({ status: "failed", code: error instanceof GeminiError ? error.code
-      : error instanceof AnalysisContractError ? "AI_INVALID_OUTPUT" : "GEMINI_SMOKE_FAILED" }));
+      : error instanceof AnalysisContractError ? "AI_INVALID_OUTPUT" : "GEMINI_SMOKE_FAILED",
+      httpStatus: error instanceof GeminiError ? error.httpStatus : undefined }));
     process.exitCode = 1;
   });
 }

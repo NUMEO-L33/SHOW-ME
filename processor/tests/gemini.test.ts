@@ -23,37 +23,47 @@ function input(): AnalysisInput {
 }
 function envelope(output: unknown = fakeOutput(["step-0", "step-1"])) {
   return {
-    model: GEMINI_MODEL, status: "completed",
-    steps: [{ type: "model_output", content: [{ type: "text", text: JSON.stringify(output) }] }],
-    usage: { total_input_tokens: 100, total_output_tokens: 20, total_thought_tokens: 10, total_tokens: 130, total_tool_use_tokens: 0 },
+    modelVersion: GEMINI_MODEL,
+    candidates: [{ finishReason: "STOP", content: { role: "model", parts: [{ text: JSON.stringify(output) }] } }],
+    usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, thoughtsTokenCount: 10, totalTokenCount: 130, toolUsePromptTokenCount: 0 },
   };
 }
 const response = () => Response.json(envelope());
 const options = () => ({ apiKey: key, allowExternalProcessing: true, reserveRequest: async () => {}, fetch: async () => response() });
 const hasCode = (code: string) => (error: unknown) => error instanceof GeminiError && error.code === code;
 
-test("Gemini request uses current Interactions JSON schema, bounded inline images, and no tools or storage", () => {
+test("Gemini request uses verified generateContent schema, bounded inline images and no tools", () => {
   const request = buildGeminiRequest(input());
-  assert.equal(request.model, GEMINI_MODEL);
-  assert.equal(request.store, false);
-  assert.equal(request.background, false);
-  assert.equal(request.stream, false);
-  assert.equal(request.generation_config.max_output_tokens, 8192);
-  assert.equal(request.generation_config.thinking_level, "low");
-  assert.equal(request.generation_config.thinking_summaries, "none");
-  assert.equal(request.response_format.mime_type, "application/json");
-  assert.equal(request.input[0].content.filter((part) => part.type === "image").length, 2);
-  assert.ok(request.system_instruction.includes("untrusted"));
-  assert.ok(request.system_instruction.includes("Korean"));
+  assert.equal(GEMINI_ENDPOINT, `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`);
+  assert.equal(request.generationConfig.maxOutputTokens, 8192);
+  assert.equal(request.generationConfig.responseMimeType, "application/json");
+  assert.ok(!("thinkingConfig" in request.generationConfig));
+  assert.equal(request.contents.length, 1);
+  assert.equal(request.contents[0].role, "user");
+  const parts = request.contents[0].parts;
+  assert.deepEqual(parts.map((part) => Object.keys(part)), [["text"], ["text"], ["inlineData"], ["text"], ["inlineData"]]);
+  for (const part of parts) {
+    if ("inlineData" in part) {
+      assert.equal(part.inlineData.mimeType, "image/jpeg");
+      assert.equal(part.inlineData.data, Buffer.from(fixtureJpeg).toString("base64"));
+    }
+  }
+  const schema = JSON.stringify(request.generationConfig.responseJsonSchema);
+  for (const keyword of ["minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "additionalProperties"]) {
+    assert.ok(!schema.includes(`"${keyword}":`));
+  }
+  assert.ok(schema.includes('"required"') && schema.includes('"enum":["step-0","step-1"]'));
+  assert.ok(request.systemInstruction.parts[0].text.includes("untrusted"));
+  assert.ok(request.systemInstruction.parts[0].text.includes("Korean"));
   assert.ok(!JSON.stringify(request).includes(key));
-  for (const field of ["tools", "temperature", "previous_interaction_id"]) assert.ok(!(field in request));
+  assert.deepEqual(Object.keys(request).sort(), ["contents", "generationConfig", "systemInstruction"]);
 });
 
 test("Gemini request pairs neighboring context and targets by server ID in chronological order", () => {
   const targets = [frame(1), frame(2)];
   const context = [frame(3), frame(0)];
   const request = buildGeminiRequest({ targets, context, images: [...context, ...targets].map(({ stepId }) => ({ stepId, mimeType: "image/jpeg", bytes: fixtureJpeg })) });
-  const metadata = request.input[0].content.filter((part) => part.type === "text").slice(1).map((part) => JSON.parse(String(part.text)) as { stepId: string; role: string });
+  const metadata = request.contents[0].parts.filter((part) => "text" in part).slice(1).map((part) => JSON.parse(part.text) as { stepId: string; role: string });
   assert.deepEqual(metadata.map((part) => part.stepId), ["step-0", "step-1", "step-2", "step-3"]);
   assert.deepEqual(metadata.map((part) => part.role), ["context", "target", "target", "context"]);
 });
@@ -81,6 +91,10 @@ test("Gemini adapter sends credentials only in header to fixed HTTPS endpoint af
       assert.equal(init?.redirect, "error");
       assert.equal(new Headers(init?.headers).get("x-goog-api-key"), key);
       assert.ok(!String(init?.body).includes(key));
+      // Regression: use the complete wire format verified against the live API.
+      const wire = JSON.parse(String(init?.body)) as ReturnType<typeof buildGeminiRequest>;
+      assert.deepEqual(wire, buildGeminiRequest(input()));
+      assert.deepEqual(Object.keys(wire).sort(), ["contents", "generationConfig", "systemInstruction"]);
       return response();
     },
   });
@@ -104,9 +118,10 @@ test("missing consent, key, cancelled input or invalid configuration never perfo
   assert.equal(calls, 0);
 });
 
-test("completed Gemini results ignore thought/input text and validate only model output", () => {
+test("completed Gemini results ignore thoughts and signatures and validate only model output", () => {
   const raw = envelope();
-  raw.steps.unshift({ type: "thought", content: [{ type: "text", text: "private reasoning" }] }, { type: "user_input", content: [{ type: "text", text: "private echoed input" }] });
+  raw.candidates[0].content.parts.unshift(Object.assign({ text: "private reasoning" }, { thought: true, thoughtSignature: "private signature" }));
+  Object.assign(raw.candidates[0].content.parts[1], { thoughtSignature: "private signature" });
   const result = parseGeminiResponse(raw, input());
   assert.equal(result.status, "completed");
   assert.ok(!JSON.stringify(result).includes("private"));
@@ -117,32 +132,70 @@ test("Gemini response rejects foreign IDs, invalid percent rectangles, extra pri
   const rect = fakeOutput(["step-0", "step-1"]); rect.steps[0].privacy[0].bounds.width = 100;
   const privateValue = fakeOutput(["step-0", "step-1"]); Object.assign(privateValue.steps[0].privacy[0], { value: "private" });
   const merge = fakeOutput(["step-0", "step-1"]); merge.steps[0].mergeWithNext = true;
-  for (const output of [foreign, rect, privateValue, merge]) assert.throws(() => parseGeminiResponse(envelope(output), input()), AnalysisContractError);
-});
-
-test("Gemini response rejects mismatched model, unknown tool steps, invalid usage and missing final content", () => {
-  const model = envelope(); model.model = "different-model";
-  const tool = envelope(); tool.steps[0].type = "function_call";
-  const usage = envelope(); usage.usage.total_tokens = 1;
-  const toolUsage = envelope(); toolUsage.usage.total_tool_use_tokens = 1;
-  const missing = envelope(); missing.steps = [];
-  for (const raw of [model, tool, usage, toolUsage, missing]) assert.throws(() => parseGeminiResponse(raw, input()), hasCode("GEMINI_RESPONSE_INVALID"));
-});
-
-test("incomplete Gemini output is never treated as a successful draft", () => {
-  for (const status of ["incomplete", "budget_exceeded", "cancelled"]) {
-    assert.deepEqual(parseGeminiResponse({ model: GEMINI_MODEL, status }, input()), { status: "incomplete" });
+  const long = fakeOutput(["step-0", "step-1"]); long.steps[0].shortLabel = "가".repeat(61);
+  const missing = fakeOutput(["step-0"]);
+  const duplicate = fakeOutput(["step-0", "step-0"]);
+  const version = fakeOutput(["step-0", "step-1"]); Object.assign(version, { schemaVersion: 2 });
+  for (const output of [foreign, rect, privateValue, merge, long, missing, duplicate, version]) {
+    assert.throws(() => parseGeminiResponse(envelope(output), input()), AnalysisContractError);
   }
-  assert.throws(() => parseGeminiResponse({ model: GEMINI_MODEL, status: "failed" }, input()), hasCode("GEMINI_HTTP_FAILED"));
 });
 
-for (const [httpStatus, code] of [[401, "GEMINI_AUTH_FAILED"], [403, "GEMINI_AUTH_FAILED"], [429, "GEMINI_QUOTA_LIMIT"]] as const) {
+test("Gemini response rejects mismatched model, tools, invalid usage and missing final content", () => {
+  const model = envelope(); model.modelVersion = "different-model";
+  const tool = envelope(); Object.assign(tool.candidates[0].content.parts[0], { functionCall: { name: "unsafe" } });
+  const usage = envelope(); usage.usageMetadata.totalTokenCount = 1;
+  const toolUsage = envelope(); toolUsage.usageMetadata.toolUsePromptTokenCount = 1;
+  const negative = envelope(); negative.usageMetadata.thoughtsTokenCount = -1;
+  const missing = envelope(); missing.candidates[0].content.parts = [];
+  const inputRole = envelope(); inputRole.candidates[0].content.role = "user";
+  const multiple = envelope(); multiple.candidates.push(multiple.candidates[0]);
+  const noModel = { ...envelope(), modelVersion: undefined };
+  const noUsage = { ...envelope(), usageMetadata: undefined };
+  for (const raw of [model, tool, usage, toolUsage, negative, missing, inputRole, multiple, noModel, noUsage]) {
+    assert.throws(() => parseGeminiResponse(raw, input()), hasCode("GEMINI_RESPONSE_INVALID"));
+  }
+});
+
+test("incomplete or refused Gemini output is never treated as a successful draft", () => {
+  assert.deepEqual(parseGeminiResponse({ modelVersion: GEMINI_MODEL, candidates: [{ finishReason: "MAX_TOKENS" }] }, input()), { status: "incomplete" });
+  for (const finishReason of ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "ESCALATION"]) {
+    assert.deepEqual(parseGeminiResponse({ candidates: [{ finishReason }] }, input()), { status: "refused" });
+  }
+  for (const blockReason of ["SAFETY", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY"]) {
+    assert.deepEqual(parseGeminiResponse({ promptFeedback: { blockReason } }, input()), { status: "refused" });
+  }
+  for (const finishReason of ["OTHER", "UNEXPECTED_TOOL_CALL", "MALFORMED_RESPONSE", "unknown"]) {
+    assert.throws(() => parseGeminiResponse({ modelVersion: GEMINI_MODEL, candidates: [{ finishReason }] }, input()), hasCode("GEMINI_RESPONSE_INVALID"));
+  }
+  assert.throws(() => parseGeminiResponse({ ...envelope(), promptFeedback: { blockReason: "SAFETY" } }, input()), hasCode("GEMINI_RESPONSE_INVALID"));
+});
+
+test("Gemini response accepts omitted zero thought usage and split final JSON", () => {
+  const raw = envelope();
+  const text = raw.candidates[0].content.parts[0].text;
+  raw.candidates[0].content.parts = [{ text: text.slice(0, 30) }, { text: text.slice(30) }];
+  const result = parseGeminiResponse({ ...raw, usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 } }, input());
+  assert.equal(result.status, "completed");
+  if (result.status !== "completed") assert.fail();
+  assert.equal(result.outputTokens, 20);
+});
+
+for (const [httpStatus, code] of [[400, "GEMINI_HTTP_FAILED"], [401, "GEMINI_AUTH_FAILED"], [403, "GEMINI_AUTH_FAILED"], [429, "GEMINI_QUOTA_LIMIT"]] as const) {
   test(`HTTP ${httpStatus} is sanitized and never automatically retried`, async () => {
     let calls = 0;
     const provider = new GeminiAnalysisProvider({ ...options(), fetch: async () => {
       calls += 1; return new Response(`private-provider-body-${key}`, { status: httpStatus });
     } });
-    await assert.rejects(provider.analyzeFrames(input(), signal()), hasCode(code));
+    await assert.rejects(provider.analyzeFrames(input(), signal()), (error: unknown) => {
+      assert.ok(error instanceof GeminiError);
+      assert.equal(error.code, code);
+      assert.equal(error.httpStatus, httpStatus);
+      assert.equal(error.message, code);
+      assert.ok(!JSON.stringify(error).includes(key));
+      assert.ok(!JSON.stringify(error).includes("private-provider-body"));
+      return true;
+    });
     assert.equal(calls, 1);
   });
 }
@@ -238,7 +291,7 @@ test("synthetic smoke generates two real JPEG screens locally without user media
     assert.equal(image.bytes.at(-2), 0xff); assert.equal(image.bytes.at(-1), 0xd9);
   }
   assert.notDeepEqual(synthetic.images[0].bytes, synthetic.images[1].bytes);
-  assert.equal(buildGeminiRequest(synthetic).model, GEMINI_MODEL);
+  assert.equal(buildGeminiRequest(synthetic).contents[0].parts.filter((part) => "inlineData" in part).length, 2);
 });
 
 for (const outcome of ["success", "timeout", "invalid"] as const) {

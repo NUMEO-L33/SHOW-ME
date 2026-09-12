@@ -4,7 +4,7 @@ import { ANALYSIS_LIMITS, AnalysisContractError, type AnalysisProvider } from ".
 
 export const GEMINI_MODEL = "gemini-3.8-flash";
 export const GEMINI_PROMPT_VERSION = "showme-gemini-ko-v1";
-export const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+export const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 export const GEMINI_MAX_OUTPUT_TOKENS = 8192;
 
 export type AnalysisInput = Parameters<AnalysisProvider["analyzeFrames"]>[0];
@@ -35,32 +35,32 @@ Set mergeWithNext:false; automatic merging is not enabled in this adapter.`;
 
 type Schema = Record<string, unknown>;
 const object = (properties: Record<string, Schema>): Schema => ({
-  type: "object", properties, required: Object.keys(properties), additionalProperties: false,
+  type: "object", properties, required: Object.keys(properties),
 });
-const percent: Schema = { type: "number", minimum: 0, maximum: 100 };
+const percent: Schema = { type: "number" };
 
 /** Provider-facing schema is deliberately separate from the stricter server validator. */
 export function geminiResponseSchema(targetIds: string[]): Schema {
   const point = object({ x: percent, y: percent });
   const bounds = object({ x: percent, y: percent, width: percent, height: percent });
   return object({
-    schemaVersion: { type: "integer", minimum: 1, maximum: 1 },
+    schemaVersion: { type: "integer", description: "Always return 1." },
     steps: {
-      type: "array", minItems: targetIds.length, maxItems: targetIds.length,
+      type: "array",
       items: object({
         stepId: { type: "string", enum: targetIds },
-        shortLabel: { type: "string", minLength: 1, maxLength: 60 },
-        instruction: { type: "string", minLength: 1, maxLength: 500 },
+        shortLabel: { type: "string" },
+        instruction: { type: "string" },
         action: { type: "string", enum: ["tap", "wait", "observe", "unknown"] },
         target: { anyOf: [point, { type: "null" }] },
         privacy: {
-          type: "array", maxItems: ANALYSIS_LIMITS.maxPrivacyRegions,
+          type: "array",
           items: object({
             kind: { type: "string", enum: ["phone", "account", "identity", "address", "email", "balance", "password", "other"] },
             bounds,
           }),
         },
-        reviewReasons: { type: "array", maxItems: 4, items: {
+        reviewReasons: { type: "array", items: {
           type: "string", enum: ["unclear_action", "small_text", "missing_context", "privacy_uncertain"],
         } },
         mergeWithNext: { type: "boolean", description: "Always false; merging is not enabled." },
@@ -92,20 +92,23 @@ export function buildGeminiRequest(input: AnalysisInput) {
     if (!ids.has(image.stepId) || image.bytes.byteLength < 4 || image.bytes.byteLength > ANALYSIS_LIMITS.maxImageBytes ||
         image.bytes[0] !== 0xff || image.bytes[1] !== 0xd8 || image.bytes[2] !== 0xff) throw new AnalysisContractError();
   }
-  const parts: Array<Record<string, unknown>> = [{ type: "text", text: JSON.stringify({
+  const parts: Array<{ text: string } | { inlineData: { mimeType: "image/jpeg"; data: string } }> = [{ text: JSON.stringify({
     targetIds: targets.map((frame) => frame.stepId), promptVersion: GEMINI_PROMPT_VERSION,
     coordinateSystem: "percent of full image; origin top-left",
   }) }];
   for (const frame of frames.sort((a, b) => a.position - b.position)) {
     const image = images.find((candidate) => candidate.stepId === frame.stepId)!;
-    parts.push({ type: "text", text: JSON.stringify({ ...frame, role: targets.some((target) => target.stepId === frame.stepId) ? "target" : "context" }) });
-    parts.push({ type: "image", mime_type: "image/jpeg", data: Buffer.from(image.bytes).toString("base64") });
+    parts.push({ text: JSON.stringify({ ...frame, role: targets.some((target) => target.stepId === frame.stepId) ? "target" : "context" }) });
+    parts.push({ inlineData: { mimeType: "image/jpeg", data: Buffer.from(image.bytes).toString("base64") } });
   }
   return {
-    model: GEMINI_MODEL, system_instruction: systemInstruction,
-    input: [{ role: "user", content: parts }],
-    store: false, stream: false, background: false,
-    generation_config: { thinking_level: "low", thinking_summaries: "none", max_output_tokens: GEMINI_MAX_OUTPUT_TOKENS },
-    response_format: { type: "text", mime_type: "application/json", schema: geminiResponseSchema(targets.map((frame) => frame.stepId)) },
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: "user", parts }],
+    // Verified with synthetic images: simple provider schema and default thinking.
+    // The strict server validator still enforces all sizes, coordinates and extra fields.
+    generationConfig: {
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS, responseMimeType: "application/json",
+      responseJsonSchema: geminiResponseSchema(targets.map((frame) => frame.stepId)),
+    },
   };
 }
