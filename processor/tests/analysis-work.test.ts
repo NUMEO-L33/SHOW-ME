@@ -287,7 +287,7 @@ test("current JSON format reopens without version reset and rejects corrupted wo
   const h = await harness(context);
   await h.acquire();
   const saved = await h.state();
-  assert.equal(saved.version, 3);
+  assert.equal(saved.version, 4);
   for (const mutation of [
     (raw: typeof saved) => { raw.analysis[0].state.runs[0].leaseExpiresAt = null; },
     (raw: typeof saved) => { raw.analysis[0].state.runs[0].attemptCount = 4; },

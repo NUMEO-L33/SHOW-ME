@@ -3,10 +3,10 @@ import { z } from "zod";
 
 import { analysisBudgetPriceSchema, analysisBudgetUnitsSchema, quoteAnalysisBudget, reserveAnalysisBudget, settleAnalysisRequest } from "./analysis-budget.js";
 import {
-  accountingControlSchema, analysisRequestAttemptSchema, AnalysisAccountingError, budgetUnitFields,
+  accountingControlSchema, analysisRequestAttemptSchema, analysisWorkOwnerSchema, AnalysisAccountingError, budgetUnitFields,
   parseRequestAttempt, sameBudgetUnits, type AnalysisRequestAttempt,
 } from "./analysis-accounting-contract.js";
-import { analysisBatches, analysisManifest } from "./analysis-contract.js";
+import { analysisBatches, analysisManifest, analysisOutputSchema, parseAnalysisOutput } from "./analysis-contract.js";
 import { parseAnalysisCommand, parseAnalysisState, transitionAnalysis, type AnalysisCommand, type AnalysisState } from "./analysis-state.js";
 import type { GuideWithSteps } from "./domain.js";
 import { GEMINI_MAX_OUTPUT_TOKENS } from "./gemini/request.js";
@@ -52,15 +52,24 @@ const reservationSchema = z.object({
     frameCount: counter.min(1).max(24), createdAt: z.string().datetime(),
   }).strict().nullable(),
 }).strict();
-const batchSchema = z.object({
+const queuedBatchSchema = z.object({
   guideId: id, runId: id, index: counter.max(5), status: z.literal("queued"),
   targetIds: z.array(id).min(1).max(4), contextIds: z.array(id).max(2),
 }).strict();
+const batchSchema = z.discriminatedUnion("status", [queuedBatchSchema, queuedBatchSchema.extend({
+  status: z.literal("succeeded"),
+  completion: z.object({
+    inputFingerprint: fingerprint, dispatchId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/),
+    ordinal: z.union([z.literal(0), z.literal(1)]), owner: analysisWorkOwnerSchema,
+    output: analysisOutputSchema, inputTokens: counter, outputTokens: counter, completedAt: z.string().datetime(),
+  }).strict(),
+}).strict()]);
 export type AnalysisBudgetWindow = z.infer<typeof windowSchema>;
 export type AnalysisReservation = z.infer<typeof reservationSchema>;
 export type AnalysisStoredBatch = z.infer<typeof batchSchema>;
-const legacyLedgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(reservationSchema), batches: z.array(batchSchema) }).strict();
-const ledgerSchema = legacyLedgerSchema.extend({ attempts: z.array(analysisRequestAttemptSchema), control: accountingControlSchema }).strict();
+const legacyLedgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(reservationSchema), batches: z.array(queuedBatchSchema) }).strict();
+const v3LedgerSchema = legacyLedgerSchema.extend({ attempts: z.array(analysisRequestAttemptSchema), control: accountingControlSchema }).strict();
+const ledgerSchema = v3LedgerSchema.extend({ batches: z.array(batchSchema) }).strict();
 export type AnalysisFundingLedger = z.infer<typeof ledgerSchema>;
 export type AnalysisFundingResult = { analysis: AnalysisState; reservation: AnalysisReservation; batches: AnalysisStoredBatch[]; replayed: boolean };
 
@@ -106,6 +115,23 @@ export function emptyFundingLedger(): AnalysisFundingLedger { return { windows: 
 export function upgradeFundingLedgerV2(raw: unknown): AnalysisFundingLedger {
   return parseFundingLedger({ ...parse(legacyLedgerSchema, raw), attempts: [], control: { halted: false } });
 }
+export function upgradeFundingLedgerV3(raw: unknown): AnalysisFundingLedger {
+  return parseFundingLedger(parse(v3LedgerSchema, raw));
+}
+
+/** Stored output has to refer to an immutable, known, non-overrun settlement. */
+export function validateBatchSettlements(batches: AnalysisStoredBatch[], attempts: AnalysisRequestAttempt[]): void {
+  for (const batch of batches) {
+    if (batch.status !== "succeeded") continue;
+    const c = batch.completion;
+    const attempt = attempts.find((a) => a.guideId === batch.guideId && a.runId === batch.runId &&
+      a.batchIndex === batch.index && a.ordinal === c.ordinal && a.dispatchId === c.dispatchId);
+    if (!attempt || attempt.status !== "settled" || attempt.usage?.status !== "known" ||
+        attempt.usage.inputTokens !== c.inputTokens || attempt.usage.outputTokens !== c.outputTokens ||
+        !attempt.finishedAt || Date.parse(attempt.finishedAt) > Date.parse(c.completedAt) ||
+        attempts.some((a) => a.guideId === batch.guideId && a.runId === batch.runId && a.batchIndex === batch.index && a.ordinal > c.ordinal)) invalid();
+  }
+}
 
 /** Unallocated slots still retain their maximum. Only recorded settlements/releases discount them. */
 export function reservationAccounted(reservation: AnalysisReservation, rawAttempts: AnalysisRequestAttempt[]) {
@@ -142,13 +168,31 @@ export function validateFundingAnalysis(analysis: AnalysisState, reservation: An
     expectedInputFingerprint: run.manifest.fingerprint };
   const expected = analysisBatches(run.manifest.frames).map((batch, index) => ({ guideId: reservation.guideId, runId: run.id,
     index, status: "queued" as const, targetIds: batch.targets.map((f) => f.stepId), contextIds: batch.context.map((f) => f.stepId) }));
-  if (requestFingerprint(command) !== reservation.details.requestFingerprint || JSON.stringify(batches) !== JSON.stringify(expected)) invalid();
+  const descriptors = batches.map((b) => ({ guideId: b.guideId, runId: b.runId, index: b.index, status: "queued",
+    targetIds: b.targetIds, contextIds: b.contextIds }));
+  if (requestFingerprint(command) !== reservation.details.requestFingerprint || JSON.stringify(descriptors) !== JSON.stringify(expected)) invalid();
+  for (const batch of batches) {
+    if (batch.status !== "succeeded") continue;
+    const c = batch.completion;
+    if (c.inputFingerprint !== run.manifest.fingerprint || c.owner.attemptCount > run.attemptCount ||
+        (c.owner.attemptCount === run.attemptCount && c.owner.attemptId !== run.attemptId)) invalid();
+    const output = parseAnalysisOutput(c.output, batch.targetIds, run.manifest.frames.at(-1)?.stepId);
+    if (JSON.stringify(output) !== JSON.stringify(c.output)) invalid();
+  }
+  if (run.status === "succeeded") {
+    if (batches.some((b) => b.status !== "succeeded")) invalid();
+    const completed = batches.filter((b) => b.status === "succeeded");
+    if (JSON.stringify(run.result) !== JSON.stringify({ schemaVersion: 1, steps: completed.flatMap((b) => b.completion.output.steps) }) ||
+        run.inputTokens !== completed.reduce((sum, b) => sum + b.completion.inputTokens, 0) ||
+        run.outputTokens !== completed.reduce((sum, b) => sum + b.completion.outputTokens, 0)) invalid();
+  }
 }
 
 /** Full-file validation. Never reset a corrupt ledger to empty on reopen. */
 export function parseFundingLedger(raw: unknown): AnalysisFundingLedger {
   const ledger = parse(ledgerSchema, raw);
   ledger.attempts = ledger.attempts.map(parseRequestAttempt);
+  validateBatchSettlements(ledger.batches, ledger.attempts);
   if (!ledger.control.halted && ledger.attempts.some((a) => a.status === "overrun")) invalid();
   const key = (...parts: unknown[]) => JSON.stringify(parts);
   for (const keys of [ledger.windows.map((w) => key(w.day, w.scope)), ledger.reservations.map((r) => key(r.guideId, r.runId)),

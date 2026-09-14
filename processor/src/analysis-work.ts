@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { AnalysisAccountingError, analysisWorkOwnerSchema, parseRequestAttempt, type AnalysisRequestAttempt } from "./analysis-accounting-contract.js";
 import { ANALYSIS_LIMITS } from "./analysis-contract.js";
-import { fundingDay, parseReservation, reservationAccounted, validateFundingAnalysis,
+import { fundingDay, parseReservation, reservationAccounted, validateBatchSettlements, validateFundingAnalysis,
   type AnalysisReservation, type AnalysisStoredBatch } from "./analysis-funding.js";
 import { parseAnalysisState, transitionAnalysis, type AnalysisRun, type AnalysisState } from "./analysis-state.js";
 import type { GuideWithSteps } from "./domain.js";
@@ -73,6 +73,7 @@ export function prepareAnalysisWorkClaim(options: {
   if (reservation.guideId !== options.guide.id || reservation.runId !== command.runId || !reservation.details) return null;
   validateFundingAnalysis(previous, reservation, options.batches);
   const attempts = options.attempts.map(parseRequestAttempt);
+  validateBatchSettlements(options.batches, attempts);
   reservationAccounted(reservation, attempts);
   const run = previous.runs.find((candidate) => candidate.id === command.runId)!;
   if (Date.parse(run.updatedAt) > now.valueOf() || Date.parse(run.createdAt) > now.valueOf()) return null;

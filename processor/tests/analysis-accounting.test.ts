@@ -250,12 +250,12 @@ test("lost settlement acknowledgement reopens as an idempotent replay", async (c
   assert.deepEqual(await h.state(), saved);
 });
 
-test("v2 funding upgrades without repricing and malformed v3 attempts or counters never reset", async (context) => {
+test("v2 funding upgrades without repricing and malformed current attempts or counters never reset", async (context) => {
   const h = await harness(context);
   const legacy = await h.state(); legacy.version = 2; delete legacy.funding.attempts; delete legacy.funding.control;
   await writeFile(h.repository.filePath, JSON.stringify(legacy));
   await h.begin(); await h.settle();
-  const saved = await h.state(); assert.equal(saved.version, 3);
+  const saved = await h.state(); assert.equal(saved.version, 4);
   assert.deepEqual(saved.funding.reservations, legacy.funding.reservations);
   const malformed = [
     { ...saved, version: 2 },

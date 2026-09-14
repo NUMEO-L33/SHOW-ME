@@ -8,7 +8,7 @@ import {
 } from "./analysis-accounting-contract.js";
 import { analysisManifest } from "./analysis-contract.js";
 import {
-  fundingDay, parseBudgetWindow, parseReservation, reservationAccounted, validateFundingAnalysis,
+  fundingDay, parseBudgetWindow, parseReservation, reservationAccounted, validateBatchSettlements, validateFundingAnalysis,
   type AnalysisBudgetWindow, type AnalysisReservation, type AnalysisStoredBatch,
 } from "./analysis-funding.js";
 import { parseAnalysisState, type AnalysisState } from "./analysis-state.js";
@@ -37,6 +37,9 @@ export function prepareAnalysisAccounting(options: {
   if ((command.type === "allocate" || command.type === "sending") &&
       (run.attemptCount > 0 || command.owner) && !ownsAnalysisWork(run, command.owner, options.now)) return null;
   const attempts = options.attempts.map(parseRequestAttempt);
+  validateBatchSettlements(options.batches, attempts);
+  if ((command.type === "allocate" || command.type === "sending") &&
+      options.batches.some((b) => b.index === command.batchIndex && b.status === "succeeded")) return null;
   const before = reservationAccounted(reservation, attempts);
   if (!control.halted && attempts.some((a) => a.status === "overrun")) accountingInvalid();
   const previous = attempts.find((a) => a.batchIndex === command.batchIndex && a.ordinal === command.ordinal);

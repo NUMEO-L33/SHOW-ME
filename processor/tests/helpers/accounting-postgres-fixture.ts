@@ -25,7 +25,7 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
         availableAt: available === null ? null : new Date(available), attemptCount: run.attemptCount };
     })],
     [analysisReservations, ledger.reservations],
-    [analysisBatchesTable, ledger.batches.map(({ guideId, runId, index, ...payload }) => ({ guideId, runId, index, payload }))],
+    [analysisBatchesTable, ledger.batches.map(({ guideId, runId, index, ...payload }) => ({ guideId, runId, index, status: payload.status, payload }))],
     [analysisBudgetWindows, ledger.windows.map(({ day, scope, ...payload }) => ({ day, scope, payload }))],
     [analysisAccountingControls, [{ id: "global", payload: ledger.control }]],
     [analysisRequestAttempts, ledger.attempts.map(({ guideId, runId, batchIndex, ordinal, dispatchId, status, ...payload }) => ({ guideId, runId, batchIndex, ordinal, dispatchId, status, payload }))],
@@ -36,6 +36,7 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
   const isolationLevels: Array<string | undefined> = [];
   let clock = new Date("2026-09-14T12:00:00.000Z");
   let failAttemptWrite = false;
+  let failWriteTable: PgTable | undefined;
   function selected(table: PgTable, condition: SQL | undefined) {
     const rendered = condition ? new PgDialect().sqlToQuery(condition) : { sql: "", params: [] };
     const { params } = rendered;
@@ -72,6 +73,7 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
     } }),
     update: (table: PgTable) => ({ set: (values: Row) => ({ where: async (condition: SQL) => {
       writes.push(table);
+      if (table === failWriteTable) throw new Error("simulated table write failure");
       for (const row of selected(table, condition)) Object.assign(row, structuredClone(values));
     } }) }),
     insert: (table: PgTable) => ({ values: (values: Row) => ({
@@ -83,10 +85,12 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
       },
       onConflictDoUpdate: async () => {
       writes.push(table);
+      if (table === failWriteTable) throw new Error("simulated table write failure");
       if (failAttemptWrite && table === analysisRequestAttempts) throw new Error("simulated attempt persistence failure");
       const rows = tables.get(table)!;
       const existing = rows.find((row) => row.guideId === values.guideId && (table === analysisRuns ? row.id === values.id :
-        table === guideDrafts ? true : row.runId === values.runId && row.batchIndex === values.batchIndex && row.ordinal === values.ordinal));
+        table === guideDrafts ? true : table === analysisBatchesTable ? row.runId === values.runId && row.index === values.index :
+          row.runId === values.runId && row.batchIndex === values.batchIndex && row.ordinal === values.ordinal));
       if (existing) Object.assign(existing, structuredClone(values)); else rows.push(structuredClone(values));
     } }) }),
   };
@@ -100,6 +104,7 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
   return { repository: new PostgresGuideRepository(database as unknown as ProcessorDatabase), locks, writes, queries, isolationLevels,
     rows: (table: PgTable) => structuredClone(tables.get(table)!),
     failAttemptWrite: () => { failAttemptWrite = true; },
+    failWrite: (table: PgTable) => { failWriteTable = table; },
     removeControl: () => { tables.set(analysisAccountingControls, []); },
     setClock: (at: Date) => { clock = new Date(at); },
     replaceRows: (table: PgTable, rows: Row[]) => { tables.set(table, structuredClone(rows)); },

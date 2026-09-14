@@ -145,10 +145,12 @@ export const analysisReservations = pgTable("analysis_reservations", {
 
 export const analysisBatchesTable = pgTable("analysis_batches", {
   guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), index: integer("batch_index").notNull(),
+  status: text("status").$type<AnalysisStoredBatch["status"]>().notNull(),
   payload: jsonb("payload").$type<Omit<AnalysisStoredBatch, "guideId" | "runId" | "index">>().notNull(),
 }, (table) => [
   primaryKey({ columns: [table.guideId, table.runId, table.index] }),
   foreignKey({ columns: [table.guideId, table.runId], foreignColumns: [analysisRuns.guideId, analysisRuns.id] }).onDelete("cascade"),
+  check("analysis_batches_status_check", sql`(${table.status} IN ('queued', 'succeeded') AND ${table.status} = ${table.payload}->>'status') IS TRUE`),
 ]);
 
 // Seeded exactly once by migration. All accounting writers lock this row first.

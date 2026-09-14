@@ -43,6 +43,13 @@
       "when": 1789386047359,
       "tag": "0005_analysis_work_queue",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789388780370,
+      "tag": "0006_analysis_batch_completion",
+      "breakpoints": true
     }
   ]
 }
