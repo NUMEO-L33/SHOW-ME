@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -19,6 +20,7 @@ import {
 } from "../domain.js";
 import type { AnalysisRun } from "../analysis-state.js";
 import type { DraftDocument } from "../analysis-contract.js";
+import type { AnalysisBudgetWindow, AnalysisReservation, AnalysisStoredBatch } from "../analysis-funding.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -112,6 +114,26 @@ export const analysisRuns = pgTable("analysis_runs", {
 }, (table) => [
   primaryKey({ columns: [table.guideId, table.id] }),
   index("analysis_runs_guide_status_idx").on(table.guideId, table.status),
+]);
+
+// Accounting survives guide deletion. Only batch payloads cascade with runs.
+export const analysisBudgetWindows = pgTable("analysis_budget_windows", {
+  day: text("day").notNull(), scope: text("scope").notNull(),
+  payload: jsonb("payload").$type<Omit<AnalysisBudgetWindow, "day" | "scope">>().notNull(),
+}, (table) => [primaryKey({ columns: [table.day, table.scope] })]);
+
+export const analysisReservations = pgTable("analysis_reservations", {
+  guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), day: text("day").notNull(),
+  maximum: jsonb("maximum").$type<AnalysisReservation["maximum"]>().notNull(),
+  details: jsonb("details").$type<AnalysisReservation["details"]>(),
+}, (table) => [primaryKey({ columns: [table.guideId, table.runId] }), index("analysis_reservations_day_idx").on(table.day)]);
+
+export const analysisBatchesTable = pgTable("analysis_batches", {
+  guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), index: integer("batch_index").notNull(),
+  payload: jsonb("payload").$type<Omit<AnalysisStoredBatch, "guideId" | "runId" | "index">>().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.guideId, table.runId, table.index] }),
+  foreignKey({ columns: [table.guideId, table.runId], foreignColumns: [analysisRuns.guideId, analysisRuns.id] }).onDelete("cascade"),
 ]);
 
 export type GuideRow = typeof guides.$inferSelect;

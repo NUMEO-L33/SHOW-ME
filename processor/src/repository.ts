@@ -27,6 +27,9 @@ import {
   type GuideWithSteps,
 } from "./domain.js";
 import {
+  analysisBatchesTable,
+  analysisBudgetWindows,
+  analysisReservations,
   analysisRuns,
   guideDrafts,
   guideSteps,
@@ -42,7 +45,13 @@ import {
   type AnalysisCommand, type AnalysisState,
 } from "./analysis-state.js";
 
-const JSON_REPOSITORY_VERSION = 1 as const;
+import {
+  emptyFundingLedger, fundingDay, fundingWindowIdentity, initialBudgetWindow, parseBudgetWindow,
+  parseFundingCommand, parseFundingLedger, parseFundingPolicy, parseReservation, parseStoredBatch, prepareFundedAnalysis, validateFundingAnalysis,
+  type AnalysisFundingCommand, type AnalysisFundingLedger, type AnalysisFundingPolicy, type AnalysisFundingResult,
+} from "./analysis-funding.js";
+
+const JSON_REPOSITORY_VERSION = 2 as const;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 
@@ -51,9 +60,11 @@ type JsonRepositoryState = {
   guides: Guide[];
   steps: GuideStep[];
   analysis: Array<{ guideId: string; state: AnalysisState }>;
+  funding: AnalysisFundingLedger;
 };
 
 export type ProcessorDatabase = NodePgDatabase<typeof processorSchema>;
+type ProcessorTransaction = Parameters<Parameters<ProcessorDatabase["transaction"]>[0]>[0];
 
 export type RepositoryFactoryOptions = {
   databaseUrl?: string | null;
@@ -75,7 +86,7 @@ export class GuideNotFoundError extends Error {
 }
 
 function emptyJsonState(): JsonRepositoryState {
-  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [] };
+  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [], funding: emptyFundingLedger() };
 }
 
 function clone<T>(value: T): T {
@@ -427,7 +438,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
-    (parsed as { version?: unknown }).version !== JSON_REPOSITORY_VERSION ||
+    ![1, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
     !Array.isArray((parsed as { guides?: unknown }).guides) ||
     !Array.isArray((parsed as { steps?: unknown }).steps)
   ) {
@@ -435,8 +446,16 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   }
 
   const state = parsed as JsonRepositoryState;
-  // Additive upgrade of legacy v1 files; never silently discard malformed state.
-  if (state.analysis === undefined) state.analysis = [];
+  const legacyVersion = (parsed as { version: number }).version === 1;
+  // Older binaries reject v2 instead of silently discarding budget reservations.
+  if (legacyVersion) {
+    if (state.funding !== undefined) throw new RepositoryDataError("Invalid legacy funding state.");
+    state.funding = emptyFundingLedger();
+    state.version = JSON_REPOSITORY_VERSION;
+  }
+  state.funding = parseFundingLedger(state.funding);
+  // Additive upgrade of legacy analysis; never discard malformed state.
+  if (legacyVersion && state.analysis === undefined) state.analysis = [];
   if (!Array.isArray(state.analysis) || state.analysis.some((entry) => !entry || typeof entry.guideId !== "string") ||
       new Set(state.analysis.map((entry) => entry.guideId)).size !== state.analysis.length) {
     throw new RepositoryDataError("Invalid persisted analysis state.");
@@ -445,6 +464,13 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
     if (!state.guides.some((guide) => guide.id === entry.guideId)) throw new RepositoryDataError("Orphaned analysis state.");
     return { guideId: entry.guideId, state: parseAnalysisState(entry.state) };
   });
+  for (const reservation of state.funding.reservations) {
+    if (!reservation.details) continue;
+    const analysis = state.analysis.find((entry) => entry.guideId === reservation.guideId)?.state;
+    if (!analysis) throw new RepositoryDataError("Orphaned analysis reservation.");
+    validateFundingAnalysis(analysis, reservation, state.funding.batches
+      .filter((b) => b.guideId === reservation.guideId && b.runId === reservation.runId).sort((a, b) => a.index - b.index));
+  }
   if (state.guides.some((guide) => !isGuideStatus(guide.status))) {
     throw new RepositoryDataError(`JSON repository at ${filePath} contains an invalid guide status.`);
   }
@@ -535,6 +561,9 @@ export class JsonGuideRepository implements GuideRepository {
       const guide = state.guides.find((candidate) => candidate.id === guideId);
       if (!guide) return null;
       const previous = state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState();
+      // Budgeted runs cannot use the legacy unmetered runner before B4 exists.
+      if (["claim", "finish", "fail"].includes(command.type) && "runId" in command &&
+          state.funding.reservations.some((r) => r.guideId === guideId && r.runId === command.runId)) return null;
       const next = transitionAnalysis({ ...guide, steps: state.steps.filter((step) => step.guideId === guideId) }, previous, command);
       if (!next) return null;
       const validated = parseAnalysisState(next);
@@ -542,6 +571,49 @@ export class JsonGuideRepository implements GuideRepository {
       await this.writeState(state);
       return clone(validated);
     });
+  }
+
+  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date()): Promise<AnalysisFundingResult | null> {
+    command = parseFundingCommand(command);
+    policy = parseFundingPolicy(policy);
+    fundingDay(now);
+    now = new Date(now.valueOf());
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const guide = state.guides.find((candidate) => candidate.id === guideId);
+      if (!guide) return null;
+      const prepared = prepareFundedAnalysis({ guide: { ...guide, steps: state.steps.filter((step) => step.guideId === guideId) },
+        previous: state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState(), command, policy, now,
+        existing: state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId) ?? null,
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
+        windows: state.funding.windows });
+      if (!prepared) return null;
+      const { windows, ...result } = prepared;
+      if (result.replayed) return clone(result);
+      state.analysis = [...state.analysis.filter((entry) => entry.guideId !== guideId), { guideId, state: result.analysis }];
+      for (const window of windows) state.funding.windows = [...state.funding.windows.filter((w) => w.day !== window.day || w.scope !== window.scope), window];
+      state.funding.reservations.push(result.reservation);
+      state.funding.batches.push(...result.batches);
+      state.funding = parseFundingLedger(state.funding);
+      // One fsync + atomic rename for the draft, run, batches and all windows.
+      await this.writeState(state);
+      return clone(result);
+    });
+  }
+
+  async getAnalysisFunding(guideId: string, runId: string) {
+    return this.serialize(async () => {
+      const state = await this.readState();
+      if (!state.guides.some((guide) => guide.id === guideId)) return null;
+      const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === runId);
+      return reservation?.details ? clone({ reservation,
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === runId).sort((a, b) => a.index - b.index) }) : null;
+    });
+  }
+
+  async getAnalysisBudgetWindow(day: string, scope: string) {
+    fundingWindowIdentity(day, scope);
+    return this.serialize(async () => clone((await this.readState()).funding.windows.find((w) => w.day === day && w.scope === scope) ?? null));
   }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {
@@ -753,6 +825,8 @@ export class JsonGuideRepository implements GuideRepository {
       state.guides = state.guides.filter((candidate) => candidate.id !== guideId);
       state.steps = state.steps.filter((step) => step.guideId !== guideId);
       state.analysis = state.analysis.filter((entry) => entry.guideId !== guideId);
+      state.funding.batches = state.funding.batches.filter((entry) => entry.guideId !== guideId);
+      state.funding.reservations = state.funding.reservations.map((entry) => entry.guideId === guideId ? { ...entry, details: null } : entry);
       await this.writeState(state);
       return true;
     });
@@ -876,6 +950,33 @@ function stepToInsert(step: GuideStep): NewGuideStepRow {
   };
 }
 
+async function loadAnalysisRows(transaction: ProcessorTransaction, guideId: string): Promise<AnalysisState> {
+  const [draft] = await transaction.select().from(guideDrafts).where(eq(guideDrafts.guideId, guideId)).limit(1);
+  const runs = await transaction.select().from(analysisRuns).where(eq(analysisRuns.guideId, guideId));
+  return parseAnalysisState({ draft: draft ? {
+    revision: draft.revision, inputFingerprint: draft.inputFingerprint, document: draft.document,
+    createdAt: draft.createdAt.toISOString(), updatedAt: draft.updatedAt.toISOString(),
+  } : null, runs: runs.map((run) => ({ ...run.payload, id: run.id, status: run.status })) });
+}
+
+async function persistAnalysisRows(transaction: ProcessorTransaction, guideId: string, previous: AnalysisState, validated: AnalysisState) {
+  if (validated.draft && JSON.stringify(validated.draft) !== JSON.stringify(previous.draft)) {
+    const values = { ...validated.draft, guideId, createdAt: new Date(validated.draft.createdAt), updatedAt: new Date(validated.draft.updatedAt) };
+    await transaction.insert(guideDrafts).values(values).onConflictDoUpdate({ target: guideDrafts.guideId, set: values });
+  }
+  for (const run of validated.runs) {
+    if (JSON.stringify(run) === JSON.stringify(previous.runs.find((candidate) => candidate.id === run.id))) continue;
+    const { id, status, ...payload } = run;
+    await transaction.insert(analysisRuns).values({ guideId, id, status, payload })
+      .onConflictDoUpdate({ target: [analysisRuns.guideId, analysisRuns.id], set: { status, payload } });
+  }
+}
+
+// Roll back even provisional zero-valued windows on conflict or racing replay.
+class FundingRollback extends Error {
+  constructor(readonly result: AnalysisFundingResult | null) { super("Analysis funding transaction not committed."); }
+}
+
 export class PostgresGuideRepository implements GuideRepository {
   constructor(
     readonly database: ProcessorDatabase,
@@ -903,33 +1004,18 @@ export class PostgresGuideRepository implements GuideRepository {
       // Same parent lock as media completion and deletion: no check/write gap.
       const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for(command ? "update" : "share");
       if (!guide) return null;
-      const [draft] = await transaction.select().from(guideDrafts).where(eq(guideDrafts.guideId, guideId)).limit(1);
-      const runs = await transaction.select().from(analysisRuns).where(eq(analysisRuns.guideId, guideId));
-      const previous = parseAnalysisState({
-        draft: draft ? {
-          revision: draft.revision, inputFingerprint: draft.inputFingerprint, document: draft.document,
-          createdAt: draft.createdAt.toISOString(), updatedAt: draft.updatedAt.toISOString(),
-        } : null,
-        runs: runs.map((run) => ({ ...run.payload, id: run.id, status: run.status })),
-      });
+      const previous = await loadAnalysisRows(transaction, guideId);
       if (!command) return previous;
+      if (["claim", "finish", "fail"].includes(command.type) && "runId" in command) {
+        const [funded] = await transaction.select({ runId: analysisReservations.runId }).from(analysisReservations)
+          .where(and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
+        if (funded) return null;
+      }
       const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
       const next = transitionAnalysis({ ...guideFromRow(guide), steps: steps.map(stepFromRow) }, previous, command);
       if (!next) return null;
       const validated = parseAnalysisState(next);
-      if (validated.draft && JSON.stringify(validated.draft) !== JSON.stringify(previous.draft)) {
-        const values = {
-          ...validated.draft, guideId,
-          createdAt: new Date(validated.draft.createdAt), updatedAt: new Date(validated.draft.updatedAt),
-        };
-        await transaction.insert(guideDrafts).values(values).onConflictDoUpdate({ target: guideDrafts.guideId, set: values });
-      }
-      for (const run of validated.runs) {
-        if (JSON.stringify(run) === JSON.stringify(previous.runs.find((candidate) => candidate.id === run.id))) continue;
-        const { id, status, ...payload } = run;
-        await transaction.insert(analysisRuns).values({ guideId, id, status, payload })
-          .onConflictDoUpdate({ target: [analysisRuns.guideId, analysisRuns.id], set: { status, payload } });
-      }
+      await persistAnalysisRows(transaction, guideId, previous, validated);
       return validated;
     });
   }
@@ -937,6 +1023,80 @@ export class PostgresGuideRepository implements GuideRepository {
   getAnalysisState(guideId: string): Promise<AnalysisState | null> { return this.analysisTransaction(guideId); }
   executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null> {
     return this.analysisTransaction(guideId, command);
+  }
+
+  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date()): Promise<AnalysisFundingResult | null> {
+    command = parseFundingCommand(command);
+    policy = parseFundingPolicy(policy);
+    const day = fundingDay(now);
+    now = new Date(now.valueOf());
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
+        const [initialReservation] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
+        const windows = [];
+        if (!initialReservation) {
+          // All budget writers must retain this order: global-day, guide-day, guide.
+          for (const scope of ["global", `guide:${guideId}`]) {
+            const { day: windowDay, scope: windowScope, ...payload } = initialBudgetWindow(day, scope, policy);
+            await transaction.insert(analysisBudgetWindows).values({ day: windowDay, scope: windowScope, payload }).onConflictDoNothing();
+            const [row] = await transaction.select().from(analysisBudgetWindows)
+              .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope))).limit(1).for("update");
+            windows.push(parseBudgetWindow({ ...row.payload, day: row.day, scope: row.scope }));
+          }
+        }
+        const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+        if (!guide) throw new FundingRollback(null);
+        const [stored] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
+        const batchRows = await transaction.select().from(analysisBatchesTable)
+          .where(and(eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+        const previous = await loadAnalysisRows(transaction, guideId);
+        const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+        const prepared = prepareFundedAnalysis({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, previous,
+          command, policy, now, existing: stored ? parseReservation(stored) : null,
+          batches: batchRows.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })), windows });
+        if (!prepared) throw new FundingRollback(null);
+        const { windows: nextWindows, ...result } = prepared;
+        if (result.replayed) {
+          if (!initialReservation) throw new FundingRollback(result);
+          return result;
+        }
+        await persistAnalysisRows(transaction, guideId, previous, result.analysis);
+        for (const window of nextWindows) {
+          const { day: windowDay, scope, ...payload } = window;
+          await transaction.update(analysisBudgetWindows).set({ payload })
+            .where(and(eq(analysisBudgetWindows.day, windowDay), eq(analysisBudgetWindows.scope, scope)));
+        }
+        await transaction.insert(analysisReservations).values(result.reservation);
+        await transaction.insert(analysisBatchesTable).values(result.batches.map(({ guideId: batchGuideId, runId, index, ...payload }) => ({ guideId: batchGuideId, runId, index, payload })));
+        return result;
+      });
+    } catch (error) {
+      if (error instanceof FundingRollback) return error.result;
+      throw error;
+    }
+  }
+
+  async getAnalysisFunding(guideId: string, runId: string) {
+    return this.database.transaction(async (transaction) => {
+      const [guide] = await transaction.select({ id: guides.id }).from(guides).where(eq(guides.id, guideId)).limit(1).for("share");
+      if (!guide) return null;
+      const [row] = await transaction.select().from(analysisReservations)
+        .where(and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, runId))).limit(1);
+      if (!row?.details) return null;
+      const batches = await transaction.select().from(analysisBatchesTable)
+        .where(and(eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, runId))).orderBy(asc(analysisBatchesTable.index));
+      const result = { reservation: parseReservation(row), batches: batches.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })) };
+      validateFundingAnalysis(await loadAnalysisRows(transaction, guideId), result.reservation, result.batches);
+      return result;
+    });
+  }
+
+  async getAnalysisBudgetWindow(day: string, scope: string) {
+    fundingWindowIdentity(day, scope);
+    const [row] = await this.database.select().from(analysisBudgetWindows)
+      .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope))).limit(1);
+    return row ? parseBudgetWindow({ ...row.payload, day: row.day, scope: row.scope }) : null;
   }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {
@@ -1232,6 +1392,8 @@ export class PostgresGuideRepository implements GuideRepository {
       if (options?.expectedUpdatedAt !== undefined && guide.updatedAt !== options.expectedUpdatedAt) return false;
 
       await transaction.delete(guideSteps).where(eq(guideSteps.guideId, guideId));
+      // Preserve maximum accounting + opaque IDs, remove consent/media/policy details.
+      await transaction.update(analysisReservations).set({ details: null }).where(eq(analysisReservations.guideId, guideId));
       const deleted = await transaction
         .delete(guides)
         .where(eq(guides.id, guideId))

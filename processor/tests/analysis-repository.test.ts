@@ -10,6 +10,8 @@ import { createAnalysisHarness, fakeOutput } from "./helpers/analysis-fixtures.j
 test("analysis state initializes lazily and survives reopening a legacy JSON repository", async (context) => {
   const { repository, guideId, initialize } = await createAnalysisHarness(context);
   const legacy = JSON.parse(await readFile(repository.filePath, "utf8"));
+  legacy.version = 1;
+  delete legacy.funding;
   delete legacy.analysis;
   await writeFile(repository.filePath, JSON.stringify(legacy));
   const draft = (await initialize())?.draft;

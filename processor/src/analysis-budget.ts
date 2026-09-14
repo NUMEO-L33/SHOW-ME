@@ -13,17 +13,19 @@ export class AnalysisBudgetError extends Error {
 
 const counter = z.number().int().nonnegative().safe();
 const unitFields = ["requests", "inputTokens", "outputTokens", "costMicrousd"] as const;
-const unitsSchema = z.object({
+export const analysisBudgetUnitsSchema = z.object({
   requests: counter, inputTokens: counter, outputTokens: counter, costMicrousd: counter,
 }).strict();
+const unitsSchema = analysisBudgetUnitsSchema;
 export type AnalysisBudgetUnits = z.infer<typeof unitsSchema>;
 
 // Rates are supplied by trusted, versioned server policy, not by HTTP callers.
 // No built-in prices or free-tier assumptions: zero/unknown prices fail closed.
-const priceSchema = z.object({
+export const analysisBudgetPriceSchema = z.object({
   model: z.enum(GEMINI_MODELS), version: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
   inputMicrousdPerMillionTokens: counter.positive(), outputMicrousdPerMillionTokens: counter.positive(),
 }).strict();
+const priceSchema = analysisBudgetPriceSchema;
 export type AnalysisBudgetPrice = z.infer<typeof priceSchema>;
 const planSchema = z.object({
   model: z.enum(GEMINI_MODELS), frameCount: counter.min(1).max(ANALYSIS_LIMITS.maxFrames),

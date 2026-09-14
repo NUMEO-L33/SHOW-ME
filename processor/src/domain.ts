@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { AnalysisCommand, AnalysisState } from "./analysis-state.js";
+import type { AnalysisFundingRepository } from "./analysis-funding.js";
 
 export const GUIDE_STATUSES = [
   "uploading",
@@ -233,7 +234,7 @@ export type CompleteProcessingAttemptInput = {
   statusMessage?: string;
 };
 
-export interface GuideRepository {
+export interface GuideRepository extends AnalysisFundingRepository {
   /** Internal-only Gate 3A commands; callers must authenticate before exposing an API. */
   executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null>;
   getAnalysisState(guideId: string): Promise<AnalysisState | null>;
