@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { analysisBudgetUnitsSchema, type AnalysisBudgetUnits } from "./analysis-budget.js";
+import { ANALYSIS_LIMITS } from "./analysis-contract.js";
 
 /** Internal accounting only; none of these records authorizes a provider call. */
 export class AnalysisAccountingError extends Error {
@@ -10,14 +11,17 @@ export class AnalysisAccountingError extends Error {
 
 const id = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const counter = z.number().int().nonnegative().safe();
+export const analysisWorkOwnerSchema = z.object({
+  attemptId: id, attemptCount: counter.min(1).max(ANALYSIS_LIMITS.maxAttempts),
+}).strict();
 export const accountingUsageSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("unknown") }).strict(),
   z.object({ status: z.literal("known"), inputTokens: counter, outputTokens: counter }).strict(),
 ]);
 const identity = { runId: z.string().min(1).max(128), batchIndex: counter.max(5), ordinal: z.union([z.literal(0), z.literal(1)]), dispatchId: id };
 const commandSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("allocate"), ...identity }).strict(),
-  z.object({ type: z.literal("sending"), ...identity }).strict(),
+  z.object({ type: z.literal("allocate"), ...identity, owner: analysisWorkOwnerSchema.optional() }).strict(),
+  z.object({ type: z.literal("sending"), ...identity, owner: analysisWorkOwnerSchema.optional() }).strict(),
   z.object({ type: z.literal("settle"), ...identity, usage: accountingUsageSchema }).strict(),
   z.object({ type: z.literal("release"), ...identity }).strict(),
 ]);

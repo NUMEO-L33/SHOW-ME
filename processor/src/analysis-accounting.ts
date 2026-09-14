@@ -13,6 +13,7 @@ import {
 } from "./analysis-funding.js";
 import { parseAnalysisState, type AnalysisState } from "./analysis-state.js";
 import type { GuideWithSteps } from "./domain.js";
+import { ownsAnalysisWork } from "./analysis-work.js";
 
 export type AccountingTransition = AnalysisAccountingResult & { windows: AnalysisBudgetWindow[]; control: AnalysisAccountingControl };
 
@@ -31,6 +32,10 @@ export function prepareAnalysisAccounting(options: {
   const analysis = parseAnalysisState(options.analysis);
   validateFundingAnalysis(analysis, reservation, options.batches);
   const run = analysis.runs.find((r) => r.id === command.runId)!;
+  // Once work has an owner, fresh dispatch writes AND their replays require that
+  // exact, unexpired lease. Settlement remains numeric-only and may arrive late.
+  if ((command.type === "allocate" || command.type === "sending") &&
+      (run.attemptCount > 0 || command.owner) && !ownsAnalysisWork(run, command.owner, options.now)) return null;
   const attempts = options.attempts.map(parseRequestAttempt);
   const before = reservationAccounted(reservation, attempts);
   if (!control.halted && attempts.some((a) => a.status === "overrun")) accountingInvalid();

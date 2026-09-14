@@ -2,7 +2,7 @@
 
 화면 녹화 영상을 올리면 단계별 대표 화면으로 바꾸는 한국어 안내서 제작기입니다.
 
-개발은 [전체 개발 계획 v1.4](docs/DEVELOPMENT_PLAN.md)을 기준으로 순서대로 진행합니다. 각 묶음의 선행 조건·완료 기준·현재 상태, 사용자 확정 정책과 웹 완성 후 모바일 보완까지 정리되어 있습니다.
+개발은 [전체 개발 계획 v1.5](docs/DEVELOPMENT_PLAN.md)을 기준으로 순서대로 진행합니다. 각 묶음의 선행 조건·완료 기준·현재 상태, 사용자 확정 정책과 웹 완성 후 모바일 보완까지 정리되어 있습니다.
 
 현재 사용자 화면은 Phase 0–2까지 구현되어 있으며, AI 계약·저장 기반, Gemini 가상 화면 연결 시험, 분석 HTTP API 경계를 추가했습니다. 제품의 자동 AI 분석은 아직 꺼져 있습니다.
 
@@ -14,7 +14,8 @@
 - Gate 3B-2A: 인증된 분석 요청·조회·취소 API. 작업 큐·운영 예산 접수기가 준비되기 전에는 새 요청을 503으로 거절합니다. [현재 계약과 미구현 범위](docs/ANALYSIS_API.md)
 - 전체 계획 B2-A/B: 초안·작업·묶음·예산 원자 저장과 요청별 사용량 정산, 중복 반영 방지·상한 위반 중단 기반. [저장·정산 체크포인트](docs/ANALYSIS_EXECUTION_DESIGN.md)
 - 전체 계획 B3: 요청을 예산 저장에 연결하는 접수기와 저장 직전 준비 조건 재확인. 실제 준비 조건 검증기·AI 실행기가 없어 기본 설정의 새 요청은 계속 503입니다. [현재 접수 계약](docs/ANALYSIS_API.md)
-- 아직 다음 단계: AI 작업 큐·운영 예산·동의 화면 연결, StepCanvas 편집, 비가역 개인정보 가림, 서버 기반 공개 링크
+- 전체 계획 B4-A: 대기 작업 조회, 단일 작업 소유권, 만료 후 인계와 불확실 요청 보존. 자동 실행 루프·AI 처리 연결은 아직 없습니다. [인계 저장과 남은 작업](docs/ANALYSIS_EXECUTION_DESIGN.md)
+- 아직 다음 단계: AI 묶음 처리·부분 결과 복구·운영 전송 조건·동의 화면 연결, StepCanvas 편집, 비가역 개인정보 가림, 서버 기반 공개 링크
 
 웹 UI는 `npm run dev`, 미디어 서비스 개발 모드는 `npm run processor:dev`로 각각 실행합니다. 컴파일된 프로세서는 `npm run processor:build` 후 `npm run processor:start`로 실행합니다. 로컬 UI는 기본적으로 `http://127.0.0.1:8788`의 프로세서를 찾습니다. 전체 검증은 `npm run check`입니다. 단계별 완료 조건은 [`docs/IMPLEMENTATION_PHASES.md`](docs/IMPLEMENTATION_PHASES.md), 배포 구조와 환경 변수는 [`processor/README.md`](processor/README.md)를 참고하세요.
 

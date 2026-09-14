@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  check,
   foreignKey,
   index,
   integer,
@@ -112,9 +113,22 @@ export const analysisRuns = pgTable("analysis_runs", {
   id: text("id").notNull(),
   status: text("status").$type<AnalysisRun["status"]>().notNull(),
   payload: jsonb("payload").$type<Omit<AnalysisRun, "id" | "status">>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+  availableAt: timestamp("available_at", { withTimezone: true, mode: "date" }),
+  attemptCount: integer("attempt_count").notNull(),
 }, (table) => [
   primaryKey({ columns: [table.guideId, table.id] }),
   index("analysis_runs_guide_status_idx").on(table.guideId, table.status),
+  index("analysis_runs_work_due_idx").on(table.status, table.availableAt, table.createdAt, table.guideId, table.id),
+  check("analysis_runs_work_projection_check", sql`(
+    ${table.createdAt} = (${table.payload}->>'createdAt')::timestamptz
+    AND ${table.attemptCount} = (${table.payload}->>'attemptCount')::integer
+    AND ${table.attemptCount} BETWEEN 0 AND 3
+    AND (${table.status} <> 'running' OR ${table.availableAt} IS NOT NULL)
+    AND ${table.availableAt} IS NOT DISTINCT FROM CASE
+      WHEN ${table.status} = 'queued' THEN (${table.payload}->>'createdAt')::timestamptz
+      WHEN ${table.status} = 'running' THEN (${table.payload}->>'leaseExpiresAt')::timestamptz
+      ELSE NULL::timestamptz END) IS TRUE`),
 ]);
 
 // Accounting survives guide deletion. Only batch payloads cascade with runs.
