@@ -6,6 +6,7 @@ import { ANALYSIS_CONSENT_VERSION, AnalysisContractError, analysisManifest, pars
 import { parseAnalysisState, type AnalysisCommand, type AnalysisRun, type AnalysisState } from "./analysis-state.js";
 import type { GuideRepository, GuideWithSteps } from "./domain.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
+import { AnalysisAdmissionError } from "./analysis-admission.js";
 
 export const ANALYSIS_API_MODEL = GEMINI_TEST_MODEL;
 export const ANALYSIS_ADMISSION_TIMEOUT_MS = 5_000;
@@ -19,6 +20,7 @@ const errors = {
   ANALYSIS_MEDIA_NOT_READY: [409, "화면 추출이 완료된 영상만 분석할 수 있어요."],
   ANALYSIS_STATE_CHANGED: [409, "분석 또는 편집 상태가 바뀌었어요. 최신 상태를 확인해 주세요."],
   ANALYSIS_UNAVAILABLE: [503, "AI 분석 실행 준비가 아직 완료되지 않았어요."],
+  ANALYSIS_BUDGET_LIMIT: [429, "오늘 사용할 수 있는 AI 분석 한도에 도달했어요."],
   ANALYSIS_ADMISSION_TIMEOUT: [503, "요청 접수 확인이 지연됐어요. 같은 실행 ID로 상태를 확인해 주세요."],
   ANALYSIS_INTERNAL_ERROR: [500, "분석 요청을 처리하지 못했어요."],
 } as const;
@@ -30,10 +32,10 @@ export class AnalysisApiError extends Error {
 export type AnalysisRequestCommand = Extract<AnalysisCommand, { type: "request" }>;
 /**
  * Trusted composition boundary, NOT a public enable flag.
- * A future implementation must atomically reserve the operating budget and
- * persist the run, admit only when its durable worker is ready, and honor the
- * snapshot/consent/idempotency contract. The HTTP layer never calls Google.
- * Startup deliberately supplies no admission until that implementation exists.
+ * The durable implementation atomically reserves the operating budget and
+ * persists the run only when trusted readiness evidence permits admission,
+ * honoring the snapshot/consent/idempotency contract. The HTTP layer never calls Google.
+ * Startup's default admission has no readiness verifier and stays unavailable.
  */
 export interface AnalysisAdmission {
   request(guideId: string, command: AnalysisRequestCommand, signal: AbortSignal): Promise<AnalysisState | null>;
@@ -190,7 +192,7 @@ export function createAnalysisRouter(options: {
   router.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     void _next;
     const type = typeof error === "object" && error !== null && "type" in error ? error.type : undefined;
-    const code = error instanceof AnalysisApiError ? error.code
+    const code = error instanceof AnalysisApiError || error instanceof AnalysisAdmissionError ? error.code
       : type === "entity.too.large" ? "ANALYSIS_BODY_TOO_LARGE"
       : type === "entity.parse.failed" ? "ANALYSIS_INVALID_REQUEST"
       : type === "encoding.unsupported" || type === "charset.unsupported" ? "ANALYSIS_JSON_REQUIRED"

@@ -11,6 +11,7 @@ import { rateLimit } from "express-rate-limit";
 
 import { createAssetTicket, verifyAssetTicket } from "./asset-token.js";
 import { AnalysisApiError, createAnalysisRouter, type AnalysisAdmission } from "./analysis-api.js";
+import { DurableAnalysisAdmission } from "./analysis-admission.js";
 import {
   cleanupStorageKeys,
   DELETION_PENDING,
@@ -59,7 +60,7 @@ export type ProcessorAppDependencies = {
   pipeline: GuidePipeline;
   queue?: ProcessingQueue;
   readiness?: { ready: boolean };
-  /** Absent at startup until durable AI scheduling and operating budgets exist. */
+  /** Trusted composition override. Default admission has no readiness verifier and rejects new runs. */
   analysisAdmission?: AnalysisAdmission;
 };
 
@@ -407,7 +408,7 @@ export function createProcessorApp({
   });
 
   app.use("/api/guides/:guideId/analysis", createAnalysisRouter({
-    repository, admission: analysisAdmission,
+    repository, admission: analysisAdmission ?? new DurableAnalysisAdmission({ repository }),
     authenticate: async (request) => {
       try { return await requireGuideAccess(request, repository); }
       catch (error) {

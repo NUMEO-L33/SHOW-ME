@@ -65,7 +65,8 @@ export type AnalysisFundingLedger = z.infer<typeof ledgerSchema>;
 export type AnalysisFundingResult = { analysis: AnalysisState; reservation: AnalysisReservation; batches: AnalysisStoredBatch[]; replayed: boolean };
 
 export interface AnalysisFundingRepository {
-  reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now?: Date): Promise<AnalysisFundingResult | null>;
+  /** beforeCommit is trusted synchronous validation only; no I/O or mutations. Replays skip it. */
+  reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now?: Date, beforeCommit?: () => void): Promise<AnalysisFundingResult | null>;
   getAnalysisFunding(guideId: string, runId: string): Promise<{ reservation: AnalysisReservation; batches: AnalysisStoredBatch[] } | null>;
   getAnalysisBudgetWindow(day: string, scope: string): Promise<AnalysisBudgetWindow | null>;
 }

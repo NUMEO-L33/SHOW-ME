@@ -28,13 +28,14 @@ export function fakeProvider(): AnalysisProvider {
   };
 }
 
-export async function createAnalysisHarness(context: TestContext, stepCount = 2) {
+export async function createAnalysisHarness(context: TestContext, stepCount = 2,
+  identity = { guideId: "analysis-guide", editToken: "fixture-token" }) {
   const root = await mkdtemp(join(tmpdir(), "showme-analysis-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   const repository = new JsonGuideRepository(join(root, "guides.json"));
-  const guideId = "analysis-guide";
+  const guideId = identity.guideId;
   await repository.createGuide({
-    id: guideId, slug: guideId, editToken: "fixture-token", title: "private filename is not an AI title",
+    id: guideId, slug: guideId, editToken: identity.editToken, title: "private filename is not an AI title",
     status: "queued", originalObjectKey: `guides/${guideId}/source.mp4`,
     sourceFilename: "private-fixture.mp4", sourceMimeType: "video/mp4", sourceSizeBytes: 128,
   });

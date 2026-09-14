@@ -101,6 +101,16 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function validateFundingCommit(beforeCommit?: () => void): void {
+  const result = beforeCommit?.();
+  if (result !== undefined) {
+    // Reject accidental async validators rather than commit before their checks.
+    // Consume a rejected promise so its private error cannot escape via an unhandled rejection.
+    void Promise.resolve(result).catch(() => undefined);
+    throw new RepositoryDataError("Funding commit validation must be synchronous and return no value.");
+  }
+}
+
 function normalizedLimit(limit = DEFAULT_LIST_LIMIT): number {
   if (!Number.isInteger(limit) || limit <= 0) {
     throw new RangeError("limit must be a positive integer.");
@@ -583,7 +593,7 @@ export class JsonGuideRepository implements GuideRepository {
     });
   }
 
-  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date()): Promise<AnalysisFundingResult | null> {
+  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date(), beforeCommit?: () => void): Promise<AnalysisFundingResult | null> {
     command = parseFundingCommand(command);
     policy = parseFundingPolicy(policy);
     fundingDay(now);
@@ -600,6 +610,7 @@ export class JsonGuideRepository implements GuideRepository {
       if (!prepared) return null;
       const { windows, ...result } = prepared;
       if (result.replayed) return clone(result);
+      validateFundingCommit(beforeCommit);
       state.analysis = [...state.analysis.filter((entry) => entry.guideId !== guideId), { guideId, state: result.analysis }];
       for (const window of windows) state.funding.windows = [...state.funding.windows.filter((w) => w.day !== window.day || w.scope !== window.scope), window];
       state.funding.reservations.push(result.reservation);
@@ -1087,7 +1098,7 @@ export class PostgresGuideRepository implements GuideRepository {
     return this.analysisTransaction(guideId, command);
   }
 
-  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date()): Promise<AnalysisFundingResult | null> {
+  async reserveAnalysisRequest(guideId: string, command: AnalysisFundingCommand, policy: AnalysisFundingPolicy, now = new Date(), beforeCommit?: () => void): Promise<AnalysisFundingResult | null> {
     command = parseFundingCommand(command);
     policy = parseFundingPolicy(policy);
     const day = fundingDay(now);
@@ -1125,6 +1136,7 @@ export class PostgresGuideRepository implements GuideRepository {
           if (!initialReservation) throw new FundingRollback(result);
           return result;
         }
+        validateFundingCommit(beforeCommit);
         await persistAnalysisRows(transaction, guideId, previous, result.analysis);
         for (const window of nextWindows) {
           const { day: windowDay, scope, ...payload } = window;

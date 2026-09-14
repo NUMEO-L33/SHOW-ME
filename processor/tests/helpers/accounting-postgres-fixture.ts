@@ -54,7 +54,14 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
       writes.push(table);
       for (const row of selected(table, condition)) Object.assign(row, structuredClone(values));
     } }) }),
-    insert: (table: PgTable) => ({ values: (values: Row) => ({ onConflictDoUpdate: async () => {
+    insert: (table: PgTable) => ({ values: (values: Row) => ({
+      onConflictDoNothing: async () => {
+        if (table !== analysisBudgetWindows) throw new Error("fixture supports only provisional budget window inserts");
+        writes.push(table);
+        const rows = tables.get(table)!;
+        if (!rows.some((row) => row.day === values.day && row.scope === values.scope)) rows.push(structuredClone(values));
+      },
+      onConflictDoUpdate: async () => {
       writes.push(table);
       if (failAttemptWrite) throw new Error("simulated attempt persistence failure");
       const rows = tables.get(table)!;
