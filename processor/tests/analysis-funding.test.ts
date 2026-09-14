@@ -38,7 +38,7 @@ test("funding atomically saves the draft, run, six bounded batches and both budg
   assert.deepEqual(result.batches[0].contextIds, ["step-4"]);
   assert.deepEqual(result.batches[1].contextIds, ["step-3", "step-8"]);
   const saved = await h.state();
-  assert.equal(saved.version, 2);
+  assert.equal(saved.version, 3);
   assert.equal(saved.funding.reservations.length, 1);
   assert.equal(saved.funding.windows.length, 2);
   for (const window of saved.funding.windows) assert.deepEqual(window.used, result.reservation.maximum);
@@ -215,7 +215,7 @@ test("legacy files upgrade on write and malformed accounting is never reset on r
   await writeFile(h.repository.filePath, JSON.stringify(legacy));
   assert.ok(await h.reserve());
   const saved = await h.state();
-  assert.equal(saved.version, 2);
+  assert.equal(saved.version, 3);
   const invalid = [ { ...saved, funding: null }, { ...saved, funding: undefined }, { ...saved, version: 1 } ];
   const tampered = structuredClone(saved);
   tampered.funding.windows[0].used.requests = 0;

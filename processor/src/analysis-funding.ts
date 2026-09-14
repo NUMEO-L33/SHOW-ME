@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-import { analysisBudgetPriceSchema, analysisBudgetUnitsSchema, quoteAnalysisBudget, reserveAnalysisBudget } from "./analysis-budget.js";
+import { analysisBudgetPriceSchema, analysisBudgetUnitsSchema, quoteAnalysisBudget, reserveAnalysisBudget, settleAnalysisRequest } from "./analysis-budget.js";
+import {
+  accountingControlSchema, analysisRequestAttemptSchema, AnalysisAccountingError, budgetUnitFields,
+  parseRequestAttempt, sameBudgetUnits, type AnalysisRequestAttempt,
+} from "./analysis-accounting-contract.js";
 import { analysisBatches, analysisManifest } from "./analysis-contract.js";
 import { parseAnalysisCommand, parseAnalysisState, transitionAnalysis, type AnalysisCommand, type AnalysisState } from "./analysis-state.js";
 import type { GuideWithSteps } from "./domain.js";
@@ -55,7 +59,8 @@ const batchSchema = z.object({
 export type AnalysisBudgetWindow = z.infer<typeof windowSchema>;
 export type AnalysisReservation = z.infer<typeof reservationSchema>;
 export type AnalysisStoredBatch = z.infer<typeof batchSchema>;
-const ledgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(reservationSchema), batches: z.array(batchSchema) }).strict();
+const legacyLedgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(reservationSchema), batches: z.array(batchSchema) }).strict();
+const ledgerSchema = legacyLedgerSchema.extend({ attempts: z.array(analysisRequestAttemptSchema), control: accountingControlSchema }).strict();
 export type AnalysisFundingLedger = z.infer<typeof ledgerSchema>;
 export type AnalysisFundingResult = { analysis: AnalysisState; reservation: AnalysisReservation; batches: AnalysisStoredBatch[]; replayed: boolean };
 
@@ -96,7 +101,37 @@ export function parseReservation(raw: unknown): AnalysisReservation {
   }
   return reservation;
 }
-export function emptyFundingLedger(): AnalysisFundingLedger { return { windows: [], reservations: [], batches: [] }; }
+export function emptyFundingLedger(): AnalysisFundingLedger { return { windows: [], reservations: [], batches: [], attempts: [], control: { halted: false } }; }
+export function upgradeFundingLedgerV2(raw: unknown): AnalysisFundingLedger {
+  return parseFundingLedger({ ...parse(legacyLedgerSchema, raw), attempts: [], control: { halted: false } });
+}
+
+/** Unallocated slots still retain their maximum. Only recorded settlements/releases discount them. */
+export function reservationAccounted(reservation: AnalysisReservation, rawAttempts: AnalysisRequestAttempt[]) {
+  const attempts = rawAttempts.map(parseRequestAttempt);
+  const slots = attempts.map((a) => `${a.batchIndex}:${a.ordinal}`);
+  if (new Set(slots).size !== slots.length || new Set(attempts.map((a) => a.dispatchId)).size !== attempts.length) invalid();
+  const q = reservation.details ? quote(reservation.details.policy, reservation.details.frameCount, reservation.details.command.model) : null;
+  for (const a of attempts) {
+    if (a.guideId !== reservation.guideId || a.runId !== reservation.runId ||
+        a.createdAt.slice(0, 10) !== reservation.day || (a.sentAt && a.sentAt.slice(0, 10) !== reservation.day)) invalid();
+    if (a.ordinal === 1 && !attempts.some((p) => p.batchIndex === a.batchIndex && p.ordinal === 0 &&
+        ["settled", "uncertain", "overrun"].includes(p.status))) invalid();
+    if (q && reservation.details) {
+      if (a.batchIndex >= q.batchCount || a.ordinal > reservation.details.policy.transientRetries ||
+          !sameBudgetUnits(a.maximum, q.request.maximum)) invalid();
+      if (a.status === "settled" && !sameBudgetUnits(a.charged, settleAnalysisRequest(q.request, a.usage))) invalid();
+    }
+  }
+  const accounted = { ...reservation.maximum };
+  for (const field of budgetUnitFields) {
+    const allocated = attempts.reduce((sum, a) => sum + BigInt(a.maximum[field]), 0n);
+    const released = attempts.reduce((sum, a) => sum + BigInt(a.maximum[field] - a.charged[field]), 0n);
+    if (allocated > BigInt(reservation.maximum[field])) invalid();
+    accounted[field] = Number(BigInt(reservation.maximum[field]) - released);
+  }
+  return accounted;
+}
 
 export function validateFundingAnalysis(analysis: AnalysisState, reservation: AnalysisReservation, batches: AnalysisStoredBatch[]): void {
   const run = analysis.runs.find((candidate) => candidate.id === reservation.runId);
@@ -112,11 +147,14 @@ export function validateFundingAnalysis(analysis: AnalysisState, reservation: An
 /** Full-file validation. Never reset a corrupt ledger to empty on reopen. */
 export function parseFundingLedger(raw: unknown): AnalysisFundingLedger {
   const ledger = parse(ledgerSchema, raw);
+  ledger.attempts = ledger.attempts.map(parseRequestAttempt);
+  if (!ledger.control.halted && ledger.attempts.some((a) => a.status === "overrun")) invalid();
   const key = (...parts: unknown[]) => JSON.stringify(parts);
   for (const keys of [ledger.windows.map((w) => key(w.day, w.scope)), ledger.reservations.map((r) => key(r.guideId, r.runId)),
     ledger.batches.map((b) => key(b.guideId, b.runId, b.index))]) if (new Set(keys).size !== keys.length) invalid();
   for (const reservation of ledger.reservations) {
     parseReservation(reservation);
+    reservationAccounted(reservation, ledger.attempts.filter((a) => a.guideId === reservation.guideId && a.runId === reservation.runId));
     for (const scope of ["global", `guide:${reservation.guideId}`]) {
       if (!ledger.windows.some((w) => w.day === reservation.day && w.scope === scope)) invalid();
     }
@@ -129,10 +167,12 @@ export function parseFundingLedger(raw: unknown): AnalysisFundingLedger {
     }
   }
   for (const batch of ledger.batches) if (!ledger.reservations.some((r) => r.guideId === batch.guideId && r.runId === batch.runId && r.details)) invalid();
+  for (const attempt of ledger.attempts) if (!ledger.reservations.some((r) => r.guideId === attempt.guideId && r.runId === attempt.runId)) invalid();
   for (const window of ledger.windows) {
     const reservations = ledger.reservations.filter((r) => r.day === window.day && (window.scope === "global" || window.scope === `guide:${r.guideId}`));
     for (const field of ["requests", "inputTokens", "outputTokens", "costMicrousd"] as const) {
-      const total = reservations.reduce((sum, r) => sum + BigInt(r.maximum[field]), 0n);
+      const total = reservations.reduce((sum, r) => sum + BigInt(reservationAccounted(r,
+        ledger.attempts.filter((a) => a.guideId === r.guideId && a.runId === r.runId))[field]), 0n);
       if (total !== BigInt(window.used[field]) || window.used[field] > window.limit[field]) invalid();
     }
   }
@@ -145,10 +185,10 @@ export function initialBudgetWindow(day: string, scope: string, policy: Analysis
     used: { requests: 0, inputTokens: 0, outputTokens: 0, costMicrousd: 0 } });
 }
 
-/** Caller holds global-day, guide-day, then guide locks and commits all returned values together. */
+/** Caller holds global control, global-day, guide-day, then guide locks and commits all values together. */
 export function prepareFundedAnalysis(options: {
   guide: GuideWithSteps; previous: AnalysisState; command: AnalysisFundingCommand; policy: AnalysisFundingPolicy; now: Date;
-  existing: AnalysisReservation | null; batches: AnalysisStoredBatch[]; windows: AnalysisBudgetWindow[];
+  existing: AnalysisReservation | null; batches: AnalysisStoredBatch[]; windows: AnalysisBudgetWindow[]; halted: boolean;
 }): (AnalysisFundingResult & { windows: AnalysisBudgetWindow[] }) | null {
   const { guide, now } = options;
   const command = parseFundingCommand(options.command);
@@ -165,6 +205,7 @@ export function prepareFundedAnalysis(options: {
     return { analysis: previous, reservation, batches, windows: [], replayed: true };
   }
   if (previous.runs.some((run) => run.id === command.runId)) return null; // Never fund a legacy unbudgeted run retroactively.
+  if (options.halted) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
   const policy = parseFundingPolicy(options.policy);
   if (command.provider !== "gemini" || command.model !== policy.price.model) invalid();
   const manifest = analysisManifest(guide);

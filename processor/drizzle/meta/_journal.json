@@ -29,6 +29,13 @@
       "when": 1789379233608,
       "tag": "0003_analysis_funding",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789383082269,
+      "tag": "0004_analysis_accounting",
+      "breakpoints": true
     }
   ]
 }

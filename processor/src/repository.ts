@@ -27,9 +27,11 @@ import {
   type GuideWithSteps,
 } from "./domain.js";
 import {
+  analysisAccountingControls,
   analysisBatchesTable,
   analysisBudgetWindows,
   analysisReservations,
+  analysisRequestAttempts,
   analysisRuns,
   guideDrafts,
   guideSteps,
@@ -48,10 +50,16 @@ import {
 import {
   emptyFundingLedger, fundingDay, fundingWindowIdentity, initialBudgetWindow, parseBudgetWindow,
   parseFundingCommand, parseFundingLedger, parseFundingPolicy, parseReservation, parseStoredBatch, prepareFundedAnalysis, validateFundingAnalysis,
+  reservationAccounted, upgradeFundingLedgerV2,
   type AnalysisFundingCommand, type AnalysisFundingLedger, type AnalysisFundingPolicy, type AnalysisFundingResult,
 } from "./analysis-funding.js";
+import {
+  parseAccountingCommand, parseAccountingControl, parseRequestAttempt,
+  type AnalysisAccountingCommand, type AnalysisAccountingResult, type AnalysisRequestAttempt,
+} from "./analysis-accounting-contract.js";
+import { prepareAnalysisAccounting } from "./analysis-accounting.js";
 
-const JSON_REPOSITORY_VERSION = 2 as const;
+const JSON_REPOSITORY_VERSION = 3 as const;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 
@@ -438,7 +446,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
-    ![1, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
+    ![1, 2, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
     !Array.isArray((parsed as { guides?: unknown }).guides) ||
     !Array.isArray((parsed as { steps?: unknown }).steps)
   ) {
@@ -447,12 +455,14 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
 
   const state = parsed as JsonRepositoryState;
   const legacyVersion = (parsed as { version: number }).version === 1;
-  // Older binaries reject v2 instead of silently discarding budget reservations.
+  const fundingV2 = (parsed as { version: number }).version === 2;
+  // Older binaries must reject v3 rather than silently discard settlements.
   if (legacyVersion) {
     if (state.funding !== undefined) throw new RepositoryDataError("Invalid legacy funding state.");
     state.funding = emptyFundingLedger();
-    state.version = JSON_REPOSITORY_VERSION;
   }
+  if (fundingV2) state.funding = upgradeFundingLedgerV2(state.funding);
+  state.version = JSON_REPOSITORY_VERSION;
   state.funding = parseFundingLedger(state.funding);
   // Additive upgrade of legacy analysis; never discard malformed state.
   if (legacyVersion && state.analysis === undefined) state.analysis = [];
@@ -586,7 +596,7 @@ export class JsonGuideRepository implements GuideRepository {
         previous: state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState(), command, policy, now,
         existing: state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId) ?? null,
         batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
-        windows: state.funding.windows });
+        windows: state.funding.windows, halted: state.funding.control.halted });
       if (!prepared) return null;
       const { windows, ...result } = prepared;
       if (result.replayed) return clone(result);
@@ -615,6 +625,44 @@ export class JsonGuideRepository implements GuideRepository {
     fundingWindowIdentity(day, scope);
     return this.serialize(async () => clone((await this.readState()).funding.windows.find((w) => w.day === day && w.scope === scope) ?? null));
   }
+
+  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now = new Date()): Promise<AnalysisAccountingResult | null> {
+    command = parseAccountingCommand(command);
+    fundingDay(now);
+    now = new Date(now.valueOf());
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const guide = state.guides.find((g) => g.id === guideId);
+      const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId);
+      if (!guide || !reservation?.details) return null;
+      const prepared = prepareAnalysisAccounting({ guide: { ...guide, steps: state.steps.filter((s) => s.guideId === guideId) },
+        analysis: state.analysis.find((a) => a.guideId === guideId)?.state ?? emptyAnalysisState(), reservation,
+        attempts: state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === command.runId),
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
+        windows: state.funding.windows, control: state.funding.control, command, now });
+      if (!prepared) return null;
+      const { windows, control, ...result } = prepared;
+      if (result.replayed) return clone(result);
+      state.funding.control = control;
+      state.funding.attempts = [...state.funding.attempts.filter((a) => !(a.guideId === guideId && a.runId === command.runId &&
+        a.batchIndex === command.batchIndex && a.ordinal === command.ordinal)), result.attempt];
+      for (const window of windows) state.funding.windows = [...state.funding.windows.filter((w) => w.day !== window.day || w.scope !== window.scope), window];
+      state.funding = parseFundingLedger(state.funding);
+      await this.writeState(state);
+      return clone(result);
+    });
+  }
+
+  async getAnalysisRequestAttempts(guideId: string, runId: string) {
+    return this.serialize(async () => {
+      const state = await this.readState();
+      if (!state.guides.some((g) => g.id === guideId) || !state.funding.reservations.some((r) => r.guideId === guideId && r.runId === runId && r.details)) return null;
+      return clone(state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === runId)
+        .sort((a, b) => a.batchIndex - b.batchIndex || a.ordinal - b.ordinal));
+    });
+  }
+
+  async getAnalysisAccountingControl() { return this.serialize(async () => clone((await this.readState()).funding.control)); }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {
     return this.serialize(async () => {
@@ -972,6 +1020,20 @@ async function persistAnalysisRows(transaction: ProcessorTransaction, guideId: s
   }
 }
 
+async function lockAccountingControl(transaction: ProcessorTransaction) {
+  const [row] = await transaction.select().from(analysisAccountingControls)
+    .where(eq(analysisAccountingControls.id, "global")).limit(1).for("update");
+  // A missing/corrupt singleton is an error, never an implicit reset to enabled.
+  return parseAccountingControl(row?.payload);
+}
+
+async function loadRequestAttempts(transaction: ProcessorTransaction, guideId: string, runId: string): Promise<AnalysisRequestAttempt[]> {
+  const rows = await transaction.select().from(analysisRequestAttempts)
+    .where(and(eq(analysisRequestAttempts.guideId, guideId), eq(analysisRequestAttempts.runId, runId)))
+    .orderBy(asc(analysisRequestAttempts.batchIndex), asc(analysisRequestAttempts.ordinal));
+  return rows.map(({ payload, ...identity }) => parseRequestAttempt({ ...payload, ...identity }));
+}
+
 // Roll back even provisional zero-valued windows on conflict or racing replay.
 class FundingRollback extends Error {
   constructor(readonly result: AnalysisFundingResult | null) { super("Analysis funding transaction not committed."); }
@@ -1032,11 +1094,12 @@ export class PostgresGuideRepository implements GuideRepository {
     now = new Date(now.valueOf());
     try {
       return await this.database.transaction(async (transaction) => {
+        const control = await lockAccountingControl(transaction);
         const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
         const [initialReservation] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
         const windows = [];
         if (!initialReservation) {
-          // All budget writers must retain this order: global-day, guide-day, guide.
+          // All budget writers: global control, global-day, guide-day, guide.
           for (const scope of ["global", `guide:${guideId}`]) {
             const { day: windowDay, scope: windowScope, ...payload } = initialBudgetWindow(day, scope, policy);
             await transaction.insert(analysisBudgetWindows).values({ day: windowDay, scope: windowScope, payload }).onConflictDoNothing();
@@ -1048,13 +1111,14 @@ export class PostgresGuideRepository implements GuideRepository {
         const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
         if (!guide) throw new FundingRollback(null);
         const [stored] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
+        if (stored) reservationAccounted(parseReservation(stored), await loadRequestAttempts(transaction, guideId, command.runId));
         const batchRows = await transaction.select().from(analysisBatchesTable)
           .where(and(eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
         const previous = await loadAnalysisRows(transaction, guideId);
         const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
         const prepared = prepareFundedAnalysis({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, previous,
           command, policy, now, existing: stored ? parseReservation(stored) : null,
-          batches: batchRows.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })), windows });
+          batches: batchRows.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })), windows, halted: control.halted });
         if (!prepared) throw new FundingRollback(null);
         const { windows: nextWindows, ...result } = prepared;
         if (result.replayed) {
@@ -1088,6 +1152,7 @@ export class PostgresGuideRepository implements GuideRepository {
         .where(and(eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, runId))).orderBy(asc(analysisBatchesTable.index));
       const result = { reservation: parseReservation(row), batches: batches.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })) };
       validateFundingAnalysis(await loadAnalysisRows(transaction, guideId), result.reservation, result.batches);
+      reservationAccounted(result.reservation, await loadRequestAttempts(transaction, guideId, runId));
       return result;
     });
   }
@@ -1097,6 +1162,69 @@ export class PostgresGuideRepository implements GuideRepository {
     const [row] = await this.database.select().from(analysisBudgetWindows)
       .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope))).limit(1);
     return row ? parseBudgetWindow({ ...row.payload, day: row.day, scope: row.scope }) : null;
+  }
+
+  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now = new Date()): Promise<AnalysisAccountingResult | null> {
+    command = parseAccountingCommand(command);
+    fundingDay(now);
+    now = new Date(now.valueOf());
+    return this.database.transaction(async (transaction) => {
+      const control = await lockAccountingControl(transaction);
+      const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
+      const [initial] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
+      if (!initial?.details) return null;
+      const windows = [];
+      for (const scope of ["global", `guide:${guideId}`]) {
+        const [row] = await transaction.select().from(analysisBudgetWindows)
+          .where(and(eq(analysisBudgetWindows.day, initial.day), eq(analysisBudgetWindows.scope, scope))).limit(1).for("update");
+        windows.push(parseBudgetWindow(row ? { ...row.payload, day: row.day, scope: row.scope } : undefined));
+      }
+      const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      // Deletion could have committed before the parent lock; never recreate details.
+      const [reservation] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
+      if (!reservation?.details) return null;
+      const batches = await transaction.select().from(analysisBatchesTable)
+        .where(and(eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+      const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const prepared = prepareAnalysisAccounting({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) },
+        analysis: await loadAnalysisRows(transaction, guideId), reservation: parseReservation(reservation),
+        attempts: await loadRequestAttempts(transaction, guideId, command.runId),
+        batches: batches.map((b) => parseStoredBatch({ ...b.payload, guideId: b.guideId, runId: b.runId, index: b.index })),
+        windows, control, command, now });
+      if (!prepared) return null;
+      const { windows: nextWindows, control: nextControl, ...result } = prepared;
+      if (result.replayed) return result;
+      for (const { day, scope, ...payload } of nextWindows) {
+        await transaction.update(analysisBudgetWindows).set({ payload })
+          .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope)));
+      }
+      const { guideId: attemptGuideId, runId, batchIndex, ordinal, dispatchId, status, ...payload } = result.attempt;
+      await transaction.insert(analysisRequestAttempts).values({ guideId: attemptGuideId, runId, batchIndex, ordinal, dispatchId, status, payload })
+        .onConflictDoUpdate({ target: [analysisRequestAttempts.guideId, analysisRequestAttempts.runId, analysisRequestAttempts.batchIndex, analysisRequestAttempts.ordinal],
+          set: { status, payload } });
+      if (nextControl.halted !== control.halted) await transaction.update(analysisAccountingControls).set({ payload: nextControl })
+        .where(eq(analysisAccountingControls.id, "global"));
+      return result;
+    });
+  }
+
+  async getAnalysisRequestAttempts(guideId: string, runId: string) {
+    return this.database.transaction(async (transaction) => {
+      const [guide] = await transaction.select({ id: guides.id }).from(guides).where(eq(guides.id, guideId)).limit(1).for("share");
+      if (!guide) return null;
+      const [reservation] = await transaction.select().from(analysisReservations)
+        .where(and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, runId))).limit(1);
+      if (!reservation?.details) return null;
+      const attempts = await loadRequestAttempts(transaction, guideId, runId);
+      reservationAccounted(parseReservation(reservation), attempts);
+      return attempts;
+    });
+  }
+
+  async getAnalysisAccountingControl() {
+    const [row] = await this.database.select().from(analysisAccountingControls).where(eq(analysisAccountingControls.id, "global")).limit(1);
+    return parseAccountingControl(row?.payload);
   }
 
   async createGuide(input: CreateGuideInput): Promise<Guide> {

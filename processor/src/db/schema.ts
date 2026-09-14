@@ -21,6 +21,7 @@ import {
 import type { AnalysisRun } from "../analysis-state.js";
 import type { DraftDocument } from "../analysis-contract.js";
 import type { AnalysisBudgetWindow, AnalysisReservation, AnalysisStoredBatch } from "../analysis-funding.js";
+import type { AnalysisAccountingControl, AnalysisRequestAttempt } from "../analysis-accounting-contract.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -134,6 +135,25 @@ export const analysisBatchesTable = pgTable("analysis_batches", {
 }, (table) => [
   primaryKey({ columns: [table.guideId, table.runId, table.index] }),
   foreignKey({ columns: [table.guideId, table.runId], foreignColumns: [analysisRuns.guideId, analysisRuns.id] }).onDelete("cascade"),
+]);
+
+// Seeded exactly once by migration. All accounting writers lock this row first.
+export const analysisAccountingControls = pgTable("analysis_accounting_controls", {
+  id: text("id").primaryKey(),
+  payload: jsonb("payload").$type<AnalysisAccountingControl>().notNull(),
+});
+
+// Numeric accounting survives guide/run deletion through the retained reservation.
+export const analysisRequestAttempts = pgTable("analysis_request_attempts", {
+  guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), batchIndex: integer("batch_index").notNull(),
+  ordinal: integer("ordinal").notNull(), dispatchId: text("dispatch_id").notNull(),
+  status: text("status").$type<AnalysisRequestAttempt["status"]>().notNull(),
+  payload: jsonb("payload").$type<Omit<AnalysisRequestAttempt, "guideId" | "runId" | "batchIndex" | "ordinal" | "dispatchId" | "status">>().notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.guideId, table.runId, table.batchIndex, table.ordinal] }),
+  uniqueIndex("analysis_request_attempts_dispatch_unique").on(table.guideId, table.runId, table.dispatchId),
+  index("analysis_request_attempts_status_idx").on(table.status),
+  foreignKey({ columns: [table.guideId, table.runId], foreignColumns: [analysisReservations.guideId, analysisReservations.runId] }).onDelete("restrict"),
 ]);
 
 export type GuideRow = typeof guides.$inferSelect;
