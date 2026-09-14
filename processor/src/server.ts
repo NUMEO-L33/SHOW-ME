@@ -10,6 +10,7 @@ import express, { type Application, type NextFunction, type Request, type Respon
 import { rateLimit } from "express-rate-limit";
 
 import { createAssetTicket, verifyAssetTicket } from "./asset-token.js";
+import { AnalysisApiError, createAnalysisRouter, type AnalysisAdmission } from "./analysis-api.js";
 import {
   cleanupStorageKeys,
   DELETION_PENDING,
@@ -58,6 +59,8 @@ export type ProcessorAppDependencies = {
   pipeline: GuidePipeline;
   queue?: ProcessingQueue;
   readiness?: { ready: boolean };
+  /** Absent at startup until durable AI scheduling and operating budgets exist. */
+  analysisAdmission?: AnalysisAdmission;
 };
 
 function cleanFilename(filename: string) {
@@ -346,6 +349,7 @@ export function createProcessorApp({
   pipeline,
   queue = new ProcessingQueue(1, config.queueCapacity),
   readiness = { ready: true },
+  analysisAdmission,
 }: ProcessorAppDependencies): Application {
   const app = express();
   const assetTicketSecret = config.assetTicketSecret
@@ -401,6 +405,17 @@ export function createProcessorApp({
     }
     next();
   });
+
+  app.use("/api/guides/:guideId/analysis", createAnalysisRouter({
+    repository, admission: analysisAdmission,
+    authenticate: async (request) => {
+      try { return await requireGuideAccess(request, repository); }
+      catch (error) {
+        if (error instanceof HttpError && error.code === "GUIDE_NOT_FOUND") throw new AnalysisApiError("GUIDE_NOT_FOUND");
+        throw error;
+      }
+    },
+  }));
 
   app.post("/api/guides", uploadLimiter, async (request, response, next) => {
     let upload: ReceivedUpload | undefined;

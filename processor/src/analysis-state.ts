@@ -41,6 +41,7 @@ type AttemptIdentity = { runId: string; attemptId: string; attemptCount: number 
 export type AnalysisCommand =
   | { type: "initialize" }
   | { type: "start"; runId: string; baseDraftRevision: number; consentVersion: string; provider: string; model: string; promptVersion: string }
+  | { type: "request"; runId: string; baseDraftRevision: number; consentVersion: string; provider: string; model: string; promptVersion: string; expectedInputFingerprint: string }
   | { type: "claim"; runId: string; attemptId: string; expectedAttemptCount: number; leaseMs: number }
   | ({ type: "finish"; output: unknown; inputTokens: number; outputTokens: number } & AttemptIdentity)
   | ({ type: "fail"; errorCode: AnalysisErrorCode } & AttemptIdentity)
@@ -57,6 +58,11 @@ const commandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start"), runId: opaque, baseDraftRevision: revision,
     consentVersion: z.literal(ANALYSIS_CONSENT_VERSION), provider: opaque, model: opaque, promptVersion: opaque,
+  }).strict(),
+  z.object({
+    type: z.literal("request"), runId: opaque, baseDraftRevision: revision,
+    consentVersion: z.literal(ANALYSIS_CONSENT_VERSION), provider: opaque, model: opaque, promptVersion: opaque,
+    expectedInputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   }).strict(),
   z.object({
     type: z.literal("claim"), runId: opaque, attemptId: opaque, expectedAttemptCount: counter,
@@ -127,6 +133,15 @@ export function transitionAnalysis(
   const manifest = analysisManifest(guide);
   const state = structuredClone(previous);
   const timestamp = now.toISOString();
+  if (command.type === "request") {
+    // HTTP admission binds its authenticated media snapshot to the same atomic
+    // transition that creates the initial draft and run. No partial initialization.
+    if (command.expectedInputFingerprint !== manifest.fingerprint) return null;
+    if (!state.draft) state.draft = {
+      revision: 0, inputFingerprint: manifest.fingerprint, document: initialDraft(manifest),
+      createdAt: timestamp, updatedAt: timestamp,
+    };
+  }
   if (command.type === "initialize") {
     if (state.draft) return state.draft.inputFingerprint === manifest.fingerprint ? state : null;
     state.draft = {
@@ -147,7 +162,7 @@ export function transitionAnalysis(
   }
   opaque.parse(command.runId);
   const existing = state.runs.find((run) => run.id === command.runId);
-  if (command.type === "start") {
+  if (command.type === "start" || command.type === "request") {
     revision.parse(command.baseDraftRevision);
     if (command.consentVersion !== ANALYSIS_CONSENT_VERSION) throw new AnalysisContractError();
     for (const value of [command.provider, command.model, command.promptVersion]) opaque.parse(value);

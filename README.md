@@ -2,13 +2,15 @@
 
 화면 녹화 영상을 올리면 단계별 대표 화면으로 바꾸는 한국어 안내서 제작기입니다.
 
-현재 사용자 흐름은 Phase 0–2까지 구현되어 있으며, Gate 3A의 AI 계약·저장 기반을 추가했습니다.
+현재 사용자 화면은 Phase 0–2까지 구현되어 있으며, AI 계약·저장 기반, Gemini 가상 화면 연결 시험, 분석 HTTP API 경계를 추가했습니다. 제품의 자동 AI 분석은 아직 꺼져 있습니다.
 
 - Sites 앱: 업로드 UI, 처리 상태 폴링, 실제 추출 프레임 검토
 - Node 프로세서: 스트리밍 업로드, edit token, 상태 복구, ffprobe/ffmpeg 장면 감지와 회전 안전 프레임 추출
 - 영속 계층: 로컬 개발용 JSON/파일 어댑터, 배포용 PostgreSQL/Drizzle + Replit App Storage 어댑터
-- Gate 3A: 검증된 AI 제안·초안 revision·분석 소유권 저장과 테스트 전용 실행기. 실제 AI 호출·분석 API·화면 연결은 아직 비활성 상태입니다. [검증 범위](docs/GATE_3A_CHECKPOINT.md)
-- 아직 다음 단계: AI 설명·클릭 위치·개인정보 탐지, StepCanvas 편집, 비가역 개인정보 가림, 서버 기반 공개 링크
+- Gate 3A: 검증된 AI 제안·초안 revision·분석 소유권 저장과 내부 실행기. [검증 범위](docs/GATE_3A_CHECKPOINT.md)
+- Gate 3B-1: Gemini 3.5 Flash-Lite로 가상 화면 2장의 실제 분석·검증·결과 저장 성공. 사용자 영상 자동 전송은 하지 않습니다. [Gemini 시험](docs/GEMINI_SETUP.md)
+- Gate 3B-2A: 인증된 분석 요청·조회·취소 API. 작업 큐·운영 예산 접수기가 준비되기 전에는 새 요청을 503으로 거절합니다. [현재 계약과 미구현 범위](docs/ANALYSIS_API.md)
+- 아직 다음 단계: AI 작업 큐·운영 예산·동의 화면 연결, StepCanvas 편집, 비가역 개인정보 가림, 서버 기반 공개 링크
 
 웹 UI는 `npm run dev`, 미디어 서비스 개발 모드는 `npm run processor:dev`로 각각 실행합니다. 컴파일된 프로세서는 `npm run processor:build` 후 `npm run processor:start`로 실행합니다. 로컬 UI는 기본적으로 `http://127.0.0.1:8788`의 프로세서를 찾습니다. 전체 검증은 `npm run check`입니다. 단계별 완료 조건은 [`docs/IMPLEMENTATION_PHASES.md`](docs/IMPLEMENTATION_PHASES.md), 배포 구조와 환경 변수는 [`processor/README.md`](processor/README.md)를 참고하세요.
 

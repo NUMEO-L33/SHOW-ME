@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import request from "supertest";
 
+import { ANALYSIS_CONSENT_VERSION } from "../src/analysis-contract.js";
 import { loadConfig } from "../src/config.js";
 import { createGuidePipeline } from "../src/pipeline.js";
 import { ProcessingQueue } from "../src/queue.js";
@@ -64,8 +65,13 @@ for (const [extension, mimeType, codec] of [
     const guide = await repository.getGuideById(guideId);
     assert.ok(guide);
     assert.ok(await repository.executeAnalysisCommand(guideId, { type: "initialize" }));
-    // No public AI routes or fake-provider product mode exist in this foundation.
-    await request(app).post(`/api/guides/${guideId}/analysis`).set("Authorization", auth).expect(404);
+    // Routes exist, but startup must not queue analysis without durable admission.
+    const analysisBefore = await repository.getAnalysisState(guideId);
+    const unavailable = await request(app).post(`/api/guides/${guideId}/analysis`).set("Authorization", auth)
+      .send({ runId: randomUUID(), baseDraftRevision: 0, consentVersion: ANALYSIS_CONSENT_VERSION, externalProcessing: true })
+      .expect(503);
+    assert.equal(unavailable.body.code, "ANALYSIS_UNAVAILABLE");
+    assert.deepEqual(await repository.getAnalysisState(guideId), analysisBefore);
     await request(app).delete(`/api/guides/${guideId}`).set("Authorization", auth).expect(204);
     assert.equal(await repository.getAnalysisState(guideId), null);
     await assert.rejects(() => access(join(storage.root, guide.originalObjectKey)));
