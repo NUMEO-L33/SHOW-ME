@@ -8,8 +8,8 @@ import { ANALYSIS_CONSENT_VERSION, AnalysisContractError } from "../src/analysis
 import { executeAnalysisAttempt } from "../src/analysis-runner.js";
 import { GeminiAnalysisProvider, GeminiError, parseGeminiResponse } from "../src/gemini/provider.js";
 import { createLocalRequestPermit, GEMINI_SMOKE_DAILY_REQUESTS } from "../src/gemini/quota.js";
-import { buildGeminiRequest, GEMINI_ENDPOINT, GEMINI_MODEL, GEMINI_PROMPT_VERSION, type AnalysisInput } from "../src/gemini/request.js";
-import { smokeMode, SYNTHETIC_CONSENT_VERSION } from "../src/gemini/smoke.js";
+import { buildGeminiRequest, geminiEndpoint, GEMINI_ENDPOINT, GEMINI_MODEL, GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL, type AnalysisInput } from "../src/gemini/request.js";
+import { smokeMode, smokeOptions, SYNTHETIC_CONSENT_VERSION } from "../src/gemini/smoke.js";
 import { syntheticAnalysisInput } from "../src/gemini/synthetic.js";
 import { createAnalysisHarness, fakeOutput } from "./helpers/analysis-fixtures.js";
 
@@ -116,6 +116,38 @@ test("missing consent, key, cancelled input or invalid configuration never perfo
   await assert.rejects(new GeminiAnalysisProvider(base).analyzeFrames(input(), cancelled.signal), hasCode("GEMINI_CANCELLED"));
   assert.throws(() => new GeminiAnalysisProvider({ ...base, timeoutMs: 60_001 }), hasCode("GEMINI_DISABLED"));
   assert.equal(calls, 0);
+});
+
+test("explicit test model binds the request endpoint and response identity without changing the default", async () => {
+  assert.equal(new GeminiAnalysisProvider(options()).model, GEMINI_MODEL);
+  let calls = 0;
+  const provider = new GeminiAnalysisProvider({ ...options(), model: GEMINI_TEST_MODEL, transientRetries: 0,
+    fetch: async (url) => {
+      calls += 1;
+      assert.equal(url, `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEST_MODEL}:generateContent`);
+      return Response.json({ ...envelope(), modelVersion: GEMINI_TEST_MODEL });
+    },
+  });
+  assert.equal(provider.model, GEMINI_TEST_MODEL);
+  assert.equal((await provider.analyzeFrames(input(), signal())).status, "completed");
+  assert.equal(calls, 1);
+  assert.throws(() => parseGeminiResponse(envelope(), input(), GEMINI_TEST_MODEL), hasCode("GEMINI_RESPONSE_INVALID"));
+  assert.throws(() => parseGeminiResponse({ ...envelope(), modelVersion: GEMINI_TEST_MODEL }, input()), hasCode("GEMINI_RESPONSE_INVALID"));
+  calls = 0;
+  const failed = new GeminiAnalysisProvider({ ...options(), model: GEMINI_TEST_MODEL, transientRetries: 0,
+    fetch: async (url) => { calls += 1; assert.equal(url, geminiEndpoint(GEMINI_TEST_MODEL)); return new Response(null, { status: 503 }); },
+  });
+  await assert.rejects(failed.analyzeFrames(input(), signal()), hasCode("GEMINI_HTTP_FAILED"));
+  assert.equal(calls, 1);
+});
+
+test("model allowlist rejects aliases, URLs and unknown models before credentials can be sent", () => {
+  for (const value of ["gemini-flash-latest", "gemini-unreviewed", "https://example.com", "../other?key=private", ""]) {
+    const model = value as typeof GEMINI_MODEL;
+    assert.throws(() => new GeminiAnalysisProvider({ ...options(), model }), hasCode("GEMINI_DISABLED"));
+    assert.throws(() => geminiEndpoint(model), AnalysisContractError);
+    assert.throws(() => parseGeminiResponse(envelope(), input(), model), hasCode("GEMINI_DISABLED"));
+  }
 });
 
 test("completed Gemini results ignore thoughts and signatures and validate only model output", () => {
@@ -282,6 +314,36 @@ test("smoke is offline by default, accepts no user path, and live requires expli
   assert.throws(() => smokeMode(["--live", "private-video.mp4"], env), hasCode("GEMINI_DISABLED"));
 });
 
+test("smoke test model requires an explicit allowlisted flag and never implies live consent", () => {
+  const env = { GEMINI_API_KEY: key, GEMINI_MODEL: GEMINI_TEST_MODEL,
+    SHOWME_GEMINI_FREE_TIER_CONFIRMED: "true", SHOWME_GEMINI_SYNTHETIC_CONSENT: SYNTHETIC_CONSENT_VERSION };
+  assert.deepEqual(smokeOptions([], env), { mode: "dry-run", model: GEMINI_MODEL });
+  assert.deepEqual(smokeOptions(["--model", GEMINI_TEST_MODEL], {}), { mode: "dry-run", model: GEMINI_TEST_MODEL });
+  assert.deepEqual(smokeOptions(["--live", "--model", GEMINI_TEST_MODEL], env), { mode: "live", model: GEMINI_TEST_MODEL });
+  assert.deepEqual(smokeOptions(["--model", GEMINI_TEST_MODEL, "--live"], env), { mode: "live", model: GEMINI_TEST_MODEL });
+  assert.throws(() => smokeOptions(["--live", "--model", GEMINI_TEST_MODEL], {}), hasCode("GEMINI_KEY_MISSING"));
+  assert.throws(() => smokeOptions(["--live", "--model", GEMINI_TEST_MODEL], { GEMINI_API_KEY: key }), hasCode("GEMINI_DISABLED"));
+  for (const args of [["--model"], ["--model", "gemini-flash-latest"], ["--live", "--live"],
+    ["--model", GEMINI_TEST_MODEL, "--model", GEMINI_MODEL], ["--model", GEMINI_TEST_MODEL, "private.mp4"]]) {
+    assert.throws(() => smokeOptions(args, env), hasCode("GEMINI_DISABLED"));
+  }
+});
+
+test("different smoke models share the same daily quota and keep failed reservations", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "showme-gemini-model-quota-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const reserveRequest = createLocalRequestPermit(root, () => new Date("2026-09-14T00:00:00.000Z"));
+  let calls = 0;
+  for (let index = 0; index < 11; index += 1) {
+    const provider = new GeminiAnalysisProvider({ ...options(), model: index % 2 ? GEMINI_MODEL : GEMINI_TEST_MODEL,
+      reserveRequest, transientRetries: 0, fetch: async () => { calls += 1; return new Response(null, { status: 503 }); },
+    });
+    await assert.rejects(provider.analyzeFrames(input(), signal()), hasCode(index < 10 ? "GEMINI_HTTP_FAILED" : "GEMINI_LOCAL_LIMIT"));
+  }
+  assert.equal(calls, 10);
+  assert.equal((await readdir(join(root, "2026-09-14"))).length, 10);
+});
+
 test("synthetic smoke generates two real JPEG screens locally without user media", async () => {
   const synthetic = await syntheticAnalysisInput();
   assert.equal(synthetic.images.length, 2);
@@ -294,18 +356,18 @@ test("synthetic smoke generates two real JPEG screens locally without user media
   assert.equal(buildGeminiRequest(synthetic).contents[0].parts.filter((part) => "inlineData" in part).length, 2);
 });
 
-for (const outcome of ["success", "timeout", "invalid"] as const) {
-  test(`Gemini runner integration (${outcome}) persists validated drafts or safe failures without changing media`, async (context) => {
+for (const model of [GEMINI_MODEL, GEMINI_TEST_MODEL] as const) for (const outcome of ["success", "timeout", "invalid"] as const) {
+  test(`Gemini runner integration (${model}, ${outcome}) persists validated drafts or safe failures without changing media`, async (context) => {
     const harness = await createAnalysisHarness(context);
     const initial = await harness.initialize();
     await harness.repository.executeAnalysisCommand(harness.guideId, {
       type: "start", runId: "gemini-run", baseDraftRevision: 0, consentVersion: ANALYSIS_CONSENT_VERSION,
-      provider: "gemini", model: GEMINI_MODEL, promptVersion: GEMINI_PROMPT_VERSION,
+      provider: "gemini", model, promptVersion: GEMINI_PROMPT_VERSION,
     });
-    const provider = new GeminiAnalysisProvider({ ...options(), timeoutMs: 20,
+    const provider = new GeminiAnalysisProvider({ ...options(), model, timeoutMs: 20,
       fetch: async () => {
         if (outcome === "timeout") return new Promise<Response>(() => {});
-        return outcome === "invalid" ? Response.json(envelope({ unsafe: "private-provider-body" })) : response();
+        return Response.json({ ...envelope(outcome === "invalid" ? { unsafe: "private-provider-body" } : undefined), modelVersion: model });
       },
     });
     const result = await executeAnalysisAttempt({ ...harness, runId: "gemini-run", expectedAttemptCount: 0,
@@ -313,6 +375,7 @@ for (const outcome of ["success", "timeout", "invalid"] as const) {
     });
     if (outcome === "success") {
       assert.equal(result?.runs[0].status, "succeeded");
+      assert.equal(result?.runs[0].model, model);
       assert.equal(result?.runs[0].outputTokens, 30);
       assert.equal(result?.draft?.revision, 1);
       assert.equal(result?.draft?.document.steps[0].privacyReview, "pending");

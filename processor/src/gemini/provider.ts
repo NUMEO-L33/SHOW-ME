@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 
 import { AnalysisContractError, AnalysisProviderFailure, parseAnalysisOutput, type AnalysisProvider } from "../analysis-contract.js";
-import { buildGeminiRequest, GEMINI_ENDPOINT, GEMINI_MODEL, type AnalysisInput } from "./request.js";
+import { buildGeminiRequest, geminiEndpoint, GEMINI_MODEL, isGeminiModel, type AnalysisInput, type GeminiModel } from "./request.js";
 
 export class GeminiError extends AnalysisProviderFailure {
   override name = "GeminiError";
@@ -58,9 +58,10 @@ async function readResponse(response: Response, signal: AbortSignal): Promise<un
   }
 }
 
-export function parseGeminiResponse(raw: unknown, input: AnalysisInput): Awaited<ReturnType<AnalysisProvider["analyzeFrames"]>> {
+export function parseGeminiResponse(raw: unknown, input: AnalysisInput, model: GeminiModel = GEMINI_MODEL): Awaited<ReturnType<AnalysisProvider["analyzeFrames"]>> {
+  if (!isGeminiModel(model)) throw new GeminiError("GEMINI_DISABLED");
   const parsed = envelopeSchema.safeParse(raw);
-  if (!parsed.success || (parsed.data.modelVersion !== undefined && parsed.data.modelVersion !== GEMINI_MODEL)) {
+  if (!parsed.success || (parsed.data.modelVersion !== undefined && parsed.data.modelVersion !== model)) {
     throw new GeminiError("GEMINI_RESPONSE_INVALID");
   }
   const response = parsed.data;
@@ -76,7 +77,7 @@ export function parseGeminiResponse(raw: unknown, input: AnalysisInput): Awaited
   if (candidate.finishReason === "MAX_TOKENS") return { status: "incomplete" };
   if (["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY",
     "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION", "ESCALATION"].includes(candidate.finishReason)) return { status: "refused" };
-  if (candidate.finishReason !== "STOP" || response.modelVersion !== GEMINI_MODEL) throw new GeminiError("GEMINI_RESPONSE_INVALID");
+  if (candidate.finishReason !== "STOP" || response.modelVersion !== model) throw new GeminiError("GEMINI_RESPONSE_INVALID");
   const content = z.object({
     role: z.literal("model").optional(),
     parts: z.array(z.object({ text: z.string(), thought: z.boolean().optional(), thoughtSignature: z.string().optional() }).strict()).min(1).max(8),
@@ -102,7 +103,7 @@ export function parseGeminiResponse(raw: unknown, input: AnalysisInput): Awaited
 /** Internal adapter only. Startup and public upload endpoints never register this automatically. */
 export class GeminiAnalysisProvider implements AnalysisProvider {
   readonly name = "gemini";
-  readonly model = GEMINI_MODEL;
+  readonly model: GeminiModel;
   readonly #options: {
     apiKey: string; allowExternalProcessing: boolean; reserveRequest: RequestPermit;
     fetch?: typeof fetch; timeoutMs?: number; transientRetries?: 0 | 1;
@@ -110,11 +111,14 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
 
   constructor(options: {
     apiKey: string; allowExternalProcessing: boolean; reserveRequest: RequestPermit;
-    fetch?: typeof fetch; timeoutMs?: number; transientRetries?: 0 | 1;
+    fetch?: typeof fetch; timeoutMs?: number; transientRetries?: 0 | 1; model?: GeminiModel;
   }) {
     const timeout = options.timeoutMs ?? 60_000;
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60_000 ||
         ![0, 1].includes(options.transientRetries ?? 1)) throw new GeminiError("GEMINI_DISABLED");
+    const model = options.model ?? GEMINI_MODEL;
+    if (!isGeminiModel(model)) throw new GeminiError("GEMINI_DISABLED");
+    this.model = model;
     this.#options = { ...options };
   }
 
@@ -140,7 +144,7 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
         controller.signal.throwIfAborted();
         await this.#options.reserveRequest(controller.signal);
         controller.signal.throwIfAborted();
-        const response = await send(GEMINI_ENDPOINT, {
+        const response = await send(geminiEndpoint(this.model), {
           method: "POST", redirect: "error", signal: controller.signal,
           headers: { "content-type": "application/json", "x-goog-api-key": this.#options.apiKey }, body,
         });
@@ -159,7 +163,7 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
           }
           throw new GeminiError("GEMINI_HTTP_FAILED", response.status);
         }
-        return parseGeminiResponse(await readResponse(response, controller.signal), input);
+        return parseGeminiResponse(await readResponse(response, controller.signal), input, this.model);
       }
       throw new GeminiError("GEMINI_HTTP_FAILED");
     };

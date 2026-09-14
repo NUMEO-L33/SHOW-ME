@@ -3,8 +3,21 @@ import { z } from "zod";
 import { ANALYSIS_LIMITS, AnalysisContractError, type AnalysisProvider } from "../analysis-contract.js";
 
 export const GEMINI_MODEL = "gemini-3.8-flash";
+export const GEMINI_TEST_MODEL = "gemini-3.5-flash-lite";
+export const GEMINI_MODELS = [GEMINI_MODEL, GEMINI_TEST_MODEL] as const;
+export type GeminiModel = typeof GEMINI_MODELS[number];
+
+export function isGeminiModel(value: unknown): value is GeminiModel {
+  return GEMINI_MODELS.some((model) => model === value);
+}
+
+export function geminiEndpoint(model: GeminiModel): string {
+  if (!isGeminiModel(model)) throw new AnalysisContractError();
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+}
+
 export const GEMINI_PROMPT_VERSION = "showme-gemini-ko-v1";
-export const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+export const GEMINI_ENDPOINT = geminiEndpoint(GEMINI_MODEL);
 export const GEMINI_MAX_OUTPUT_TOKENS = 8192;
 
 export type AnalysisInput = Parameters<AnalysisProvider["analyzeFrames"]>[0];
