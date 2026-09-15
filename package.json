@@ -16,6 +16,7 @@
     "processor:build": "tsc --project processor/tsconfig.build.json",
     "processor:start": "node processor/dist/index.js",
     "processor:test": "tsx --test processor/tests/**/*.test.ts",
+    "processor:postgres:verify": "node processor/scripts/verify-postgres.mjs --local-docker",
     "client:test": "tsx --test lib/**/*.test.ts",
     "processor:typecheck": "tsc --project processor/tsconfig.json --noEmit",
     "processor:gemini:smoke": "node --env-file-if-exists=processor/.env --import tsx processor/src/gemini/smoke.ts",

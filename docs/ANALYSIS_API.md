@@ -1,5 +1,7 @@
 # 분석 HTTP API — Gate 3B-2A / B3 접수기 / B4-B3 내부 실행 경계
 
+최신 검증(2026-09-15): B5-A의 실제 로컬 PostgreSQL 시험 17개와 기본 360개를 통과했다. API 계약/기본 503은 그대로이며 실제 Google 연결이나 운영 개방은 아니다. [실제 DB 검증 기록](B5_POSTGRES_VERIFICATION.md).
+
 갱신일: 2026-09-15 · 범위: 독립 Node 프로세서의 요청·조회·취소 경계
 
 세 경로와 `DurableAnalysisAdmission`을 실제 서버에 등록했다. **기본 접수기에는 실제 준비 조건 검증기(`AnalysisAdmissionReadiness`)가 없으므로 새 분석 요청은 계속 `503 ANALYSIS_UNAVAILABLE`이며 초안·대기 작업도 만들지 않는다.** B3의 202 흐름은 가상의 준비 조건 보고서와 실제 로컬 JSON 저장소를 연결한 HTTP 통합 테스트다. 실제 DB/작업 실행기/무료 상태를 검증했거나 Google 자동 분석이 동작한다는 뜻이 아니다.
