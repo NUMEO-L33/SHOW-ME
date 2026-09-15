@@ -50,9 +50,9 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
     isCurrent: () => current,
   };
   const calls: string[][] = []; const loads: string[] = [];
-  const provider: AnalysisDispatchProvider = { name: "gemini", model: GEMINI_TEST_MODEL, transientRetries: 0, maxOutputTokens: 8192, dispatchContract: "single-send-v1",
+  const provider: AnalysisDispatchProvider = { name: "gemini", model: GEMINI_TEST_MODEL, transientRetries: 0, maxOutputTokens: 8192, dispatchContract: "locked-send-v2",
     async analyzeFrames(input, signal, authorizeSend) {
-      const finalCheck = await authorizeSend(signal); finalCheck();
+      await authorizeSend(signal, async () => new Response());
       signal.throwIfAborted(); calls.push(input.targets.map((f) => f.stepId));
       return { status: "completed", output: fakeOutput(input.targets.map((f) => f.stepId)), inputTokens: 100, outputTokens: 20 };
     } };
@@ -146,7 +146,7 @@ test("only qualified transient HTTP failures retry once in a new durable request
   for (const status of [500, 502, 503, 504]) {
     const h = await harness(context, 2); const analyze = h.provider.analyzeFrames; let invoked = 0;
     h.provider.analyzeFrames = async (input, signal, authorizeSend) => {
-      if (++invoked === 1) { (await authorizeSend(signal))(); throw new GeminiError("GEMINI_HTTP_FAILED", status); }
+      if (++invoked === 1) { await authorizeSend(signal, async () => new Response()); throw new GeminiError("GEMINI_HTTP_FAILED", status); }
       return analyze(input, signal, authorizeSend);
     };
     assert.equal(await h.make().tick(), "completed"); assert.equal(invoked, 2);
@@ -160,12 +160,12 @@ test("quota, authentication, transport, refusal and invalid output never trigger
   for (const error of [new GeminiError("GEMINI_QUOTA_LIMIT", 429), new GeminiError("GEMINI_AUTH_FAILED", 401),
     new GeminiError("GEMINI_HTTP_FAILED"), new GeminiError("GEMINI_RESPONSE_INVALID"), new Error("private provider body")]) {
     const h = await harness(context, 2); let invoked = 0;
-    h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); invoked++; throw error; };
+    h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); invoked++; throw error; };
     assert.equal(await h.make().tick(), "failed"); assert.equal(invoked, 1); assert.equal((await h.run()).status, "failed");
     assert.ok(!JSON.stringify(await h.state()).includes("private provider body"));
   }
   for (const status of ["refused", "incomplete"] as const) {
-    const h = await harness(context, 2); h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); return { status }; };
+    const h = await harness(context, 2); h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); return { status }; };
     assert.equal(await h.make().tick(), "failed");
     assert.equal((await h.run()).errorCode, status === "refused" ? "AI_REFUSED" : "AI_INCOMPLETE");
   }
@@ -174,7 +174,7 @@ test("quota, authentication, transport, refusal and invalid output never trigger
 test("retry policy zero and exhausted retry slots cannot send an extra request", async (context) => {
   for (const retries of [0, 1] as const) {
     const h = await harness(context, 2, retries); let invoked = 0;
-    h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); invoked++; throw new GeminiError("GEMINI_HTTP_FAILED", 503); };
+    h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); invoked++; throw new GeminiError("GEMINI_HTTP_FAILED", 503); };
     assert.equal(await h.make().tick(), "failed"); assert.equal(invoked, retries + 1);
     assert.equal((await h.state()).funding.attempts.length, retries + 1);
   }
@@ -296,7 +296,7 @@ test("invalid output settles known usage and overrun atomically halts further di
   for (const overrun of [false, true]) {
     const h = await harness(context, 2);
     h.provider.analyzeFrames = async (_input, signal, authorize) => {
-      (await authorize(signal))();
+      await authorize(signal, async () => new Response());
       return { status: "completed", output: { private: "bad output" }, inputTokens: overrun ? 1001 : 100, outputTokens: 20 };
     };
     assert.equal(await h.make().tick(), "failed");
@@ -395,7 +395,7 @@ test("an I/O timeout invalidates a delayed claim guard so it cannot write after 
 
 test("a replacement owner survives the previous worker's late completion and cleanup", async (context) => {
   const h = await harness(context, 2); const entered = deferred<void>(); const late = deferred<Awaited<ReturnType<AnalysisDispatchProvider["analyzeFrames"]>>>();
-  h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); entered.resolve(); return late.promise; };
+  h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); entered.resolve(); return late.promise; };
   const work = h.make().tick(); await entered.promise; h.advance(10_001);
   assert.ok(await h.repository.claimAnalysisWork(h.guideId, { runId: h.command.runId, attemptId: "replacement-owner",
     expectedAttemptCount: 1, leaseMs: 1000 }, h.clock()));
@@ -407,7 +407,7 @@ test("a replacement owner survives the previous worker's late completion and cle
 
 test("global halt while a provider is pending aborts processing without erasing the overrun", async (context) => {
   const h = await harness(context, 2); const entered = deferred<void>(); const late = deferred<never>();
-  h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); entered.resolve(); return late.promise; };
+  h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); entered.resolve(); return late.promise; };
   const work = h.make().tick(); await entered.promise;
   const attempt = (await h.repository.getAnalysisRequestAttempts(h.guideId, h.command.runId))![0];
   await h.repository.executeAnalysisAccounting(h.guideId, { type: "settle", runId: h.command.runId,
@@ -421,7 +421,7 @@ test("a dispatcher provider cannot return success without the send gate or reque
   for (const twice of [false, true]) {
     const h = await harness(context, 2);
     h.provider.analyzeFrames = async (_input, signal, authorize) => {
-      if (twice) { (await authorize(signal))(); await authorize(signal); }
+      if (twice) { await authorize(signal, async () => new Response()); await authorize(signal, async () => new Response()); }
       return { status: "completed", output: fakeOutput(["step-0", "step-1"]), inputTokens: 100, outputTokens: 20 };
     };
     assert.ok(["failed", "unavailable"].includes(await h.make().tick()));
@@ -431,8 +431,66 @@ test("a dispatcher provider cannot return success without the send gate or reque
 
 test("stop waits for bounded uncertain settlement after interrupting a provider", async (context) => {
   const h = await harness(context, 2); const entered = deferred<void>(); const late = deferred<never>();
-  h.provider.analyzeFrames = async (_input, signal, authorize) => { (await authorize(signal))(); entered.resolve(); return late.promise; };
+  h.provider.analyzeFrames = async (_input, signal, authorize) => { await authorize(signal, async () => new Response()); entered.resolve(); return late.promise; };
   const worker = h.make(); const work = worker.tick(); await entered.promise; await worker.stop();
   assert.equal(await work, "stopped"); assert.equal((await h.state()).funding.attempts[0].status, "uncertain");
   assert.equal((await h.run()).status, "running"); late.reject(new Error("late")); await delay(10);
+});
+
+test("regression: cancellation committed during the final control read prevents the actual fetch", async (context) => {
+  const h = await harness(context, 2); let armed = false; let fetched = 0;
+  const control = h.repository.getAnalysisAccountingControl.bind(h.repository);
+  h.repository.getAnalysisAccountingControl = async () => {
+    if (armed) { armed = false; await h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: h.command.runId }); }
+    return control();
+  };
+  const provider = new GeminiAnalysisProvider({ model: GEMINI_TEST_MODEL, apiKey: "fictional-key", allowExternalProcessing: true,
+    transientRetries: 0, reserveRequest: async () => { armed = true; }, fetch: async () => { fetched++; return new Response("stub"); } });
+  assert.notEqual(await h.make({ provider, statusPollMs: 5000 }).tick(), "completed");
+  assert.equal(fetched, 0); assert.equal((await h.run()).status, "cancelled");
+  assert.equal((await h.repository.getAnalysisState(h.guideId))!.draft!.revision, 0);
+});
+
+test("locked launch linearizes against cancellation without holding the lock for the response", async (context) => {
+  for (const cancelFirst of [false, true]) {
+    const h = await harness(context, 2); const identity = await h.seedSent(); const events: string[] = [];
+    const command = { ...identity, inputFingerprint: h.command.expectedInputFingerprint };
+    const response = deferred<Response>(); let pendingCancel: Promise<unknown> | undefined;
+    if (cancelFirst) await h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: h.command.runId });
+    const launched = await h.repository.launchAnalysisRequest(h.guideId, command, () => {
+      events.push("send-started"); void response.promise;
+      pendingCancel = h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: h.command.runId }).then(() => events.push("cancel-committed"));
+    }, h.clock());
+    assert.equal(launched, !cancelFirst); await pendingCancel;
+    assert.deepEqual(events, cancelFirst ? [] : ["send-started", "cancel-committed"]);
+    response.resolve(new Response());
+  }
+});
+
+test("locked launch revalidates deletion, owner, fingerprint, lease, day and synchronous permission", async (context) => {
+  const h = await harness(context, 2); const identity = await h.seedSent(); let launches = 0;
+  const command = { ...identity, inputFingerprint: h.command.expectedInputFingerprint };
+  for (const wrong of [{ ...command, owner: { ...command.owner, attemptId: "stale" } },
+    { ...command, inputFingerprint: "a".repeat(64) }, { ...command, dispatchId: "wrong" }]) {
+    assert.equal(await h.repository.launchAnalysisRequest(h.guideId, wrong, () => { launches++; }, h.clock()), false);
+  }
+  await assert.rejects(h.repository.launchAnalysisRequest(h.guideId, command, () => { launches++; }, h.clock(), async () => {}));
+  h.advance(1000); assert.equal(await h.repository.launchAnalysisRequest(h.guideId, command, () => { launches++; }, h.clock()), false);
+  await h.repository.deleteGuide(h.guideId);
+  assert.equal(await h.repository.launchAnalysisRequest(h.guideId, command, () => { launches++; }, h.clock()), false);
+  assert.equal(launches, 0);
+});
+
+test("Postgres launches under control/guide locks using a post-read DB clock, with no writes (transaction double)", async (context) => {
+  const h = await harness(context, 2); const identity = await h.seedSent();
+  const pg = postgresAccountingFixture(h.guide, (await h.repository.getAnalysisState(h.guideId))!, (await h.state()).funding);
+  const command = { ...identity, inputFingerprint: h.command.expectedInputFingerprint }; let launches = 0;
+  pg.setClock(h.clock());
+  assert.equal(await pg.repository.launchAnalysisRequest(h.guideId, command, () => {
+    launches++; assert.deepEqual(pg.locks.map((l) => l.table), [analysisAccountingControls, guides]);
+  }), true);
+  assert.equal(launches, 1); assert.deepEqual(pg.writes, []); assert.deepEqual(pg.isolationLevels, ["read committed"]);
+  h.advance(1000); pg.setClock(h.clock());
+  assert.equal(await pg.repository.launchAnalysisRequest(h.guideId, command, () => { launches++; }), false);
+  assert.equal(launches, 1);
 });

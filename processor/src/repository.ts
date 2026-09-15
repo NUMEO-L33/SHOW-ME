@@ -63,6 +63,7 @@ import {
   type AnalysisWorkCandidate, type AnalysisWorkClaim, type AnalysisWorkResult, type AnalysisWorkFailure,
 } from "./analysis-work.js";
 import { parseBatchCompletion, prepareBatchCompletion, type AnalysisBatchCompletion, type AnalysisBatchCompletionResult } from "./analysis-batch-completion.js";
+import { canLaunchAnalysisRequest, parseAnalysisSend, type AnalysisSendCommand } from "./analysis-send.js";
 
 const JSON_REPOSITORY_VERSION = 4 as const;
 const DEFAULT_LIST_LIMIT = 100;
@@ -681,6 +682,25 @@ export class JsonGuideRepository implements GuideRepository {
   }
 
   async getAnalysisAccountingControl() { return this.serialize(async () => clone((await this.readState()).funding.control)); }
+
+  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void, now?: Date, beforeLaunch?: () => void): Promise<boolean> {
+    command = parseAnalysisSend(command);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const guide = state.guides.find((g) => g.id === guideId);
+      const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId);
+      if (!guide || !reservation?.details) return false;
+      if (!canLaunchAnalysisRequest({ guide: { ...guide, steps: state.steps.filter((s) => s.guideId === guideId) },
+        analysis: state.analysis.find((a) => a.guideId === guideId)?.state ?? emptyAnalysisState(), reservation,
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
+        attempts: state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === command.runId),
+        halted: state.funding.control.halted, command, now: workTime(fixedTime) })) return false;
+      validateFundingCommit(beforeLaunch);
+      validateFundingCommit(launch); // synchronous invocation while cancellation/deletion is excluded
+      return true;
+    });
+  }
 
   async failAnalysisWork(guideId: string, command: AnalysisWorkFailure, now?: Date, beforeCommit?: () => void): Promise<AnalysisState | null> {
     command = parseWorkFailure(command);
@@ -1450,6 +1470,32 @@ export class PostgresGuideRepository implements GuideRepository {
   async getAnalysisAccountingControl() {
     const [row] = await this.database.select().from(analysisAccountingControls).where(eq(analysisAccountingControls.id, "global")).limit(1);
     return parseAccountingControl(row?.payload);
+  }
+
+  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void, now?: Date, beforeLaunch?: () => void): Promise<boolean> {
+    command = parseAnalysisSend(command);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.database.transaction(async (transaction) => {
+      const control = await lockAccountingControl(transaction);
+      const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return false;
+      const [stored] = await transaction.select().from(analysisReservations).where(and(
+        eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
+      if (!stored?.details) return false;
+      const analysis = await loadAnalysisRows(transaction, guideId);
+      const rows = await transaction.select().from(analysisBatchesTable).where(and(eq(analysisBatchesTable.guideId, guideId),
+        eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+      const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const attempts = await loadRequestAttempts(transaction, guideId, command.runId);
+      if (!canLaunchAnalysisRequest({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, analysis,
+        reservation: parseReservation(stored), batches: rows.map(batchFromRow), attempts, halted: control.halted,
+        command, now: await analysisWorkClock(transaction, fixedTime) })) return false;
+      validateFundingCommit(beforeLaunch);
+      // Cancel/delete/media replacement need the guide lock; halt/takeover need the control lock.
+      // Start the request now, but do NOT await its response or hold locks across network latency.
+      validateFundingCommit(launch);
+      return true;
+    }, { isolationLevel: "read committed" });
   }
 
   async completeAnalysisBatch(guideId: string, command: AnalysisBatchCompletion, now?: Date, beforeCommit?: () => void): Promise<AnalysisBatchCompletionResult | null> {

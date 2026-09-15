@@ -13,7 +13,7 @@ import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
 
 /** Trusted adapter contract: exactly one external attempt per invocation, never nested retries. */
 export type AnalysisDispatchProvider = Pick<AnalysisProvider, "name" | "model"> & {
-  readonly transientRetries: number; readonly maxOutputTokens: number; readonly dispatchContract: "single-send-v1";
+  readonly transientRetries: number; readonly maxOutputTokens: number; readonly dispatchContract: "locked-send-v2";
   analyzeFrames(input: Parameters<AnalysisProvider["analyzeFrames"]>[0], signal: AbortSignal,
     authorizeSend: DispatchSendPermit): ReturnType<AnalysisProvider["analyzeFrames"]>;
 };
@@ -127,7 +127,7 @@ export class DurableAnalysisDispatcher {
   }
   private providerMatches(run: AnalysisRun, policy: AnalysisFundingPolicy): boolean {
     const provider = this.options.provider;
-    return Boolean(provider && provider.dispatchContract === "single-send-v1" && provider.transientRetries === 0 && provider.name === run.provider && provider.model === run.model &&
+    return Boolean(provider && provider.dispatchContract === "locked-send-v2" && provider.transientRetries === 0 && provider.name === run.provider && provider.model === run.model &&
       Number.isSafeInteger(provider.maxOutputTokens) && provider.maxOutputTokens > 0 && provider.maxOutputTokens <= policy.maxOutputTokensPerRequest &&
       run.model === GEMINI_TEST_MODEL && run.promptVersion === GEMINI_PROMPT_VERSION);
   }
@@ -283,11 +283,20 @@ export class DurableAnalysisDispatcher {
             guard(signal);
             response = await bounded((s) => {
               guard(s); // No await between the last guard and the single provider invocation.
-              return this.options.provider!.analyzeFrames({ ...batch, images }, s, async (providerSignal) => {
+              return this.options.provider!.analyzeFrames({ ...batch, images }, s, async (providerSignal, send) => {
                 if (++sendPermits !== 1) throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
                 const sendSignal = AbortSignal.any([s, providerSignal]);
                 await this.current(guideId, run, sendSignal, true);
-                return () => guard(sendSignal);
+                let response: Promise<Response> | undefined;
+                const launched = await this.io((lockedSignal) => repository.launchAnalysisRequest(guideId,
+                  { ...identity, owner, inputFingerprint: run.manifest.fingerprint }, () => {
+                    guard(lockedSignal);
+                    response = send();
+                    // Observe rejection even if the read-only transaction acknowledgement is lost.
+                    void response.catch(() => undefined);
+                  }, this.repositoryTime(), () => guard(lockedSignal)), sendSignal);
+                if (!launched || !response) throw new DispatchStop("lost");
+                return response;
               });
             }, signal, this.requestTimeoutMs);
           } catch (error) {

@@ -17,8 +17,8 @@ export class GeminiError extends AnalysisProviderFailure {
 }
 
 export type RequestPermit = (signal: AbortSignal) => Promise<void>;
-/** Recheck durable ownership/permission after asynchronous adapter work, then immediately before fetch. */
-export type DispatchSendPermit = (signal: AbortSignal) => Promise<() => void>;
+/** Invoke fetch synchronously inside the repository's final locked permission boundary. */
+export type DispatchSendPermit = (signal: AbortSignal, send: () => Promise<Response>) => Promise<Response>;
 const counter = z.number().int().nonnegative().safe();
 const envelopeSchema = z.object({
   modelVersion: z.string().optional(),
@@ -107,7 +107,7 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
   readonly name = "gemini";
   readonly model: GeminiModel;
   readonly maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS;
-  readonly dispatchContract = "single-send-v1" as const;
+  readonly dispatchContract = "locked-send-v2" as const;
   /** A durable dispatcher must require zero; smoke tests retain their existing default. */
   get transientRetries(): 0 | 1 { return this.#options.transientRetries ?? 1; }
   readonly #options: {
@@ -150,21 +150,11 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
         controller.signal.throwIfAborted();
         await this.#options.reserveRequest(controller.signal);
         controller.signal.throwIfAborted();
-        const finalCheck = await authorizeSend?.(controller.signal);
-        controller.signal.throwIfAborted();
-        // No await between this synchronous guard and fetch. A Promise is not a valid guard.
-        if (authorizeSend) {
-          if (typeof finalCheck !== "function") throw new GeminiError("GEMINI_DISABLED");
-          const returned: unknown = finalCheck();
-          if (returned !== undefined) {
-            void Promise.resolve(returned).catch(() => undefined);
-            throw new GeminiError("GEMINI_DISABLED");
-          }
-        }
-        const response = await send(geminiEndpoint(this.model), {
+        const launch = () => send(geminiEndpoint(this.model), {
           method: "POST", redirect: "error", signal: controller.signal,
           headers: { "content-type": "application/json", "x-goog-api-key": this.#options.apiKey }, body,
         });
+        const response = await (authorizeSend ? authorizeSend(controller.signal, launch) : launch());
         if (controller.signal.aborted) {
           void response.body?.cancel().catch(() => {});
           controller.signal.throwIfAborted();
