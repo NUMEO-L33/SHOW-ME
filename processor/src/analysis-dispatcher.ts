@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { AnalysisAccountingError, type AnalysisAccountingCommand } from "./analysis-accounting-contract.js";
+import { AnalysisAccountingError, retryableHttpStatusSchema, type AnalysisAccountingCommand } from "./analysis-accounting-contract.js";
 import { AnalysisAdmissionError, verifyAnalysisReadiness, type AnalysisAdmissionReadiness } from "./analysis-admission.js";
 import { ANALYSIS_LIMITS, AnalysisContractError, analysisBatches, analysisManifest, type AnalysisProvider } from "./analysis-contract.js";
 import { fundingDay, type AnalysisFundingPolicy } from "./analysis-funding.js";
 import type { AnalysisErrorCode, AnalysisRun } from "./analysis-state.js";
-import { ownsAnalysisWork, workTime, type AnalysisWorkCandidate } from "./analysis-work.js";
+import { ownsAnalysisWork, workTime, workAvailableAt, type AnalysisWorkCandidate, type AnalysisWorkCursor } from "./analysis-work.js";
 import type { GuideRepository } from "./domain.js";
 import { GeminiError, type DispatchSendPermit } from "./gemini/provider.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
@@ -73,6 +73,7 @@ export class DurableAnalysisDispatcher {
   private loop?: Promise<void>;
   private outcome: AnalysisDispatchOutcome = "idle";
   private failures = 0;
+  private cursor?: AnalysisWorkCursor;
 
   constructor(options: Options) {
     this.options = { ...options };
@@ -169,15 +170,27 @@ export class DurableAnalysisDispatcher {
     const signal = AbortSignal.any([this.shutdown.signal, deadline.signal]);
     const timer = setTimeout(() => deadline.abort(new DispatchStop("timeout")), this.leaseMs);
     try {
-      const candidates = await this.io(() => repository.listAnalysisWork(20, this.repositoryTime()), signal);
+      const closures = await this.io(() => repository.listAnalysisClosures(20, this.repositoryTime()), signal);
+      for (const candidate of closures) await this.io((s) => repository.closeAnalysisReservation(candidate.guideId,
+        candidate.runId, this.repositoryTime(), () => s.throwIfAborted()), signal);
+      const candidates = await this.io(() => repository.listAnalysisWork(20, this.repositoryTime(), this.cursor), signal);
+      if (!candidates.length) this.cursor = undefined; // Wrap on the next bounded pass, never an unbounded scan.
+      let unavailable = false;
       for (const candidate of candidates) {
         const funded = await this.io(() => repository.getAnalysisFunding(candidate.guideId, candidate.runId), signal);
         const state = await this.io(() => repository.getAnalysisState(candidate.guideId), signal);
         const run = state?.runs.find((r) => r.id === candidate.runId);
+        const availableAt = run && workAvailableAt(run);
+        if (run && availableAt) this.cursor = { availableAt, createdAt: run.createdAt, guideId: candidate.guideId, runId: run.id };
         if (!funded?.reservation.details || !run) continue;
         // Do not churn lease attempts just because entitlement is unavailable or yesterday's work is still queued.
         if (fundingDay(this.time()) !== funded.reservation.day) continue;
-        const assertCurrent = await this.permission(candidate.guideId, run, funded.reservation.details.policy, signal);
+        let assertCurrent: () => void;
+        try { assertCurrent = await this.permission(candidate.guideId, run, funded.reservation.details.policy, signal); }
+        catch (error) {
+          if (!(error instanceof AnalysisAdmissionError)) throw error;
+          unavailable = true; continue; // Ineligible heads do not hide later work or consume claims.
+        }
         const claim = await this.io((s) => repository.claimAnalysisWork(candidate.guideId, {
           runId: candidate.runId, attemptId: randomUUID(), expectedAttemptCount: candidate.expectedAttemptCount, leaseMs: this.leaseMs,
         }, this.repositoryTime(), () => { s.throwIfAborted(); assertCurrent(); }), signal);
@@ -186,7 +199,7 @@ export class DurableAnalysisDispatcher {
         // Await bounded orchestration cleanup too; stop must not leave an unobserved worker tail.
         return await this.process(candidate, claim.run, signal);
       }
-      return "idle";
+      return unavailable ? "unavailable" : "idle";
     } catch (error) {
       if (this.shutdown.signal.aborted) return "stopped";
       const unavailable = error instanceof AnalysisAdmissionError || error instanceof AnalysisAccountingError;
@@ -206,6 +219,11 @@ export class DurableAnalysisDispatcher {
     } finally {
       clearTimeout(timer);
       deadline.abort(new DispatchStop("lost"));
+      if (active) {
+        // Separate bounded cleanup survives stop/cancel. Live same-day work is left recoverable.
+        await this.io((s) => repository.closeAnalysisReservation(active!.guideId, active!.run.id,
+          this.repositoryTime(), () => s.throwIfAborted()), new AbortController().signal);
+      }
     }
   }
 
@@ -228,7 +246,6 @@ export class DurableAnalysisDispatcher {
     const owner = { attemptId: run.attemptId!, attemptCount: run.attemptCount };
     try {
       for (const [batchIndex, batch] of analysisBatches(run.manifest.frames).entries()) {
-        let retryAllowed = false;
         for (;;) {
           await this.current(guideId, run, signal, true);
           const funding = await this.io(() => repository.getAnalysisFunding(guideId, runId), signal);
@@ -243,10 +260,11 @@ export class DurableAnalysisDispatcher {
           let dispatchId = randomUUID() as string;
           if (previous?.status === "reserved") { ordinal = previous.ordinal; dispatchId = previous.dispatchId; }
           else if (previous) {
-            // Recovered unknown sends have no durable failure classification: never retry them blindly.
-            if (!retryAllowed || previous.ordinal !== 0 || previous.status !== "uncertain" || policy.transientRetries !== 1) {
+            // Only a saved confirmed transient HTTP response survives a restart as retry authority.
+            if (previous.retryableHttpStatus === undefined || previous.ordinal !== 0 || !["uncertain", "settled"].includes(previous.status) || policy.transientRetries !== 1) {
               throw new WorkFailure("AI_PROVIDER_FAILED");
             }
+            await delay(this.retryDelayMs, undefined, { signal });
             ordinal = 1;
           }
           const identity = { runId, batchIndex, ordinal, dispatchId };
@@ -278,6 +296,7 @@ export class DurableAnalysisDispatcher {
           if (!sent || sent.replayed || sent.attempt.status !== "sending") throw new DispatchStop("lost");
           let response: Awaited<ReturnType<AnalysisProvider["analyzeFrames"]>>;
           let sendPermits = 0;
+          let requestLaunched = false;
           try {
             await this.current(guideId, run, signal, true);
             guard(signal);
@@ -291,6 +310,7 @@ export class DurableAnalysisDispatcher {
                 const launched = await this.io((lockedSignal) => repository.launchAnalysisRequest(guideId,
                   { ...identity, owner, inputFingerprint: run.manifest.fingerprint }, () => {
                     guard(lockedSignal);
+                    requestLaunched = true;
                     response = send();
                     // Observe rejection even if the read-only transaction acknowledgement is lost.
                     void response.catch(() => undefined);
@@ -300,12 +320,13 @@ export class DurableAnalysisDispatcher {
               });
             }, signal, this.requestTimeoutMs);
           } catch (error) {
-            await this.settleAfterStop(guideId, { type: "settle", ...identity, usage: { status: "unknown" } });
+            const transient = requestLaunched && error instanceof GeminiError && error.code === "GEMINI_HTTP_FAILED"
+              ? retryableHttpStatusSchema.safeParse(error.httpStatus) : undefined;
+            const retryableHttpStatus = ordinal === 0 && transient?.success ? transient.data : undefined;
+            await this.settleAfterStop(guideId, { type: "settle", ...identity, usage: { status: "unknown" },
+              ...(retryableHttpStatus === undefined ? {} : { retryableHttpStatus }) });
             signal.throwIfAborted();
-            if (sendPermits === 1 && error instanceof GeminiError && error.code === "GEMINI_HTTP_FAILED" &&
-                [500, 502, 503, 504].includes(error.httpStatus ?? 0) && ordinal === 0 && policy.transientRetries === 1) {
-              retryAllowed = true;
-              await delay(this.retryDelayMs, undefined, { signal });
+            if (retryableHttpStatus !== undefined && policy.transientRetries === 1) {
               continue;
             }
             if (error instanceof AnalysisAdmissionError) throw error;

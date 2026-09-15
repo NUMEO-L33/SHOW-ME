@@ -50,6 +50,13 @@
       "when": 1789388780370,
       "tag": "0006_analysis_batch_completion",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789444816045,
+      "tag": "0007_analysis_reservation_closure",
+      "breakpoints": true
     }
   ]
 }

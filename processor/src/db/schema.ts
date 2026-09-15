@@ -140,8 +140,15 @@ export const analysisBudgetWindows = pgTable("analysis_budget_windows", {
 export const analysisReservations = pgTable("analysis_reservations", {
   guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), day: text("day").notNull(),
   maximum: jsonb("maximum").$type<AnalysisReservation["maximum"]>().notNull(),
+  released: jsonb("released").$type<AnalysisReservation["released"]>().notNull()
+    .default(sql`'{"requests":0,"inputTokens":0,"outputTokens":0,"costMicrousd":0}'::jsonb`),
+  closedAt: text("closed_at"),
   details: jsonb("details").$type<AnalysisReservation["details"]>(),
-}, (table) => [primaryKey({ columns: [table.guideId, table.runId] }), index("analysis_reservations_day_idx").on(table.day)]);
+}, (table) => [primaryKey({ columns: [table.guideId, table.runId] }), index("analysis_reservations_day_idx").on(table.day),
+  index("analysis_reservations_open_idx").on(table.day, table.guideId, table.runId).where(sql`${table.closedAt} is null`),
+  check("analysis_reservations_release_check", sql`(${table.closedAt} IS NOT NULL OR
+    ${table.released} = '{"requests":0,"inputTokens":0,"outputTokens":0,"costMicrousd":0}'::jsonb) IS TRUE`),
+]);
 
 export const analysisBatchesTable = pgTable("analysis_batches", {
   guideId: text("guide_id").notNull(), runId: text("run_id").notNull(), index: integer("batch_index").notNull(),

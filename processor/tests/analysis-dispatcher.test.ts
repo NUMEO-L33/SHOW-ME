@@ -40,7 +40,7 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
     id: "dispatch-fixture", checkedAt: clock().toISOString(), validUntil: new Date(timestamp + 20_000).toISOString(),
     guideId: h.guideId, inputFingerprint: command.expectedInputFingerprint, frameCount: count,
     model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION, scope: "approved_synthetic", inputApprovalId: "fictional-input",
-    runtime: { repository: "postgres-0006", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
+    runtime: { repository: "postgres-0007", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
     policy: selectedPolicy, entitlement: { mode: "free_only", projectRef: "private-project", evidenceId: "private-evidence", paidFallback: false,
       dailyQuota: { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000 } },
   };
@@ -127,10 +127,71 @@ test("restart claims an expired owner and automatically skips its saved batch", 
 });
 
 test("a recovered ambiguous send keeps maximum usage and is not blindly retried", async (context) => {
-  const h = await harness(context, 2); await h.seedSent(); const before = await h.state(); h.advance(1001);
+  const h = await harness(context, 2); await h.seedSent(); h.advance(1001);
   assert.equal(await h.make().tick(), "failed"); assert.deepEqual(h.calls, []);
   const state = await h.state(); assert.equal(state.funding.attempts[0].status, "uncertain");
-  assert.deepEqual(state.funding.windows, before.funding.windows); assert.equal((await h.run()).status, "failed");
+  for (const window of state.funding.windows) assert.deepEqual(window.used, state.funding.attempts[0].maximum);
+  assert.equal(state.funding.reservations[0].released.requests, 1); assert.equal((await h.run()).status, "failed");
+});
+
+test("a persisted transient HTTP receipt survives takeover and permits only the single reserved retry", async (context) => {
+  for (const knownLater of [false, true]) {
+    const h = await harness(context, 2); const { owner: _owner, ...identity } = await h.seedSent(); void _owner;
+    assert.ok(await h.repository.executeAnalysisAccounting(h.guideId, { type: "settle", ...identity,
+      usage: { status: "unknown" }, retryableHttpStatus: 503 }, h.clock()));
+    if (knownLater) assert.ok(await h.repository.executeAnalysisAccounting(h.guideId, { type: "settle", ...identity,
+      usage: { status: "known", inputTokens: 10, outputTokens: 2 } }, h.clock()));
+    h.advance(1001); const worker = h.make(); assert.equal(await worker.tick(), "completed");
+    assert.equal(h.calls.length, 1); const s = await h.state();
+    assert.equal(s.funding.attempts.length, 2); assert.equal(s.funding.attempts[0].retryableHttpStatus, 503);
+    assert.equal(s.funding.attempts[1].ordinal, 1); assert.equal(s.funding.reservations[0].released.requests, 0);
+    assert.equal((await h.run()).attemptCount, 2); assert.equal(await worker.tick(), "idle"); assert.equal(h.calls.length, 1);
+  }
+});
+
+test("a lost transient-receipt acknowledgement recovers its durable eligibility without another original send", async (context) => {
+  const h = await harness(context, 2); const analyze = h.provider.analyzeFrames; let invocations = 0;
+  h.provider.analyzeFrames = async (input, signal, authorize) => {
+    if (++invocations === 1) { await authorize(signal, async () => new Response()); throw new GeminiError("GEMINI_HTTP_FAILED", 503); }
+    return analyze(input, signal, authorize);
+  };
+  const execute = h.repository.executeAnalysisAccounting.bind(h.repository); let lost = false;
+  h.repository.executeAnalysisAccounting = async (...args) => {
+    const result = await execute(...args);
+    if (!lost && args[1].type === "settle" && args[1].retryableHttpStatus) { lost = true; throw new Error("lost acknowledgement"); }
+    return result;
+  };
+  assert.equal(await h.make().tick(), "degraded"); assert.equal(invocations, 1);
+  assert.equal((await h.state()).funding.attempts[0].retryableHttpStatus, 503);
+  h.advance(10_001); assert.equal(await h.make().tick(), "completed"); assert.equal(invocations, 2);
+  assert.equal((await h.state()).funding.attempts.length, 2);
+});
+
+test("twenty unavailable candidates cannot hide the next eligible page or consume their claim counts", async (context) => {
+  const h = await harness(context, 2);
+  const funding = h.repository.getAnalysisFunding.bind(h.repository); const state = h.repository.getAnalysisState.bind(h.repository);
+  h.repository.getAnalysisFunding = async () => funding(h.guideId, h.command.runId);
+  h.repository.getAnalysisState = async () => state(h.guideId);
+  let pages = 0;
+  h.repository.listAnalysisWork = async (limit, _at, after) => {
+    assert.equal(limit, 20); pages++;
+    if (!after) return Array.from({ length: 20 }, (_, i) => ({ guideId: `unavailable-${String(i).padStart(2, "0")}`, runId: h.command.runId, expectedAttemptCount: 0 }));
+    assert.equal(after.guideId, "unavailable-19");
+    return [{ guideId: h.guideId, runId: h.command.runId, expectedAttemptCount: 0 }];
+  };
+  // The fictional readiness report is bound to the real guide, so the other candidates fail permission.
+  const worker = h.make(); assert.equal(await worker.tick(), "unavailable"); assert.equal(h.calls.length, 0);
+  assert.equal((await h.run()).attemptCount, 0); assert.equal(pages, 1);
+  assert.equal(await worker.tick(), "completed"); assert.equal(pages, 2); assert.equal(h.calls.length, 1);
+});
+
+test("an unavailable head does not stop a ready candidate later in the same bounded page", async (context) => {
+  const h = await harness(context, 2);
+  const funding = h.repository.getAnalysisFunding.bind(h.repository); const state = h.repository.getAnalysisState.bind(h.repository);
+  h.repository.getAnalysisFunding = async () => funding(h.guideId, h.command.runId);
+  h.repository.getAnalysisState = async () => state(h.guideId);
+  h.repository.listAnalysisWork = async () => ["unavailable", h.guideId].map((guideId) => ({ guideId, runId: h.command.runId, expectedAttemptCount: 0 }));
+  assert.equal(await h.make().tick(), "completed"); assert.equal(h.calls.length, 1); assert.equal((await h.run()).attemptCount, 1);
 });
 
 test("a recovered reserved-but-never-sent slot is reused safely without adding a request", async (context) => {
@@ -206,7 +267,7 @@ test("revocation during image loading prevents a send and bounds frame bytes", a
   const h = await harness(context, 2);
   assert.equal(await h.make({ loadImage: async () => { h.revoke(); return new Uint8Array([1]); } }).tick(), "unavailable");
   assert.deepEqual(h.calls, []); assert.equal((await h.run()).status, "failed");
-  assert.equal((await h.state()).funding.attempts[0].status, "reserved");
+  assert.equal((await h.state()).funding.attempts[0].status, "released");
   for (const bytes of [new Uint8Array(), new Uint8Array(ANALYSIS_LIMITS.maxImageBytes + 1)]) {
     const bad = await harness(context, 2);
     assert.equal(await bad.make({ loadImage: async () => bytes }).tick(), "failed");
@@ -284,9 +345,10 @@ test("explicit start polls automatically, repeated start is single-flight, and s
   assert.equal(await worker.tick(), "stopped");
 });
 
-test("previous-day queued work is not claimed and midnight after image loading cannot send", async (context) => {
-  const h = await harness(context); h.advance(86_400_000); const before = await h.state();
-  assert.equal(await h.make().tick(), "idle"); assert.deepEqual(await h.state(), before);
+test("previous-day queued work closes without claiming and midnight after image loading cannot send", async (context) => {
+  const h = await harness(context); h.advance(86_400_000);
+  assert.equal(await h.make().tick(), "idle"); assert.equal((await h.run()).status, "failed");
+  assert.equal((await h.run()).attemptCount, 0); assert.equal((await h.state()).funding.windows[0].used.requests, 0);
   const active = await harness(context, 2);
   assert.equal(await active.make({ loadImage: async () => { active.advance(86_400_000); return new Uint8Array([1]); } }).tick(), "unavailable");
   assert.deepEqual(active.calls, []);

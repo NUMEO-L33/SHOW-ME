@@ -19,10 +19,12 @@ export const accountingUsageSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("known"), inputTokens: counter, outputTokens: counter }).strict(),
 ]);
 const identity = { runId: z.string().min(1).max(128), batchIndex: counter.max(5), ordinal: z.union([z.literal(0), z.literal(1)]), dispatchId: id };
+export const retryableHttpStatusSchema = z.union([z.literal(500), z.literal(502), z.literal(503), z.literal(504)]);
+export type RetryableHttpStatus = z.infer<typeof retryableHttpStatusSchema>;
 const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("allocate"), ...identity, owner: analysisWorkOwnerSchema.optional() }).strict(),
   z.object({ type: z.literal("sending"), ...identity, owner: analysisWorkOwnerSchema.optional() }).strict(),
-  z.object({ type: z.literal("settle"), ...identity, usage: accountingUsageSchema }).strict(),
+  z.object({ type: z.literal("settle"), ...identity, usage: accountingUsageSchema, retryableHttpStatus: retryableHttpStatusSchema.optional() }).strict(),
   z.object({ type: z.literal("release"), ...identity }).strict(),
 ]);
 export type AnalysisAccountingCommand = z.infer<typeof commandSchema>;
@@ -33,6 +35,7 @@ export const analysisRequestAttemptSchema = z.object({
   status: z.enum(["reserved", "sending", "settled", "uncertain", "overrun", "released"]),
   maximum: analysisBudgetUnitsSchema, charged: analysisBudgetUnitsSchema,
   usage: accountingUsageSchema.nullable(),
+  retryableHttpStatus: retryableHttpStatusSchema.optional(),
   createdAt: z.string().datetime(), sentAt: z.string().datetime().nullable(), finishedAt: z.string().datetime().nullable(),
 }).strict();
 export type AnalysisRequestAttempt = z.infer<typeof analysisRequestAttemptSchema>;
@@ -49,12 +52,18 @@ function parse<T>(schema: z.ZodType<T>, raw: unknown): T {
   const result = schema.safeParse(raw);
   return result.success ? result.data : accountingInvalid();
 }
-export function parseAccountingCommand(raw: unknown) { return parse(commandSchema, raw); }
+export function parseAccountingCommand(raw: unknown) {
+  const command = parse(commandSchema, raw);
+  if (command.type === "settle" && command.retryableHttpStatus !== undefined &&
+      (command.usage.status !== "unknown" || command.ordinal !== 0)) accountingInvalid();
+  return command;
+}
 export function parseAccountingControl(raw: unknown) { return parse(accountingControlSchema, raw); }
 export function sameBudgetUnits(a: AnalysisBudgetUnits, b: AnalysisBudgetUnits) { return budgetUnitFields.every((key) => a[key] === b[key]); }
 export function zeroBudgetUnits(): AnalysisBudgetUnits { return { requests: 0, inputTokens: 0, outputTokens: 0, costMicrousd: 0 }; }
 export function parseRequestAttempt(raw: unknown): AnalysisRequestAttempt {
   const a = parse(analysisRequestAttemptSchema, raw);
+  if (a.retryableHttpStatus !== undefined && (a.ordinal !== 0 || !["uncertain", "settled", "overrun"].includes(a.status))) accountingInvalid();
   if (a.maximum.requests !== 1 || a.maximum.inputTokens < 1 || a.maximum.outputTokens < 1 || a.maximum.costMicrousd < 1 ||
       budgetUnitFields.some((key) => a.charged[key] > a.maximum[key]) ||
       (a.sentAt && a.sentAt < a.createdAt) || (a.finishedAt && a.finishedAt < (a.sentAt ?? a.createdAt))) accountingInvalid();

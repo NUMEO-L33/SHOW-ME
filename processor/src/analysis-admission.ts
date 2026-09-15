@@ -25,7 +25,7 @@ const snapshotSchema = z.object({
   frameCount: positive.max(24), model: z.literal(GEMINI_TEST_MODEL), promptVersion: z.literal(GEMINI_PROMPT_VERSION),
   scope: z.literal("approved_synthetic"), inputApprovalId: id,
   // These are claims from a TRUSTED verifier, not proof derived from their spelling.
-  runtime: z.object({ repository: z.literal("postgres-0006"), dispatcher: z.literal("durable-accounted-v1"),
+  runtime: z.object({ repository: z.literal("postgres-0007"), dispatcher: z.literal("durable-accounted-v1"),
     inputTokenBound: positive, boundIncludes: z.literal("prompt-schema-targets-context") }).strict(),
   policy: analysisFundingPolicySchema,
   entitlement: z.discriminatedUnion("mode", [

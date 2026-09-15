@@ -50,7 +50,7 @@ import {
 import {
   emptyFundingLedger, fundingDay, fundingWindowIdentity, initialBudgetWindow, parseBudgetWindow,
   parseFundingCommand, parseFundingLedger, parseFundingPolicy, parseReservation, parseStoredBatch, prepareFundedAnalysis, validateFundingAnalysis,
-  reservationAccounted, upgradeFundingLedgerV2, upgradeFundingLedgerV3, validateBatchSettlements,
+  reservationAccounted, upgradeFundingLedgerV2, upgradeFundingLedgerV3, upgradeFundingLedgerV4, validateBatchSettlements,
   type AnalysisFundingCommand, type AnalysisFundingLedger, type AnalysisFundingPolicy, type AnalysisFundingResult,
 } from "./analysis-funding.js";
 import {
@@ -61,11 +61,13 @@ import { prepareAnalysisAccounting } from "./analysis-accounting.js";
 import {
   parseWorkClaim, prepareAnalysisWorkClaim, parseWorkFailure, prepareAnalysisWorkFailure, validateWorkProjection, workAvailableAt, workLimit, workTime,
   type AnalysisWorkCandidate, type AnalysisWorkClaim, type AnalysisWorkResult, type AnalysisWorkFailure,
+  parseWorkCursor, compareWorkCursor, type AnalysisWorkCursor,
 } from "./analysis-work.js";
 import { parseBatchCompletion, prepareBatchCompletion, type AnalysisBatchCompletion, type AnalysisBatchCompletionResult } from "./analysis-batch-completion.js";
 import { canLaunchAnalysisRequest, parseAnalysisSend, type AnalysisSendCommand } from "./analysis-send.js";
+import { analysisClosureDue, prepareAnalysisClosure, type AnalysisClosureCandidate, type AnalysisClosureResult } from "./analysis-closure.js";
 
-const JSON_REPOSITORY_VERSION = 4 as const;
+const JSON_REPOSITORY_VERSION = 5 as const;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 
@@ -462,7 +464,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
-    ![1, 2, 3, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
+    ![1, 2, 3, 4, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
     !Array.isArray((parsed as { guides?: unknown }).guides) ||
     !Array.isArray((parsed as { steps?: unknown }).steps)
   ) {
@@ -473,13 +475,14 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   const legacyVersion = (parsed as { version: number }).version === 1;
   const fundingV2 = (parsed as { version: number }).version === 2;
   const fundingV3 = (parsed as { version: number }).version === 3;
-  // Older binaries must reject v4 rather than ignore or discard completed batches.
+  // Older binaries must reject v5 rather than ignore completion/release accounting.
   if (legacyVersion) {
     if (state.funding !== undefined) throw new RepositoryDataError("Invalid legacy funding state.");
     state.funding = emptyFundingLedger();
   }
   if (fundingV2) state.funding = upgradeFundingLedgerV2(state.funding);
   if (fundingV3) state.funding = upgradeFundingLedgerV3(state.funding);
+  if ((parsed as { version: number }).version === 4) state.funding = upgradeFundingLedgerV4(state.funding);
   state.version = JSON_REPOSITORY_VERSION;
   state.funding = parseFundingLedger(state.funding);
   // Additive upgrade of legacy analysis; never discard malformed state.
@@ -683,6 +686,44 @@ export class JsonGuideRepository implements GuideRepository {
 
   async getAnalysisAccountingControl() { return this.serialize(async () => clone((await this.readState()).funding.control)); }
 
+  async listAnalysisClosures(limit = 20, now?: Date): Promise<AnalysisClosureCandidate[]> {
+    limit = workLimit(limit);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(); const at = workTime(fixedTime);
+      return state.funding.reservations.filter((r) => analysisClosureDue(r,
+        state.analysis.find((a) => a.guideId === r.guideId)?.state.runs.find((run) => run.id === r.runId), at))
+        .sort((a, b) => a.day.localeCompare(b.day) || a.guideId.localeCompare(b.guideId) || a.runId.localeCompare(b.runId))
+        .slice(0, limit).map(({ guideId, runId }) => ({ guideId, runId }));
+    });
+  }
+
+  async closeAnalysisReservation(guideId: string, runId: string, now?: Date, beforeCommit?: () => void): Promise<AnalysisClosureResult | null> {
+    requireNonEmpty(guideId, "guideId"); requireNonEmpty(runId, "runId");
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === runId);
+      if (!reservation) return null;
+      const prepared = prepareAnalysisClosure({ reservation,
+        analysis: reservation.details ? state.analysis.find((a) => a.guideId === guideId)?.state ?? null : null,
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === runId).sort((a, b) => a.index - b.index),
+        attempts: state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === runId),
+        windows: state.funding.windows, now: workTime(fixedTime) });
+      if (!prepared) return null;
+      const result = { reservation: prepared.reservation, replayed: prepared.replayed };
+      if (prepared.replayed) return clone(result);
+      validateFundingCommit(beforeCommit);
+      if (prepared.analysis) state.analysis = state.analysis.map((a) => a.guideId === guideId ? { guideId, state: prepared.analysis! } : a);
+      state.funding.reservations = state.funding.reservations.map((r) => r === reservation ? prepared.reservation : r);
+      state.funding.attempts = [...state.funding.attempts.filter((a) => a.guideId !== guideId || a.runId !== runId), ...prepared.attempts];
+      for (const window of prepared.windows) state.funding.windows = state.funding.windows.map((w) => w.day === window.day && w.scope === window.scope ? window : w);
+      state.funding = parseFundingLedger(state.funding);
+      await this.writeState(state);
+      return clone(result);
+    });
+  }
+
   async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void, now?: Date, beforeLaunch?: () => void): Promise<boolean> {
     command = parseAnalysisSend(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
@@ -754,8 +795,9 @@ export class JsonGuideRepository implements GuideRepository {
     });
   }
 
-  async listAnalysisWork(limit = 20, now?: Date): Promise<AnalysisWorkCandidate[]> {
+  async listAnalysisWork(limit = 20, now?: Date, after?: AnalysisWorkCursor): Promise<AnalysisWorkCandidate[]> {
     limit = workLimit(limit);
+    after = parseWorkCursor(after);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.serialize(async () => {
       const state = await this.readState();
@@ -764,6 +806,7 @@ export class JsonGuideRepository implements GuideRepository {
         .filter(({ guideId, run }) => {
           const available = workAvailableAt(run);
           return available !== null && Date.parse(available) <= at.valueOf() &&
+            (!after || compareWorkCursor({ availableAt: available, createdAt: run.createdAt, guideId, runId: run.id }, after) > 0) &&
             state.guides.some((g) => g.id === guideId && g.status === "ready" && g.errorCode === null) &&
             state.funding.reservations.some((r) => r.guideId === guideId && r.runId === run.id && r.details);
         })
@@ -1271,15 +1314,72 @@ export class PostgresGuideRepository implements GuideRepository {
     return this.analysisTransaction(guideId, command);
   }
 
-  async listAnalysisWork(limit = 20, now?: Date): Promise<AnalysisWorkCandidate[]> {
+  async listAnalysisClosures(limit = 20, now?: Date): Promise<AnalysisClosureCandidate[]> {
     limit = workLimit(limit);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.database.transaction(async (transaction) => {
+      const at = await analysisWorkClock(transaction, fixedTime);
+      const rows = await transaction.select().from(analysisReservations).where(and(isNull(analysisReservations.closedAt),
+        sql`(${analysisReservations.details} is null or exists (select 1 from ${analysisRuns}
+          where ${analysisRuns.guideId} = ${analysisReservations.guideId} and ${analysisRuns.id} = ${analysisReservations.runId}
+          and (${analysisRuns.status} in ('succeeded', 'failed', 'cancelled') or
+            (${analysisReservations.day} < ${fundingDay(at)} and ${analysisRuns.availableAt} <= ${at.toISOString()}::timestamptz))))`))
+        .orderBy(asc(analysisReservations.day), asc(analysisReservations.guideId), asc(analysisReservations.runId)).limit(limit);
+      return rows.map((row) => { const r = parseReservation(row); return { guideId: r.guideId, runId: r.runId }; });
+    });
+  }
+
+  async closeAnalysisReservation(guideId: string, runId: string, now?: Date, beforeCommit?: () => void): Promise<AnalysisClosureResult | null> {
+    requireNonEmpty(guideId, "guideId"); requireNonEmpty(runId, "runId");
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.database.transaction(async (transaction) => {
+      await lockAccountingControl(transaction); // Halting stops spending, not safe cleanup.
+      const where = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, runId));
+      const [initial] = await transaction.select().from(analysisReservations).where(where).limit(1);
+      if (!initial) return null;
+      const windows = [];
+      for (const scope of ["global", `guide:${guideId}`]) {
+        const [row] = await transaction.select().from(analysisBudgetWindows).where(and(
+          eq(analysisBudgetWindows.day, initial.day), eq(analysisBudgetWindows.scope, scope))).limit(1).for("update");
+        windows.push(parseBudgetWindow(row ? { ...row.payload, day: row.day, scope: row.scope } : undefined));
+      }
+      const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      // Re-read after deletion's parent lock. Numeric tombstones are retained and never rehydrated.
+      const [row] = await transaction.select().from(analysisReservations).where(where).limit(1);
+      const reservation = parseReservation(row);
+      if (reservation.details && !guide) throw new RepositoryDataError("Orphaned analysis reservation.");
+      const previous = reservation.details ? await loadAnalysisRows(transaction, guideId) : null;
+      const batches = await transaction.select().from(analysisBatchesTable).where(and(
+        eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, runId))).orderBy(asc(analysisBatchesTable.index));
+      const attempts = await loadRequestAttempts(transaction, guideId, runId);
+      const prepared = prepareAnalysisClosure({ reservation, analysis: previous, batches: batches.map(batchFromRow), attempts, windows,
+        now: await analysisWorkClock(transaction, fixedTime) });
+      if (!prepared) return null;
+      const result = { reservation: prepared.reservation, replayed: prepared.replayed };
+      if (prepared.replayed) return result;
+      validateFundingCommit(beforeCommit);
+      if (previous && prepared.analysis) await persistAnalysisRows(transaction, guideId, previous, prepared.analysis);
+      for (const { day, scope, ...payload } of prepared.windows) await transaction.update(analysisBudgetWindows).set({ payload })
+        .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope)));
+      for (const attempt of prepared.attempts) if (JSON.stringify(attempt) !== JSON.stringify(attempts.find((a) =>
+        a.batchIndex === attempt.batchIndex && a.ordinal === attempt.ordinal))) await persistRequestAttempt(transaction, attempt);
+      await transaction.update(analysisReservations).set({ released: prepared.reservation.released, closedAt: prepared.reservation.closedAt }).where(where);
+      return result;
+    }, { isolationLevel: "read committed" });
+  }
+
+  async listAnalysisWork(limit = 20, now?: Date, after?: AnalysisWorkCursor): Promise<AnalysisWorkCandidate[]> {
+    limit = workLimit(limit);
+    after = parseWorkCursor(after);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.database.transaction(async (transaction) => {
       const at = await analysisWorkClock(transaction, fixedTime);
       const rows = await transaction.select().from(analysisRuns).where(and(
         inArray(analysisRuns.status, ["queued", "running"]), lte(analysisRuns.availableAt, at), liveFundingCondition(),
         sql`exists (select 1 from ${guides} where ${guides.id} = ${analysisRuns.guideId}
-          and ${guides.status} = 'ready' and ${guides.errorCode} is null)`))
+          and ${guides.status} = 'ready' and ${guides.errorCode} is null)`,
+        after ? sql`(${analysisRuns.availableAt}, ${analysisRuns.createdAt}, ${analysisRuns.guideId}, ${analysisRuns.id}) >
+          (${after.availableAt}::timestamptz, ${after.createdAt}::timestamptz, ${after.guideId}, ${after.runId})` : undefined))
         .orderBy(asc(analysisRuns.availableAt), asc(analysisRuns.createdAt), asc(analysisRuns.guideId), asc(analysisRuns.id)).limit(limit);
       return rows.map((row) => {
         const run = parseAnalysisState({ draft: null, runs: [{ ...row.payload, id: row.id, status: row.status }] }).runs[0];

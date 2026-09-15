@@ -36,6 +36,8 @@ export function canLaunchAnalysisRequest(options: { guide: GuideWithSteps; analy
   validateBatchSettlements(batches, attempts);
   const run = analysis.runs.find((r) => r.id === command.runId)!;
   const attempt = attempts.find((a) => a.batchIndex === command.batchIndex && a.ordinal === command.ordinal && a.dispatchId === command.dispatchId);
+  if (command.ordinal === 1 && !attempts.some((a) => a.batchIndex === command.batchIndex && a.ordinal === 0 &&
+      a.retryableHttpStatus !== undefined && ["uncertain", "settled"].includes(a.status))) return false;
   return ownsAnalysisWork(run, command.owner, now) && fundingDay(now) === reservation.day &&
     run.manifest.fingerprint === command.inputFingerprint && analysisManifest(guide).fingerprint === command.inputFingerprint &&
     batches.some((b) => b.index === command.batchIndex && b.status === "queued") &&

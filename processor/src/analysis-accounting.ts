@@ -39,7 +39,10 @@ export function prepareAnalysisAccounting(options: {
   const attempts = options.attempts.map(parseRequestAttempt);
   validateBatchSettlements(options.batches, attempts);
   if ((command.type === "allocate" || command.type === "sending") &&
-      options.batches.some((b) => b.index === command.batchIndex && b.status === "succeeded")) return null;
+      (reservation.closedAt || options.batches.some((b) => b.index === command.batchIndex && b.status === "succeeded"))) return null;
+  if ((command.type === "allocate" || command.type === "sending") && run.attemptCount > 0 && command.ordinal === 1 &&
+      !attempts.some((a) => a.batchIndex === command.batchIndex && a.ordinal === 0 && a.retryableHttpStatus !== undefined &&
+        ["uncertain", "settled"].includes(a.status))) return null;
   const before = reservationAccounted(reservation, attempts);
   if (!control.halted && attempts.some((a) => a.status === "overrun")) accountingInvalid();
   const previous = attempts.find((a) => a.batchIndex === command.batchIndex && a.ordinal === command.ordinal);
@@ -71,7 +74,11 @@ export function prepareAnalysisAccounting(options: {
   if (command.type === "sending" && previous?.status === "sending") return complete(previous, true);
   if (command.type === "release" && previous?.status === "released") return complete(previous, true);
   if (command.type === "settle" && previous && ["settled", "uncertain", "overrun"].includes(previous.status) &&
-      JSON.stringify(previous.usage) === JSON.stringify(command.usage)) return complete(previous, true);
+      JSON.stringify(previous.usage) === JSON.stringify(command.usage)) {
+    // A replay cannot manufacture retry permission for a formerly ambiguous send.
+    if (command.retryableHttpStatus !== undefined && previous.retryableHttpStatus !== command.retryableHttpStatus) return null;
+    return complete(previous, true);
+  }
 
   if (command.type === "allocate" || command.type === "sending") {
     if (control.halted) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
@@ -86,7 +93,8 @@ export function prepareAnalysisAccounting(options: {
       transientRetries: policy.transientRetries }, policy.price);
     if (command.batchIndex >= quote.batchCount || command.ordinal > policy.transientRetries || timestamp < reservation.details.createdAt) return null;
     if (command.ordinal === 1 && !attempts.some((a) => a.batchIndex === command.batchIndex && a.ordinal === 0 &&
-        ["settled", "uncertain"].includes(a.status))) return null;
+        ["settled", "uncertain"].includes(a.status) && (run.attemptCount === 0 ||
+          a.retryableHttpStatus !== undefined))) return null;
     return complete({ ...identity, status: "reserved", maximum: quote.request.maximum, charged: quote.request.maximum,
       usage: null, createdAt: timestamp, sentAt: null, finishedAt: null }, false);
   }
@@ -100,10 +108,12 @@ export function prepareAnalysisAccounting(options: {
     return complete({ ...previous, status: "released", charged: zeroBudgetUnits(), finishedAt: timestamp }, false);
   }
   if (previous.status !== "sending" && previous.status !== "uncertain") return null;
+  if (command.retryableHttpStatus !== undefined && previous.status !== "sending") return null;
   // Late accounting after cancellation is allowed; it cannot apply AI output or resurrect a run.
   try {
     const charged = settleAnalysisRequest({ price: reservation.details.policy.price, maximum: previous.maximum }, command.usage);
     return complete({ ...previous, charged, usage: command.usage,
+      ...(command.retryableHttpStatus === undefined ? {} : { retryableHttpStatus: command.retryableHttpStatus }),
       status: command.usage.status === "known" ? "settled" : "uncertain", finishedAt: timestamp }, false);
   } catch (error) {
     if (!(error instanceof AnalysisBudgetError) || error.code !== "ANALYSIS_BUDGET_EXCEEDED") throw error;

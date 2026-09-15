@@ -43,12 +43,22 @@ export function postgresAccountingFixture(guide: GuideWithSteps, analysis: Analy
     return (tables.get(table) ?? []).filter((row) => {
       if (table === analysisAccountingControls || table === guides) return row.id === params[0];
       if (table === analysisBudgetWindows) return row.day === params[0] && row.scope === params[1];
+      if (table === analysisReservations && rendered.sql.includes('"closed_at"')) {
+        const run = tables.get(analysisRuns)!.find((r) => r.guideId === row.guideId && r.id === row.runId);
+        return row.closedAt === null && (!row.details || (run && (["succeeded", "failed", "cancelled"].includes(run.status as string) ||
+          ((row.day as string) < (params[0] as string) && run.availableAt instanceof Date && run.availableAt.valueOf() <= Date.parse(params[1] as string)))));
+      }
       if (table === analysisRuns && rendered.sql.includes('"analysis_runs"."available_at"')) {
         const due = rendered.sql.includes(" <= ");
         const at = new Date(params[due ? 2 : 1] as string).valueOf();
         const available = row.availableAt instanceof Date ? row.availableAt.valueOf() : NaN;
         const funded = tables.get(analysisReservations)!.some((r) => r.guideId === row.guideId && r.runId === row.id && r.details);
         const ready = tables.get(guides)!.some((g) => g.id === row.guideId && g.status === "ready" && g.errorCode === null);
+        if (due && params.length >= 7) {
+          const comparison = available - Date.parse(params[3] as string) || (row.createdAt as Date).valueOf() - Date.parse(params[4] as string) ||
+            (row.guideId as string).localeCompare(params[5] as string) || (row.id as string).localeCompare(params[6] as string);
+          if (comparison <= 0) return false;
+        }
         return funded && (due ? ready && ["queued", "running"].includes(row.status as string) && available <= at : row.status === "running" && available > at);
       }
       return row.guideId === params[0] && (params.length < 2 || row.runId === params[1]);

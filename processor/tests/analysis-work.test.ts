@@ -168,6 +168,8 @@ test("missing, expired and stale owners cannot allocate/send or replay dispatch;
   await h.begin();
   assert.equal(await h.repository.executeAnalysisAccounting(h.guideId, { type: "sending", ...request }, time(1)), null);
   assert.equal(await h.repository.executeAnalysisAccounting(h.guideId, { type: "sending", ...request, owner }, time(1000)), null);
+  assert.ok(await h.repository.executeAnalysisAccounting(h.guideId, { type: "settle", ...request,
+    usage: { status: "unknown" }, retryableHttpStatus: 503 }, time(999)));
   await h.acquire({ ...claim, attemptId: "worker-b", expectedAttemptCount: 1 }, time(1000));
   for (const type of ["allocate", "sending"] as const) {
     assert.equal(await h.repository.executeAnalysisAccounting(h.guideId, { type, ...request, owner }, time(1001)), null);
@@ -287,7 +289,7 @@ test("current JSON format reopens without version reset and rejects corrupted wo
   const h = await harness(context);
   await h.acquire();
   const saved = await h.state();
-  assert.equal(saved.version, 4);
+  assert.equal(saved.version, 5);
   for (const mutation of [
     (raw: typeof saved) => { raw.analysis[0].state.runs[0].leaseExpiresAt = null; },
     (raw: typeof saved) => { raw.analysis[0].state.runs[0].attemptCount = 4; },

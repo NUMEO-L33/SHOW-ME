@@ -4,7 +4,7 @@ import { z } from "zod";
 import { analysisBudgetPriceSchema, analysisBudgetUnitsSchema, quoteAnalysisBudget, reserveAnalysisBudget, settleAnalysisRequest } from "./analysis-budget.js";
 import {
   accountingControlSchema, analysisRequestAttemptSchema, analysisWorkOwnerSchema, AnalysisAccountingError, budgetUnitFields,
-  parseRequestAttempt, sameBudgetUnits, type AnalysisRequestAttempt,
+  parseRequestAttempt, sameBudgetUnits, zeroBudgetUnits, type AnalysisRequestAttempt,
 } from "./analysis-accounting-contract.js";
 import { analysisBatches, analysisManifest, analysisOutputSchema, parseAnalysisOutput } from "./analysis-contract.js";
 import { parseAnalysisCommand, parseAnalysisState, transitionAnalysis, type AnalysisCommand, type AnalysisState } from "./analysis-state.js";
@@ -44,13 +44,17 @@ const windowSchema = z.object({
   day: daySchema, scope: z.string().regex(/^(global|guide:.{1,128})$/), policyVersion: id,
   limit: analysisBudgetUnitsSchema, used: analysisBudgetUnitsSchema,
 }).strict();
-const reservationSchema = z.object({
+const legacyReservationSchema = z.object({
   guideId: id, runId: id, day: daySchema, maximum: analysisBudgetUnitsSchema,
   // Null is an irreversible deletion tombstone: no media/consent/policy details.
   details: z.object({
     requestFingerprint: fingerprint, command: requestCommand, policy: analysisFundingPolicySchema,
     frameCount: counter.min(1).max(24), createdAt: z.string().datetime(),
   }).strict().nullable(),
+}).strict();
+const reservationSchema = legacyReservationSchema.extend({
+  // Only never-allocated slots. Allocated but unsent slots use released attempts.
+  released: analysisBudgetUnitsSchema, closedAt: z.string().datetime().nullable(),
 }).strict();
 const queuedBatchSchema = z.object({
   guideId: id, runId: id, index: counter.max(5), status: z.literal("queued"),
@@ -67,9 +71,10 @@ const batchSchema = z.discriminatedUnion("status", [queuedBatchSchema, queuedBat
 export type AnalysisBudgetWindow = z.infer<typeof windowSchema>;
 export type AnalysisReservation = z.infer<typeof reservationSchema>;
 export type AnalysisStoredBatch = z.infer<typeof batchSchema>;
-const legacyLedgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(reservationSchema), batches: z.array(queuedBatchSchema) }).strict();
-const v3LedgerSchema = legacyLedgerSchema.extend({ attempts: z.array(analysisRequestAttemptSchema), control: accountingControlSchema }).strict();
-const ledgerSchema = v3LedgerSchema.extend({ batches: z.array(batchSchema) }).strict();
+const legacyLedgerSchema = z.object({ windows: z.array(windowSchema), reservations: z.array(legacyReservationSchema), batches: z.array(queuedBatchSchema) }).strict();
+const v3LedgerSchema = legacyLedgerSchema.extend({ attempts: z.array(analysisRequestAttemptSchema.omit({ retryableHttpStatus: true })), control: accountingControlSchema }).strict();
+const v4LedgerSchema = v3LedgerSchema.extend({ batches: z.array(batchSchema) }).strict();
+const ledgerSchema = v4LedgerSchema.extend({ reservations: z.array(reservationSchema), attempts: z.array(analysisRequestAttemptSchema) }).strict();
 export type AnalysisFundingLedger = z.infer<typeof ledgerSchema>;
 export type AnalysisFundingResult = { analysis: AnalysisState; reservation: AnalysisReservation; batches: AnalysisStoredBatch[]; replayed: boolean };
 
@@ -113,10 +118,14 @@ export function parseReservation(raw: unknown): AnalysisReservation {
 }
 export function emptyFundingLedger(): AnalysisFundingLedger { return { windows: [], reservations: [], batches: [], attempts: [], control: { halted: false } }; }
 export function upgradeFundingLedgerV2(raw: unknown): AnalysisFundingLedger {
-  return parseFundingLedger({ ...parse(legacyLedgerSchema, raw), attempts: [], control: { halted: false } });
+  return upgradeFundingLedgerV4({ ...parse(legacyLedgerSchema, raw), attempts: [], control: { halted: false } });
 }
 export function upgradeFundingLedgerV3(raw: unknown): AnalysisFundingLedger {
-  return parseFundingLedger(parse(v3LedgerSchema, raw));
+  return upgradeFundingLedgerV4(parse(v3LedgerSchema, raw));
+}
+export function upgradeFundingLedgerV4(raw: unknown): AnalysisFundingLedger {
+  const old = parse(v4LedgerSchema, raw);
+  return parseFundingLedger({ ...old, reservations: old.reservations.map((r) => ({ ...r, released: zeroBudgetUnits(), closedAt: null })) });
 }
 
 /** Stored output has to refer to an immutable, known, non-overrun settlement. */
@@ -133,7 +142,7 @@ export function validateBatchSettlements(batches: AnalysisStoredBatch[], attempt
   }
 }
 
-/** Unallocated slots still retain their maximum. Only recorded settlements/releases discount them. */
+/** Only a closed reservation can release never-allocated slots; unknown sends retain their maximum. */
 export function reservationAccounted(reservation: AnalysisReservation, rawAttempts: AnalysisRequestAttempt[]) {
   const attempts = rawAttempts.map(parseRequestAttempt);
   const slots = attempts.map((a) => `${a.batchIndex}:${a.ordinal}`);
@@ -151,11 +160,15 @@ export function reservationAccounted(reservation: AnalysisReservation, rawAttemp
     }
   }
   const accounted = { ...reservation.maximum };
+  if (reservation.closedAt && attempts.some((a) => ["reserved", "sending"].includes(a.status) ||
+      a.createdAt > reservation.closedAt!)) invalid();
   for (const field of budgetUnitFields) {
     const allocated = attempts.reduce((sum, a) => sum + BigInt(a.maximum[field]), 0n);
     const released = attempts.reduce((sum, a) => sum + BigInt(a.maximum[field] - a.charged[field]), 0n);
     if (allocated > BigInt(reservation.maximum[field])) invalid();
-    accounted[field] = Number(BigInt(reservation.maximum[field]) - released);
+    const unallocated = Number(BigInt(reservation.maximum[field]) - allocated);
+    if (reservation.released[field] !== (reservation.closedAt ? unallocated : 0)) invalid();
+    accounted[field] = Number(BigInt(reservation.maximum[field]) - released) - reservation.released[field];
   }
   return accounted;
 }
@@ -163,6 +176,7 @@ export function reservationAccounted(reservation: AnalysisReservation, rawAttemp
 export function validateFundingAnalysis(analysis: AnalysisState, reservation: AnalysisReservation, batches: AnalysisStoredBatch[]): void {
   const run = analysis.runs.find((candidate) => candidate.id === reservation.runId);
   if (!run || !reservation.details || run.manifest.frames.length !== reservation.details.frameCount) invalid();
+  if (reservation.closedAt && (["queued", "running"].includes(run.status) || reservation.closedAt < run.updatedAt)) invalid();
   const command: AnalysisFundingCommand = { type: "request", runId: run.id, baseDraftRevision: run.baseDraftRevision,
     consentVersion: run.consentVersion, provider: run.provider, model: run.model, promptVersion: run.promptVersion,
     expectedInputFingerprint: run.manifest.fingerprint };
@@ -267,7 +281,7 @@ export function prepareFundedAnalysis(options: {
     if (!used) throw new AnalysisFundingError("ANALYSIS_BUDGET_LIMIT");
     return { ...current, used };
   });
-  const reservation = parseReservation({ guideId: guide.id, runId: command.runId, day, maximum,
+  const reservation = parseReservation({ guideId: guide.id, runId: command.runId, day, maximum, released: zeroBudgetUnits(), closedAt: null,
     details: { command, requestFingerprint: requestFingerprint(command), policy, frameCount: manifest.frames.length, createdAt: now.toISOString() } });
   const batches = analysisBatches(manifest.frames).map((batch, index) => parseStoredBatch({ guideId: guide.id, runId: command.runId,
     index, status: "queued", targetIds: batch.targets.map((f) => f.stepId), contextIds: batch.context.map((f) => f.stepId) }));

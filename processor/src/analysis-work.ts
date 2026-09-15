@@ -21,11 +21,24 @@ const claimSchema = z.object({
 }).strict();
 export type AnalysisWorkClaim = z.infer<typeof claimSchema>;
 export type AnalysisWorkCandidate = { guideId: string; runId: string; expectedAttemptCount: number };
+const cursorSchema = z.object({ availableAt: z.string().datetime(), createdAt: z.string().datetime(),
+  guideId: z.string().min(1).max(128), runId: z.string().min(1).max(128) }).strict();
+export type AnalysisWorkCursor = z.infer<typeof cursorSchema>;
+export function parseWorkCursor(raw: unknown): AnalysisWorkCursor | undefined {
+  if (raw === undefined) return undefined;
+  const result = cursorSchema.safeParse(raw);
+  if (!result.success) throw new AnalysisWorkError();
+  return result.data;
+}
+export function compareWorkCursor(a: AnalysisWorkCursor, b: AnalysisWorkCursor): number {
+  return Date.parse(a.availableAt) - Date.parse(b.availableAt) || Date.parse(a.createdAt) - Date.parse(b.createdAt) ||
+    a.guideId.localeCompare(b.guideId) || a.runId.localeCompare(b.runId);
+}
 export type AnalysisWorkResult = { outcome: "claimed" | "exhausted"; run: AnalysisRun; replayed: boolean };
 export type AnalysisWorkFailure = Extract<AnalysisCommand, { type: "fail" }>;
 export interface AnalysisWorkRepository {
   /** Bounded read-only discovery, not ownership. Default time comes from the DB for PostgreSQL. */
-  listAnalysisWork(limit?: number, now?: Date): Promise<AnalysisWorkCandidate[]>;
+  listAnalysisWork(limit?: number, now?: Date, after?: AnalysisWorkCursor): Promise<AnalysisWorkCandidate[]>;
   /** Fixed global funded-work slot of one; CAS and orphan accounting are committed together. */
   claimAnalysisWork(guideId: string, command: AnalysisWorkClaim, now?: Date, beforeCommit?: () => void): Promise<AnalysisWorkResult | null>;
   /** Fence termination and uncertain sending entries together; never refund unknown usage. */
@@ -126,7 +139,7 @@ export function prepareAnalysisWorkClaim(options: {
   const exhausted = run.attemptCount >= ANALYSIS_LIMITS.maxAttempts;
   if (!exhausted) {
     if (options.halted) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
-    // Cross-day rebudgeting belongs to B4-B. Never silently spend yesterday's reservation today.
+    // Old-day work is closed separately; only a fresh request can reserve today's budget.
     if (fundingDay(now) !== reservation.day) throw new AnalysisAccountingError("ANALYSIS_DAY_ROLLOVER");
     if (options.occupied || command.attemptId === run.attemptId) return null;
   }

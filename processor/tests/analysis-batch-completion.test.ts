@@ -166,6 +166,8 @@ test("expired/stale ownership and a newer dispatch reject late output but still 
   const before = await h.state();
   assert.equal(await h.complete(stale, at(1000)), null);
   assert.deepEqual(await h.state(), before);
+  assert.ok(await h.repository.executeAnalysisAccounting(h.guideId, { type: "settle", runId: stale.runId,
+    batchIndex: 0, ordinal: 0, dispatchId: stale.dispatchId, usage: { status: "unknown" }, retryableHttpStatus: 503 }, at(999)));
   const takeover = { attemptId: "owner-b", attemptCount: 2 };
   await h.repository.claimAnalysisWork(h.guideId, { ...claim, attemptId: takeover.attemptId, expectedAttemptCount: 1 }, at(1000));
   assert.equal(await h.complete(stale, at(1010)), null);
@@ -296,13 +298,16 @@ test("v3 upgrades on write without resetting queued work and rejects downgraded 
   const h = await harness(context);
   const body = await h.begin();
   const old = await h.state(); old.version = 3;
+  for (const r of old.funding.reservations) { delete r.released; delete r.closedAt; }
   await writeFile(h.repository.filePath, JSON.stringify(old));
   assert.equal((await new JsonGuideRepository(h.repository.filePath).getAnalysisState(h.guideId))?.runs[0].attemptCount, 1);
   assert.equal((await h.state()).version, 3); // Read-only migration does not rewrite disk.
   await h.complete(body);
   const saved = await h.state();
-  assert.equal(saved.version, 4);
-  assert.deepEqual(saved.funding.reservations, old.funding.reservations);
+  assert.equal(saved.version, 5);
+  assert.deepEqual(saved.funding.reservations.map(({ released, closedAt, ...r }: Record<string, unknown>) => {
+    void released; void closedAt; return r;
+  }), old.funding.reservations);
   assert.deepEqual(saved.analysis[0].state, old.analysis[0].state);
   saved.version = 3;
   await writeFile(h.repository.filePath, JSON.stringify(saved));
