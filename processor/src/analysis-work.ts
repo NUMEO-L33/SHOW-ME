@@ -4,7 +4,7 @@ import { AnalysisAccountingError, analysisWorkOwnerSchema, parseRequestAttempt, 
 import { ANALYSIS_LIMITS } from "./analysis-contract.js";
 import { fundingDay, parseReservation, reservationAccounted, validateBatchSettlements, validateFundingAnalysis,
   type AnalysisReservation, type AnalysisStoredBatch } from "./analysis-funding.js";
-import { parseAnalysisState, transitionAnalysis, type AnalysisRun, type AnalysisState } from "./analysis-state.js";
+import { parseAnalysisCommand, parseAnalysisState, transitionAnalysis, type AnalysisCommand, type AnalysisRun, type AnalysisState } from "./analysis-state.js";
 import type { GuideWithSteps } from "./domain.js";
 
 /** Internal queue ownership only. A claim never grants permission to send images. */
@@ -22,11 +22,46 @@ const claimSchema = z.object({
 export type AnalysisWorkClaim = z.infer<typeof claimSchema>;
 export type AnalysisWorkCandidate = { guideId: string; runId: string; expectedAttemptCount: number };
 export type AnalysisWorkResult = { outcome: "claimed" | "exhausted"; run: AnalysisRun; replayed: boolean };
+export type AnalysisWorkFailure = Extract<AnalysisCommand, { type: "fail" }>;
 export interface AnalysisWorkRepository {
   /** Bounded read-only discovery, not ownership. Default time comes from the DB for PostgreSQL. */
   listAnalysisWork(limit?: number, now?: Date): Promise<AnalysisWorkCandidate[]>;
   /** Fixed global funded-work slot of one; CAS and orphan accounting are committed together. */
   claimAnalysisWork(guideId: string, command: AnalysisWorkClaim, now?: Date, beforeCommit?: () => void): Promise<AnalysisWorkResult | null>;
+  /** Fence termination and uncertain sending entries together; never refund unknown usage. */
+  failAnalysisWork(guideId: string, command: AnalysisWorkFailure, now?: Date, beforeCommit?: () => void): Promise<AnalysisState | null>;
+}
+
+export function parseWorkFailure(raw: unknown): AnalysisWorkFailure {
+  const command = parseAnalysisCommand(raw);
+  if (command.type !== "fail" || !analysisWorkOwnerSchema.safeParse({ attemptId: command.attemptId, attemptCount: command.attemptCount }).success) {
+    throw new AnalysisWorkError();
+  }
+  return command;
+}
+
+export function prepareAnalysisWorkFailure(options: {
+  guide: GuideWithSteps; analysis: AnalysisState; reservation: AnalysisReservation; batches: AnalysisStoredBatch[];
+  attempts: AnalysisRequestAttempt[]; command: AnalysisWorkFailure; now: Date;
+}): { analysis: AnalysisState; attempts: AnalysisRequestAttempt[] } | null {
+  const command = parseWorkFailure(options.command);
+  const now = workTime(options.now);
+  const previous = parseAnalysisState(options.analysis);
+  const reservation = parseReservation(options.reservation);
+  if (!reservation.details || reservation.guideId !== options.guide.id || reservation.runId !== command.runId) return null;
+  validateFundingAnalysis(previous, reservation, options.batches);
+  validateBatchSettlements(options.batches, options.attempts);
+  reservationAccounted(reservation, options.attempts);
+  const run = previous.runs.find((r) => r.id === command.runId)!;
+  if (Date.parse(run.updatedAt) > now.valueOf() || options.attempts.some((a) =>
+    Date.parse(a.finishedAt ?? a.sentAt ?? a.createdAt) > now.valueOf())) return null;
+  // Exact current owner may terminate its expired lease, but never a replacement or cancelled run.
+  const analysis = transitionAnalysis(options.guide, previous, command, now);
+  if (!analysis) return null;
+  const attempts = options.attempts.map((a) => a.status === "sending" ? parseRequestAttempt({ ...a,
+    status: "uncertain", usage: { status: "unknown" }, finishedAt: now.toISOString() }) : a);
+  reservationAccounted(reservation, attempts);
+  return { analysis: parseAnalysisState(analysis), attempts };
 }
 
 export function parseWorkClaim(raw: unknown): AnalysisWorkClaim {

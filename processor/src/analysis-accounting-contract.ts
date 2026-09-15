@@ -38,7 +38,7 @@ export const analysisRequestAttemptSchema = z.object({
 export type AnalysisRequestAttempt = z.infer<typeof analysisRequestAttemptSchema>;
 export type AnalysisAccountingResult = { attempt: AnalysisRequestAttempt; replayed: boolean; halted: boolean };
 export interface AnalysisAccountingRepository {
-  executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date): Promise<AnalysisAccountingResult | null>;
+  executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date, beforeCommit?: () => void): Promise<AnalysisAccountingResult | null>;
   getAnalysisRequestAttempts(guideId: string, runId: string): Promise<AnalysisRequestAttempt[] | null>;
   getAnalysisAccountingControl(): Promise<AnalysisAccountingControl>;
 }

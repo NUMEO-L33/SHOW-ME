@@ -59,8 +59,8 @@ import {
 } from "./analysis-accounting-contract.js";
 import { prepareAnalysisAccounting } from "./analysis-accounting.js";
 import {
-  parseWorkClaim, prepareAnalysisWorkClaim, validateWorkProjection, workAvailableAt, workLimit, workTime,
-  type AnalysisWorkCandidate, type AnalysisWorkClaim, type AnalysisWorkResult,
+  parseWorkClaim, prepareAnalysisWorkClaim, parseWorkFailure, prepareAnalysisWorkFailure, validateWorkProjection, workAvailableAt, workLimit, workTime,
+  type AnalysisWorkCandidate, type AnalysisWorkClaim, type AnalysisWorkResult, type AnalysisWorkFailure,
 } from "./analysis-work.js";
 import { parseBatchCompletion, prepareBatchCompletion, type AnalysisBatchCompletion, type AnalysisBatchCompletionResult } from "./analysis-batch-completion.js";
 
@@ -644,7 +644,7 @@ export class JsonGuideRepository implements GuideRepository {
     return this.serialize(async () => clone((await this.readState()).funding.windows.find((w) => w.day === day && w.scope === scope) ?? null));
   }
 
-  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date): Promise<AnalysisAccountingResult | null> {
+  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date, beforeCommit?: () => void): Promise<AnalysisAccountingResult | null> {
     command = parseAccountingCommand(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.serialize(async () => {
@@ -660,6 +660,7 @@ export class JsonGuideRepository implements GuideRepository {
       if (!prepared) return null;
       const { windows, control, ...result } = prepared;
       if (result.replayed) return clone(result);
+      validateFundingCommit(beforeCommit);
       state.funding.control = control;
       state.funding.attempts = [...state.funding.attempts.filter((a) => !(a.guideId === guideId && a.runId === command.runId &&
         a.batchIndex === command.batchIndex && a.ordinal === command.ordinal)), result.attempt];
@@ -680,6 +681,28 @@ export class JsonGuideRepository implements GuideRepository {
   }
 
   async getAnalysisAccountingControl() { return this.serialize(async () => clone((await this.readState()).funding.control)); }
+
+  async failAnalysisWork(guideId: string, command: AnalysisWorkFailure, now?: Date, beforeCommit?: () => void): Promise<AnalysisState | null> {
+    command = parseWorkFailure(command);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const guide = state.guides.find((g) => g.id === guideId);
+      const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId);
+      if (!guide || !reservation?.details) return null;
+      const prepared = prepareAnalysisWorkFailure({ guide: { ...guide, steps: state.steps.filter((s) => s.guideId === guideId) },
+        analysis: state.analysis.find((a) => a.guideId === guideId)?.state ?? emptyAnalysisState(), reservation,
+        batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
+        attempts: state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === command.runId), command, now: workTime(fixedTime) });
+      if (!prepared) return null;
+      validateFundingCommit(beforeCommit);
+      state.analysis = [...state.analysis.filter((a) => a.guideId !== guideId), { guideId, state: prepared.analysis }];
+      state.funding.attempts = [...state.funding.attempts.filter((a) => a.guideId !== guideId || a.runId !== command.runId), ...prepared.attempts];
+      state.funding = parseFundingLedger(state.funding);
+      await this.writeState(state);
+      return clone(prepared.analysis);
+    });
+  }
 
   async completeAnalysisBatch(guideId: string, command: AnalysisBatchCompletion, now?: Date, beforeCommit?: () => void): Promise<AnalysisBatchCompletionResult | null> {
     command = parseBatchCompletion(command);
@@ -1366,7 +1389,7 @@ export class PostgresGuideRepository implements GuideRepository {
     return row ? parseBudgetWindow({ ...row.payload, day: row.day, scope: row.scope }) : null;
   }
 
-  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date): Promise<AnalysisAccountingResult | null> {
+  async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date, beforeCommit?: () => void): Promise<AnalysisAccountingResult | null> {
     command = parseAccountingCommand(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.database.transaction(async (transaction) => {
@@ -1396,6 +1419,7 @@ export class PostgresGuideRepository implements GuideRepository {
       if (!prepared) return null;
       const { windows: nextWindows, control: nextControl, ...result } = prepared;
       if (result.replayed) return result;
+      validateFundingCommit(beforeCommit);
       for (const { day, scope, ...payload } of nextWindows) {
         await transaction.update(analysisBudgetWindows).set({ payload })
           .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope)));
@@ -1475,6 +1499,33 @@ export class PostgresGuideRepository implements GuideRepository {
       if (accounting.control.halted !== control.halted) await transaction.update(analysisAccountingControls).set({ payload: accounting.control })
         .where(eq(analysisAccountingControls.id, "global"));
       return clone(result);
+    }, { isolationLevel: "read committed" });
+  }
+
+  async failAnalysisWork(guideId: string, command: AnalysisWorkFailure, now?: Date, beforeCommit?: () => void): Promise<AnalysisState | null> {
+    command = parseWorkFailure(command);
+    const fixedTime = now === undefined ? undefined : workTime(now);
+    return this.database.transaction(async (transaction) => {
+      await lockAccountingControl(transaction);
+      const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      const [stored] = await transaction.select().from(analysisReservations).where(and(
+        eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
+      if (!stored?.details) return null;
+      const previous = await loadAnalysisRows(transaction, guideId);
+      const rows = await transaction.select().from(analysisBatchesTable).where(and(eq(analysisBatchesTable.guideId, guideId),
+        eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+      const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const attempts = await loadRequestAttempts(transaction, guideId, command.runId);
+      const prepared = prepareAnalysisWorkFailure({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) },
+        analysis: previous, reservation: parseReservation(stored), batches: rows.map(batchFromRow), attempts, command,
+        now: await analysisWorkClock(transaction, fixedTime) });
+      if (!prepared) return null;
+      validateFundingCommit(beforeCommit);
+      await persistAnalysisRows(transaction, guideId, previous, prepared.analysis);
+      for (const attempt of prepared.attempts) if (attempt.status !== attempts.find((a) =>
+        a.batchIndex === attempt.batchIndex && a.ordinal === attempt.ordinal)?.status) await persistRequestAttempt(transaction, attempt);
+      return clone(prepared.analysis);
     }, { isolationLevel: "read committed" });
   }
 

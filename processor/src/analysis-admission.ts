@@ -61,6 +61,47 @@ function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/** Shared admission/send-time checks. Only a trusted verifier may supply this report. */
+export function verifyAnalysisReadiness(options: {
+  raw: unknown; input: AnalysisAdmissionInput; readiness: AnalysisAdmissionReadiness;
+  spending: AnalysisSpendingPolicy; clock: () => Date; signal: AbortSignal;
+}) {
+  const { input, readiness, spending, clock, signal } = options;
+  const parsed = snapshotSchema.safeParse(options.raw);
+  if (!parsed.success) unavailable();
+  const snapshot = parsed.data;
+  const time = () => {
+    const date = new Date(clock().valueOf());
+    if (!Number.isFinite(date.valueOf())) unavailable();
+    return date;
+  };
+  const at = time();
+  const assertCurrent = () => {
+    checkAbort(signal);
+    const current = time();
+    const checked = Date.parse(snapshot.checkedAt);
+    const expiry = Date.parse(snapshot.validUntil);
+    if (checked > current.valueOf() || expiry <= current.valueOf() || expiry - checked > 30_000 || expiry <= checked ||
+        current.valueOf() < at.valueOf() || fundingDay(current) !== fundingDay(at)) unavailable();
+    const valid: unknown = readiness.isCurrent(snapshot.id);
+    if (valid !== true) {
+      void Promise.resolve(valid).catch(() => undefined);
+      unavailable();
+    }
+  };
+  if (Object.entries(input).some(([key, value]) => snapshot[key as keyof AnalysisAdmissionInput] !== value) ||
+      snapshot.policy.price.model !== input.model || snapshot.policy.maxInputTokensPerRequest < snapshot.runtime.inputTokenBound) unavailable();
+  const { policy, entitlement } = snapshot;
+  if ([policy.globalLimit, policy.guideLimit].some((limit) => Object.values(limit).some((value) => value === 0))) unavailable();
+  if (spending.mode === "free_only") {
+    if (entitlement.mode !== "free_only" || ["requests", "inputTokens", "outputTokens"].some((key) =>
+      policy.globalLimit[key as keyof typeof entitlement.dailyQuota] > entitlement.dailyQuota[key as keyof typeof entitlement.dailyQuota])) unavailable();
+  } else if (entitlement.mode !== "paid_capped" || entitlement.approvalId !== spending.approvalId ||
+      entitlement.projectRef !== spending.projectRef || policy.globalLimit.costMicrousd > spending.dailyCostMicrousd) unavailable();
+  assertCurrent();
+  return { snapshot, assertCurrent, at };
+}
+
 /** Durable admission, not a dispatcher. Safe default is unavailable; no env enable flag. */
 export class DurableAnalysisAdmission implements AnalysisAdmission {
   private readonly repository: GuideRepository;
@@ -114,36 +155,9 @@ export class DurableAnalysisAdmission implements AnalysisAdmission {
     if (manifest.fingerprint !== command.expectedInputFingerprint) return null;
     const input: AnalysisAdmissionInput = { guideId, inputFingerprint: manifest.fingerprint, frameCount: manifest.frames.length,
       model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION };
-    const parsed = snapshotSchema.safeParse(await readiness.inspect({ ...input }, signal));
-    checkAbort(signal);
-    if (!parsed.success) unavailable();
-    const snapshot = parsed.data;
-    const at = this.time();
-    const assertCurrent = () => {
-      checkAbort(signal);
-      const current = this.time();
-      const checked = Date.parse(snapshot.checkedAt);
-      const expiry = Date.parse(snapshot.validUntil);
-      if (checked > current.valueOf() || expiry <= current.valueOf() || expiry - checked > 30_000 || expiry <= checked ||
-          current.valueOf() < at.valueOf() || fundingDay(current) !== fundingDay(at)) unavailable();
-      const valid: unknown = readiness.isCurrent(snapshot.id);
-      if (valid !== true) {
-        // A Promise or truthy string is not a synchronous readiness confirmation.
-        void Promise.resolve(valid).catch(() => undefined);
-        unavailable();
-      }
-    };
-    if (Object.entries(input).some(([key, value]) => snapshot[key as keyof AnalysisAdmissionInput] !== value) ||
-        snapshot.policy.price.model !== input.model || snapshot.policy.maxInputTokensPerRequest < snapshot.runtime.inputTokenBound) unavailable();
-    const { policy, entitlement } = snapshot;
-    if ([policy.globalLimit, policy.guideLimit].some((limit) => Object.values(limit).some((value) => value === 0))) unavailable();
-    if (this.spending.mode === "free_only") {
-      if (entitlement.mode !== "free_only" || ["requests", "inputTokens", "outputTokens"].some((key) =>
-        policy.globalLimit[key as keyof typeof entitlement.dailyQuota] > entitlement.dailyQuota[key as keyof typeof entitlement.dailyQuota])) unavailable();
-    } else if (entitlement.mode !== "paid_capped" || entitlement.approvalId !== this.spending.approvalId ||
-        entitlement.projectRef !== this.spending.projectRef || policy.globalLimit.costMicrousd > this.spending.dailyCostMicrousd) unavailable();
-    assertCurrent();
-    const result = await this.repository.reserveAnalysisRequest(guideId, command, policy, at, assertCurrent);
+    const { snapshot, at, assertCurrent } = verifyAnalysisReadiness({ raw: await readiness.inspect({ ...input }, signal),
+      input, readiness, spending: this.spending, clock: () => this.time(), signal });
+    const result = await this.repository.reserveAnalysisRequest(guideId, command, snapshot.policy, at, assertCurrent);
     // No queue side-effect after commit: B4 discovers the durable queued run.
     return result?.analysis ?? null;
   }

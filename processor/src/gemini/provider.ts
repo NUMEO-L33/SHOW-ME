@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 
 import { AnalysisContractError, AnalysisProviderFailure, parseAnalysisOutput, type AnalysisProvider } from "../analysis-contract.js";
-import { buildGeminiRequest, geminiEndpoint, GEMINI_MODEL, isGeminiModel, type AnalysisInput, type GeminiModel } from "./request.js";
+import { buildGeminiRequest, geminiEndpoint, GEMINI_MAX_OUTPUT_TOKENS, GEMINI_MODEL, isGeminiModel, type AnalysisInput, type GeminiModel } from "./request.js";
 
 export class GeminiError extends AnalysisProviderFailure {
   override name = "GeminiError";
@@ -17,6 +17,8 @@ export class GeminiError extends AnalysisProviderFailure {
 }
 
 export type RequestPermit = (signal: AbortSignal) => Promise<void>;
+/** Recheck durable ownership/permission after asynchronous adapter work, then immediately before fetch. */
+export type DispatchSendPermit = (signal: AbortSignal) => Promise<() => void>;
 const counter = z.number().int().nonnegative().safe();
 const envelopeSchema = z.object({
   modelVersion: z.string().optional(),
@@ -104,6 +106,10 @@ export function parseGeminiResponse(raw: unknown, input: AnalysisInput, model: G
 export class GeminiAnalysisProvider implements AnalysisProvider {
   readonly name = "gemini";
   readonly model: GeminiModel;
+  readonly maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS;
+  readonly dispatchContract = "single-send-v1" as const;
+  /** A durable dispatcher must require zero; smoke tests retain their existing default. */
+  get transientRetries(): 0 | 1 { return this.#options.transientRetries ?? 1; }
   readonly #options: {
     apiKey: string; allowExternalProcessing: boolean; reserveRequest: RequestPermit;
     fetch?: typeof fetch; timeoutMs?: number; transientRetries?: 0 | 1;
@@ -122,7 +128,7 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
     this.#options = { ...options };
   }
 
-  async analyzeFrames(input: AnalysisInput, parentSignal: AbortSignal) {
+  async analyzeFrames(input: AnalysisInput, parentSignal: AbortSignal, authorizeSend?: DispatchSendPermit) {
     if (!this.#options.allowExternalProcessing) throw new GeminiError("GEMINI_DISABLED");
     // Treat keys as opaque header values; current auth keys may contain periods.
     if (!/^[\x21-\x7e]{10,4096}$/.test(this.#options.apiKey)) throw new GeminiError("GEMINI_KEY_MISSING");
@@ -144,6 +150,17 @@ export class GeminiAnalysisProvider implements AnalysisProvider {
         controller.signal.throwIfAborted();
         await this.#options.reserveRequest(controller.signal);
         controller.signal.throwIfAborted();
+        const finalCheck = await authorizeSend?.(controller.signal);
+        controller.signal.throwIfAborted();
+        // No await between this synchronous guard and fetch. A Promise is not a valid guard.
+        if (authorizeSend) {
+          if (typeof finalCheck !== "function") throw new GeminiError("GEMINI_DISABLED");
+          const returned: unknown = finalCheck();
+          if (returned !== undefined) {
+            void Promise.resolve(returned).catch(() => undefined);
+            throw new GeminiError("GEMINI_DISABLED");
+          }
+        }
         const response = await send(geminiEndpoint(this.model), {
           method: "POST", redirect: "error", signal: controller.signal,
           headers: { "content-type": "application/json", "x-goog-api-key": this.#options.apiKey }, body,
