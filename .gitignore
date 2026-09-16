@@ -47,3 +47,27 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Private configuration and credentials (templates contain placeholders only).
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime video/frame data and test output, including artifact-local DATA_DIR.
+.data/
+coverage/
+/outputs/
+/work/
+/screenshots/
+
+# Checkout-local tooling and previous hosting runtime state.
+.sites-runtime/
+.agents/
+.codex/
+.wrangler/
+.vercel/
+.next/
+.vinext/

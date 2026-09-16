@@ -1,0 +1,2 @@
+# Replit runs shell hooks on Linux, including files edited from Windows.
+*.sh text eol=lf

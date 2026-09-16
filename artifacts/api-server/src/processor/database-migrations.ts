@@ -5,6 +5,12 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
 
+export function resolveMigrationsFolder(cwd = process.cwd()): string {
+  const artifactMigrations = path.resolve(cwd, "drizzle");
+  const workspaceMigrations = path.resolve(cwd, "artifacts", "api-server", "drizzle");
+  return existsSync(artifactMigrations) ? artifactMigrations : workspaceMigrations;
+}
+
 /**
  * Applies checked-in migrations after the HTTP listener is available. The
  * readiness routes remain 503 until this finishes, so a hosting probe never
@@ -21,10 +27,8 @@ export async function runDatabaseMigrations(databaseUrl?: string): Promise<void>
     max: 1,
   });
   try {
-    const artifactMigrations = path.resolve(process.cwd(), "drizzle");
-    const workspaceMigrations = path.resolve(process.cwd(), "artifacts", "api-server", "drizzle");
     await migrate(drizzle(pool), {
-      migrationsFolder: existsSync(artifactMigrations) ? artifactMigrations : workspaceMigrations,
+      migrationsFolder: resolveMigrationsFolder(),
     });
   } finally {
     await pool.end();
