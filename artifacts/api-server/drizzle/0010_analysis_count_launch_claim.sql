@@ -1,0 +1,2 @@
+ALTER TABLE "analysis_count_attempts" DROP CONSTRAINT "analysis_count_status_check";--> statement-breakpoint
+ALTER TABLE "analysis_count_attempts" ADD CONSTRAINT "analysis_count_status_check" CHECK ("analysis_count_attempts"."status" IN ('reserved','sending','launch_claimed','settled','uncertain','overrun','released'));

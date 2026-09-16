@@ -1,0 +1,83 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1789121244230,
+      "tag": "0000_slim_raider",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789124611249,
+      "tag": "0001_fair_harrier",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789177083144,
+      "tag": "0002_analysis_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789379233608,
+      "tag": "0003_analysis_funding",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789383082269,
+      "tag": "0004_analysis_accounting",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789386047359,
+      "tag": "0005_analysis_work_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789388780370,
+      "tag": "0006_analysis_batch_completion",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789444816045,
+      "tag": "0007_analysis_reservation_closure",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789464931422,
+      "tag": "0008_analysis_provider_quota",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789476033233,
+      "tag": "0009_analysis_count_accounting",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789477746093,
+      "tag": "0010_analysis_count_launch_claim",
+      "breakpoints": true
+    }
+  ]
+}

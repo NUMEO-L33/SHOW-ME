@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "ShowMe"
+description = "A Korean-language web app that turns screen recordings into clear, step-by-step guides, with editing, privacy review, and shareable public guide views."
+version = "1.0.0"
+id = "artifacts/showme"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20116
+
+[services.development]
+run = "pnpm --filter @workspace/showme run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/showme", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/showme/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20116"
+BASE_PATH = "/"
