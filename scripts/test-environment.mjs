@@ -14,6 +14,6 @@ export function testEnvironment(source) {
 
 export function testGroups(args) {
   if (args.length === 0) return ["migration", "server", "client"];
-  if (args.length === 1 && ["migration", "server", "client"].includes(args[0])) return args;
-  throw new Error("Use no argument, or one of: migration, server, client. PostgreSQL is opt-in and separate.");
+  if (args.length === 1 && ["migration", "server", "client", "images"].includes(args[0])) return args;
+  throw new Error("Use no argument, or one of: migration, server, client, images. PostgreSQL is opt-in and separate.");
 }

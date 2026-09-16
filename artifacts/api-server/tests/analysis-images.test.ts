@@ -13,6 +13,7 @@ import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
 import { LocalStorage, type Storage } from "../src/processor/storage.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
 import { testMediaPaths } from "./helpers/media-binaries.js";
+import { traceMediaProcess } from "./helpers/media-trace.js";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
 const { ffmpegPath } = testMediaPaths();
@@ -47,11 +48,34 @@ const safeError = (error: unknown) => error instanceof AnalysisImageError && err
 
 test("private loader reads real approved synthetic JPEGs through LocalStorage without changing source state", async (context) => {
   const h = await fixture(context); const before = await readFile(join(h.root, "guides.json"));
-  const loader = h.make();
-  for (let i = 0; i < 2; i += 1) assert.deepEqual(Buffer.from(await h.load(loader, undefined, `step-${i}`)), Buffer.from(h.input.images[i].bytes));
+  const trace = traceMediaProcess(context);
+  const loader = h.make({
+    repository: { async getGuideById(id) {
+      trace.mark("guide-read:start");
+      const guide = await h.repository.getGuideById(id);
+      trace.mark("guide-read:done"); return guide;
+    } },
+    storage: { async openRead(key) {
+      trace.mark("storage-open:start");
+      const stream = await h.storage.openRead(key);
+      trace.mark("storage-open:done");
+      stream.once("end", () => trace.mark("storage-read:end"));
+      stream.once("close", () => trace.mark("storage-read:close"));
+      return stream;
+    } },
+  });
+  const load = async (image: number, round: number) => {
+    trace.mark(`image-${image}:load-${round}`);
+    try { return await h.load(loader, undefined, `step-${image}`); }
+    catch (error) {
+      context.diagnostic(`IMAGE_LOAD_TRACE ${JSON.stringify({ image, round, ...trace.snapshot() })}`);
+      throw error;
+    }
+  };
+  for (let i = 0; i < 2; i += 1) assert.deepEqual(Buffer.from(await load(i, 1)), Buffer.from(h.input.images[i].bytes));
   assert.deepEqual(await readFile(join(h.root, "guides.json")), before);
-  const bytes = await h.load(loader); bytes[0] = 0;
-  assert.equal((await h.load(loader))[0], 255);
+  const bytes = await load(0, 2); bytes[0] = 0;
+  assert.equal((await load(0, 3))[0], 255);
 });
 
 test("client paths, URLs, wrong guides, steps or manifest identities never reach storage", async (context) => {

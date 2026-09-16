@@ -10,6 +10,7 @@ const suites = {
   migration: { cwd: root, directory: "scripts/tests", extension: ".test.mjs" },
   server: { cwd: join(root, "artifacts/api-server"), directory: "tests", extension: ".test.ts" },
   client: { cwd: join(root, "artifacts/showme"), directory: "src/lib", extension: ".test.ts" },
+  images: { cwd: join(root, "artifacts/api-server"), directory: "tests", extension: ".test.ts", only: "analysis-images.test.ts" },
 };
 
 try {
@@ -17,6 +18,7 @@ try {
     const suite = suites[group];
     const files = readdirSync(join(suite.cwd, suite.directory), { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.endsWith(suite.extension))
+      .filter((entry) => !suite.only || entry.name === suite.only)
       .map((entry) => join(suite.directory, entry.name)).sort();
     if (!files.length) throw new Error(`No ${group} test files found.`);
     const loader = group === "migration" ? [] : ["--import", pathToFileURL(

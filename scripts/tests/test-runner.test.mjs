@@ -25,6 +25,12 @@ test("default tests exclude PostgreSQL and external AI probes", () => {
   for (const name of ["migration", "server", "client"]) assert.deepEqual(testGroups([name]), [name]);
 });
 
+test("image-only diagnosis is explicit and does not change default test coverage", () => {
+  assert.deepEqual(testGroups(["images"]), ["images"]);
+  assert.deepEqual(testGroups([]), ["migration", "server", "client"]);
+  assert.throws(() => testGroups(["images", "--watch"]), /PostgreSQL is opt-in/);
+});
+
 test("unknown tests and injected node arguments fail closed", () => {
   for (const args of [["postgres"], ["integration"], ["--env-file=.env"], ["--send"], ["server", "--watch"]]) {
     assert.throws(() => testGroups(args), /PostgreSQL is opt-in/);

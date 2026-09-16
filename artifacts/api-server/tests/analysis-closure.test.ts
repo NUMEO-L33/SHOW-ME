@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
-import { test, type TestContext } from "node:test";
+import { beforeEach, test, type TestContext } from "node:test";
 import { budgetUnitFields, zeroBudgetUnits, type AnalysisAccountingCommand } from "../src/processor/analysis-accounting-contract.js";
 import { ANALYSIS_CONSENT_VERSION, analysisManifest } from "../src/processor/analysis-contract.js";
 import { type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
@@ -13,6 +13,13 @@ import { postgresAccountingFixture } from "./helpers/accounting-postgres-fixture
 const now = new Date("2026-09-14T23:59:59.000Z");
 const nextDay = new Date("2026-09-15T00:00:01.000Z");
 const later = new Date("2026-09-16T12:00:00.000Z");
+// Cancellation uses the repository's current Date rather than an explicit clock.
+// Keep it inside the fixture timeline; a real date after `later` correctly makes
+// closure reject a backwards timestamp. Timers and production guards stay real.
+beforeEach((context) => {
+  assert.ok("mock" in context);
+  context.mock.timers.enable({ apis: ["Date"], now: now.valueOf() });
+});
 const limit = { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000, costMicrousd: 1_000_000 };
 const policy: AnalysisFundingPolicy = { version: "closure-fixture", accountingOnly: true,
   price: { model: GEMINI_TEST_MODEL, version: "fictional", inputMicrousdPerMillionTokens: 100000, outputMicrousdPerMillionTokens: 200000 },
