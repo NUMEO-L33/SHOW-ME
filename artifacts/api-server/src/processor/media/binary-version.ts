@@ -49,7 +49,7 @@ export function parseMediaBinaryVersion(
 function runVersionCommand(
   product: "ffmpeg" | "ffprobe",
   executable: string,
-  timeoutMs = 5_000,
+  timeoutMs = 30_000,
 ): Promise<MediaBinaryVersion> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, ["-version"], {
@@ -140,10 +140,7 @@ export async function verifyMediaBinaryVersions(config: ProcessorConfig) {
     runVersionCommand("ffmpeg", config.ffmpegPath),
     runVersionCommand("ffprobe", config.ffprobePath),
   ]);
-  // Development Replit runtimes should remain usable with the host tools
-  // supplied by the workspace. Published deployments and production always
-  // enforce the reviewed release branch and optional exact pin.
-  const securityFloorEnforced = config.nodeEnv === "production" || config.isReplitDeployment;
+  const securityFloorEnforced = config.nodeEnv === "production" || config.isReplitRuntime;
   if (securityFloorEnforced) {
     assertReviewedMediaBinaryPair(ffmpeg, ffprobe, config.expectedMediaVersion);
   }

@@ -1,6 +1,5 @@
 import path from "node:path";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
 
@@ -212,13 +211,10 @@ function mediaExecutableSetting(
   const explicit = optionalString(env, name);
   if (explicit) return executableSetting(env, name, bundledFallback, issues);
 
-  // Prefer the host binaries in Replit, but keep development self-contained
-  // when the managed runtime does not provide them.
-  if (isReplitRuntime) {
-    const probe = spawnSync(commandFallback, ["-version"], { stdio: "ignore" });
-    if (probe.status === 0) return commandFallback;
-    return bundledFallback();
-  }
+  // Replit receives a current FFmpeg build from replit.nix. Local fixtures use
+  // the pinned npm binaries, but they are intentionally forbidden as an
+  // implicit fallback on any other production host.
+  if (isReplitRuntime) return commandFallback;
   if (nodeEnv === "production") {
     issues.push(`${name} is required outside Replit when NODE_ENV=production.`);
   }
