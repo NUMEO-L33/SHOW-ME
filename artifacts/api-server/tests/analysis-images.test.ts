@@ -46,7 +46,18 @@ async function fixture(context: TestContext) {
 }
 const safeError = (error: unknown) => error instanceof AnalysisImageError && error.message === "ANALYSIS_IMAGE_UNAVAILABLE" && error.cause === undefined;
 
-test("private loader reads real approved synthetic JPEGs through LocalStorage without changing source state", async (context) => {
+// Run the original path first, before any diagnostic observer is installed.
+// A passing traced variant must never substitute for an uninstrumented read.
+test("private loader reads real approved synthetic JPEGs through LocalStorage without changing source state (without tracing)", async (context) => {
+  const h = await fixture(context); const before = await readFile(join(h.root, "guides.json"));
+  const loader = h.make();
+  for (let i = 0; i < 2; i += 1) assert.deepEqual(Buffer.from(await h.load(loader, undefined, `step-${i}`)), Buffer.from(h.input.images[i].bytes));
+  assert.deepEqual(await readFile(join(h.root, "guides.json")), before);
+  const bytes = await h.load(loader); bytes[0] = 0;
+  assert.equal((await h.load(loader))[0], 255);
+});
+
+test("private loader diagnostics preserve real JPEG reads and source state (with tracing)", async (context) => {
   const h = await fixture(context); const before = await readFile(join(h.root, "guides.json"));
   const trace = traceMediaProcess(context);
   const loader = h.make({
