@@ -28,6 +28,8 @@ import {
 } from "./domain.js";
 import {
   analysisAccountingControls,
+  analysisCountAttempts,
+  analysisProviderQuotaCharges,
   analysisBatchesTable,
   analysisBudgetWindows,
   analysisReservations,
@@ -66,6 +68,9 @@ import {
 import { parseBatchCompletion, prepareBatchCompletion, type AnalysisBatchCompletion, type AnalysisBatchCompletionResult } from "./analysis-batch-completion.js";
 import { canLaunchAnalysisRequest, parseAnalysisSend, type AnalysisSendCommand } from "./analysis-send.js";
 import { analysisClosureDue, prepareAnalysisClosure, type AnalysisClosureCandidate, type AnalysisClosureResult } from "./analysis-closure.js";
+import { AnalysisCountError, countRequestKey, parseCountCommand, parseCountRecord, prepareCountAccounting,
+  type AnalysisCountCommand, type AnalysisCountResult, type AnalysisCountLaunchCommand } from "./analysis-count-accounting.js";
+import { assertQuotaPermit, parseQuotaReceipt, prepareQuotaCharge, quotaCoverageStart, type AnalysisQuotaReceipt } from "./analysis-quota-charge.js";
 
 const JSON_REPOSITORY_VERSION = 5 as const;
 const DEFAULT_LIST_LIMIT = 100;
@@ -724,7 +729,7 @@ export class JsonGuideRepository implements GuideRepository {
     });
   }
 
-  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void, now?: Date, beforeLaunch?: () => void): Promise<boolean> {
+  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: (lockedClock: () => Date) => void, now?: Date, beforeLaunch?: (lockedAt: Date) => void): Promise<boolean> {
     command = parseAnalysisSend(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.serialize(async () => {
@@ -732,13 +737,14 @@ export class JsonGuideRepository implements GuideRepository {
       const guide = state.guides.find((g) => g.id === guideId);
       const reservation = state.funding.reservations.find((r) => r.guideId === guideId && r.runId === command.runId);
       if (!guide || !reservation?.details) return false;
+      const lockedAt = workTime(fixedTime);
       if (!canLaunchAnalysisRequest({ guide: { ...guide, steps: state.steps.filter((s) => s.guideId === guideId) },
         analysis: state.analysis.find((a) => a.guideId === guideId)?.state ?? emptyAnalysisState(), reservation,
         batches: state.funding.batches.filter((b) => b.guideId === guideId && b.runId === command.runId).sort((a, b) => a.index - b.index),
         attempts: state.funding.attempts.filter((a) => a.guideId === guideId && a.runId === command.runId),
-        halted: state.funding.control.halted, command, now: workTime(fixedTime) })) return false;
-      validateFundingCommit(beforeLaunch);
-      validateFundingCommit(launch); // synchronous invocation while cancellation/deletion is excluded
+        halted: state.funding.control.halted, command, now: lockedAt })) return false;
+      validateFundingCommit(() => beforeLaunch?.(lockedAt));
+      validateFundingCommit(() => launch(() => workTime(fixedTime))); // synchronous invocation while cancellation/deletion is excluded
       return true;
     });
   }
@@ -1266,6 +1272,10 @@ class FundingRollback extends Error {
 }
 
 export class PostgresGuideRepository implements GuideRepository {
+  readonly countDispatchContract = "postgres-count-0010" as const;
+  // Only a successfully acknowledged, irreversible claim creates a local capability.
+  // Serialized/reconstructed tickets, another repository and a restart cannot reuse it.
+  readonly #countLaunchTickets = new WeakMap<object, { guideId: string; command: AnalysisCountLaunchCommand }>();
   constructor(
     readonly database: ProcessorDatabase,
     private readonly closeDatabase?: () => Promise<void>,
@@ -1438,7 +1448,7 @@ export class PostgresGuideRepository implements GuideRepository {
         const control = await lockAccountingControl(transaction);
         const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
         const [initialReservation] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
-        const windows = [];
+        const windows: Array<ReturnType<typeof parseBudgetWindow>> = [];
         if (!initialReservation) {
           // All budget writers: global control, global-day, guide-day, guide.
           for (const scope of ["global", `guide:${guideId}`]) {
@@ -1509,6 +1519,164 @@ export class PostgresGuideRepository implements GuideRepository {
     return row ? parseBudgetWindow({ ...row.payload, day: row.day, scope: row.scope }) : null;
   }
 
+  /** Bounded, cursor-based recovery discovery; no transition or provider permission. */
+  async listPendingAnalysisCounts(limit = 20, after?: string) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50 || (after !== undefined && !/^[a-f0-9]{64}$/.test(after))) throw new AnalysisCountError();
+    try {
+      const rows = await this.database.select().from(analysisCountAttempts).where(and(
+        inArray(analysisCountAttempts.status, ["reserved", "sending", "launch_claimed"]),
+        after === undefined ? undefined : gt(analysisCountAttempts.requestKey, after))).orderBy(asc(analysisCountAttempts.requestKey)).limit(limit);
+      return rows.map((row) => parseCountRecord({ ...row.payload, requestKey: row.requestKey, guideId: row.guideId,
+        runId: row.runId, batchIndex: row.batchIndex, generationOrdinal: row.generationOrdinal, status: row.status }));
+    } catch { throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE"); }
+  }
+
+  async claimAnalysisCountLaunch(guideId: string, raw: AnalysisCountLaunchCommand, now?: Date, beforeCommit?: () => void): Promise<object> {
+    const command = parseCountCommand(raw);
+    if (command.type !== "claim-launch") throw new AnalysisCountError();
+    const result = await this.executeAnalysisCount(guideId, command, now, beforeCommit);
+    if (result.replayed || result.record.status !== "launch_claimed" || !result.quotaReceipt) throw new AnalysisCountError();
+    const ticket = Object.freeze({});
+    this.#countLaunchTickets.set(ticket, { guideId, command: structuredClone(command) });
+    return ticket;
+  }
+
+  /** Consumes a local capability BEFORE any await. Final transaction is read-only:
+   * external work cannot roll back, so all durable writes precede this boundary.
+   */
+  async launchAnalysisCount(ticket: object, launch: (clock: () => Date) => void, now?: Date, beforeLaunch?: (clock: () => Date) => void): Promise<boolean> {
+    const permission = this.#countLaunchTickets.get(ticket);
+    this.#countLaunchTickets.delete(ticket);
+    if (!permission) return false;
+    try {
+      const { guideId, command } = permission;
+      const fixedTime = now === undefined ? undefined : workTime(now);
+      return await this.database.transaction(async (transaction) => {
+        await transaction.execute(sql`SET LOCAL lock_timeout = '4s'`);
+        await transaction.execute(sql`SET LOCAL statement_timeout = '4s'`);
+        const control = await lockAccountingControl(transaction);
+        const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+        if (!guide) return false;
+        const [stored] = await transaction.select().from(analysisReservations).where(and(
+          eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
+        if (!stored?.details) return false;
+        const reservation = parseReservation(stored);
+        const [old] = await transaction.select().from(analysisCountAttempts)
+          .where(eq(analysisCountAttempts.requestKey, countRequestKey(guideId, command))).limit(1);
+        if (!old) return false;
+        const record = parseCountRecord({ ...old.payload, requestKey: old.requestKey, guideId: old.guideId, runId: old.runId,
+          batchIndex: old.batchIndex, generationOrdinal: old.generationOrdinal, status: old.status });
+        if (record.status !== "launch_claimed") return false;
+        const [quota] = await transaction.select().from(analysisProviderQuotaCharges)
+          .where(eq(analysisProviderQuotaCharges.requestKey, record.requestKey)).limit(1);
+        const receipt = parseQuotaReceipt(quota);
+        const windows: Array<ReturnType<typeof parseBudgetWindow>> = [];
+        for (const scope of ["global", `guide:${guideId}`]) {
+          const [row] = await transaction.select().from(analysisBudgetWindows).where(and(
+            eq(analysisBudgetWindows.day, reservation.day), eq(analysisBudgetWindows.scope, scope))).limit(1);
+          windows.push(parseBudgetWindow(row ? { ...row.payload, day: row.day, scope: row.scope } : undefined));
+        }
+        const analysis = await loadAnalysisRows(transaction, guideId);
+        const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+        const batches = await transaction.select().from(analysisBatchesTable).where(and(
+          eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+        const attempts = await loadRequestAttempts(transaction, guideId, command.runId);
+        const started = performance.now(); const at = await analysisWorkClock(transaction, fixedTime);
+        const clock = () => fixedTime ? workTime(fixedTime) : new Date(at.valueOf() + Math.ceil(performance.now() - started));
+        const guard = () => {
+          // Re-evaluate the full claim prerequisites without persisting/reissuing it.
+          prepareCountAccounting({ guideId, guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, analysis,
+            reservation, batches: batches.map(batchFromRow), attempts, windows, control,
+            previous: { ...record, status: "sending" }, command, now: clock() });
+          assertQuotaPermit(receipt, { requestKey: record.requestKey, projectRef: command.binding.projectRef, model: command.binding.model,
+            inputTokenBound: record.maximum.inputTokens, limits: command.limits, notAfter: command.notAfter }, clock());
+        };
+        guard(); validateFundingCommit(() => beforeLaunch?.(clock)); guard();
+        // No write or await between this check and the synchronous launch callback.
+        validateFundingCommit(() => launch(clock));
+        return true;
+      }, { isolationLevel: "read committed" });
+    } catch { throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE"); }
+  }
+
+  /** PostgreSQL-only count accounting. Not exposed through HTTP or the automatic worker.
+   * A sending transition commits its own provider quota charge atomically. It is NOT
+   * the final locked, one-shot launch boundary; claimAnalysisCountLaunch and
+   * launchAnalysisCount provide that boundary separately after the durable charge.
+   */
+  async executeAnalysisCount(guideId: string, raw: AnalysisCountCommand, now?: Date, beforeCommit?: () => void):
+    Promise<AnalysisCountResult & { quotaReceipt: AnalysisQuotaReceipt | null }> {
+    try {
+      const command = parseCountCommand(raw); const fixedTime = now === undefined ? undefined : workTime(now);
+      const guard = () => validateFundingCommit(beforeCommit);
+      guard();
+      return await this.database.transaction(async (transaction) => {
+        await transaction.execute(sql`SET LOCAL lock_timeout = '4s'`);
+        await transaction.execute(sql`SET LOCAL statement_timeout = '4s'`);
+        const control = await lockAccountingControl(transaction); guard();
+        const [stored] = await transaction.select().from(analysisReservations).where(and(
+          eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
+        if (!stored) throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
+        const reservation = parseReservation(stored);
+        const windows = [];
+        for (const scope of ["global", `guide:${guideId}`]) {
+          const [row] = await transaction.select().from(analysisBudgetWindows).where(and(
+            eq(analysisBudgetWindows.day, reservation.day), eq(analysisBudgetWindows.scope, scope))).limit(1).for("update");
+          windows.push(parseBudgetWindow(row ? { ...row.payload, day: row.day, scope: row.scope } : undefined));
+        }
+        const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+        const steps = guide ? await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId)) : [];
+        const batches = await transaction.select().from(analysisBatchesTable).where(and(
+          eq(analysisBatchesTable.guideId, guideId), eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
+        const [old] = await transaction.select().from(analysisCountAttempts)
+          .where(eq(analysisCountAttempts.requestKey, countRequestKey(guideId, command))).limit(1);
+        const previous = old ? parseCountRecord({ ...old.payload, requestKey: old.requestKey, guideId: old.guideId,
+          runId: old.runId, batchIndex: old.batchIndex, generationOrdinal: old.generationOrdinal, status: old.status }) : null;
+        const analysis = guide ? await loadAnalysisRows(transaction, guideId) : emptyAnalysisState();
+        const attempts = await loadRequestAttempts(transaction, guideId, command.runId);
+        const at = await analysisWorkClock(transaction, fixedTime);
+        const prepared = prepareCountAccounting({ guideId, guide: guide ? { ...guideFromRow(guide), steps: steps.map(stepFromRow) } : null,
+          analysis, reservation, batches: batches.map(batchFromRow), attempts, previous, windows, control, command, now: at });
+        const { windows: nextWindows, control: nextControl, ...result } = prepared;
+        guard();
+        if (result.replayed) return { ...result, quotaReceipt: null };
+        let quotaReceipt: AnalysisQuotaReceipt | null = null;
+        if (command.type === "sending") {
+          const rows = await transaction.select().from(analysisProviderQuotaCharges).where(and(
+            eq(analysisProviderQuotaCharges.scopeKey, result.record.scopeKey),
+            sql`${analysisProviderQuotaCharges.validUntil} >= ${quotaCoverageStart(at)}`)).limit(100_001);
+          if (rows.length > 100_000) throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
+          // Conservative policy: count and generation share this model/project pool.
+          // No assumption that Google's countTokens endpoint has identical published limits.
+          quotaReceipt = prepareQuotaCharge({ requestKey: result.record.requestKey, projectRef: command.binding.projectRef,
+            model: command.binding.model, inputTokenBound: result.record.maximum.inputTokens,
+            limits: command.limits, notAfter: command.notAfter }, rows.map(parseQuotaReceipt), at);
+          await transaction.insert(analysisProviderQuotaCharges).values(quotaReceipt);
+        }
+        if (command.type === "claim-launch") {
+          const [row] = await transaction.select().from(analysisProviderQuotaCharges)
+            .where(eq(analysisProviderQuotaCharges.requestKey, result.record.requestKey)).limit(1);
+          quotaReceipt = parseQuotaReceipt(row);
+          assertQuotaPermit(quotaReceipt, { requestKey: result.record.requestKey, projectRef: command.binding.projectRef,
+            model: command.binding.model, inputTokenBound: result.record.maximum.inputTokens, limits: command.limits, notAfter: command.notAfter }, at);
+        }
+        for (const { day, scope, ...payload } of nextWindows) await transaction.update(analysisBudgetWindows).set({ payload })
+          .where(and(eq(analysisBudgetWindows.day, day), eq(analysisBudgetWindows.scope, scope)));
+        const { requestKey, guideId: g, runId, batchIndex, generationOrdinal, status, ...payload } = result.record;
+        const values = { requestKey, guideId: g, runId, batchIndex, generationOrdinal, status, payload };
+        if (previous) await transaction.update(analysisCountAttempts).set({ status, payload }).where(eq(analysisCountAttempts.requestKey, requestKey));
+        else await transaction.insert(analysisCountAttempts).values(values);
+        if (nextControl.halted !== control.halted) await transaction.update(analysisAccountingControls).set({ payload: nextControl })
+          .where(eq(analysisAccountingControls.id, "global"));
+        guard(); // Rolls back record + both windows + quota + halt together on failure/revocation.
+        return { ...result, quotaReceipt };
+      }, { isolationLevel: "read committed" });
+    } catch (error) {
+      if (error instanceof AnalysisCountError) throw error;
+      throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
+    }
+  }
+
   async executeAnalysisAccounting(guideId: string, command: AnalysisAccountingCommand, now?: Date, beforeCommit?: () => void): Promise<AnalysisAccountingResult | null> {
     command = parseAccountingCommand(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
@@ -1572,7 +1740,7 @@ export class PostgresGuideRepository implements GuideRepository {
     return parseAccountingControl(row?.payload);
   }
 
-  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void, now?: Date, beforeLaunch?: () => void): Promise<boolean> {
+  async launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: (lockedClock: () => Date) => void, now?: Date, beforeLaunch?: (lockedAt: Date) => void): Promise<boolean> {
     command = parseAnalysisSend(command);
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.database.transaction(async (transaction) => {
@@ -1587,13 +1755,18 @@ export class PostgresGuideRepository implements GuideRepository {
         eq(analysisBatchesTable.runId, command.runId))).orderBy(asc(analysisBatchesTable.index));
       const steps = await transaction.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
       const attempts = await loadRequestAttempts(transaction, guideId, command.runId);
+      const clockStarted = performance.now();
+      const lockedAt = await analysisWorkClock(transaction, fixedTime);
+      // Charge permits must not use a stale DB timestamp after callback preparation.
+      // Count the full query round trip conservatively; a test's explicit clock stays fixed.
+      const lockedClock = () => fixedTime ? workTime(fixedTime) : new Date(lockedAt.valueOf() + Math.ceil(performance.now() - clockStarted));
       if (!canLaunchAnalysisRequest({ guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, analysis,
         reservation: parseReservation(stored), batches: rows.map(batchFromRow), attempts, halted: control.halted,
-        command, now: await analysisWorkClock(transaction, fixedTime) })) return false;
-      validateFundingCommit(beforeLaunch);
+        command, now: lockedAt })) return false;
+      validateFundingCommit(() => beforeLaunch?.(lockedAt));
       // Cancel/delete/media replacement need the guide lock; halt/takeover need the control lock.
       // Start the request now, but do NOT await its response or hold locks across network latency.
-      validateFundingCommit(launch);
+      validateFundingCommit(() => launch(lockedClock));
       return true;
     }, { isolationLevel: "read committed" });
   }

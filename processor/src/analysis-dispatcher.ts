@@ -10,6 +10,10 @@ import { ownsAnalysisWork, workTime, workAvailableAt, type AnalysisWorkCandidate
 import type { GuideRepository } from "./domain.js";
 import { GeminiError, type DispatchSendPermit } from "./gemini/provider.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
+import { assertQuotaPermit, parseQuotaReceipt, quotaRequestKey, type AnalysisQuotaCharge, type AnalysisQuotaStore } from "./analysis-quota-charge.js";
+import { auditGeminiInput, verifyGeminiInputBound, type AnalysisInputBoundVerifier } from "./gemini/input-bound.js";
+import { verifyGeminiInputMeasurement, type AnalysisInputMeasurementVerifier } from "./gemini/input-measurement.js";
+import type { AnalysisMeasurementStage } from "./gemini/counted-measurements.js";
 
 /** Trusted adapter contract: exactly one external attempt per invocation, never nested retries. */
 export type AnalysisDispatchProvider = Pick<AnalysisProvider, "name" | "model"> & {
@@ -20,7 +24,11 @@ export type AnalysisDispatchProvider = Pick<AnalysisProvider, "name" | "model"> 
 export type AnalysisDispatchOutcome = "disabled" | "idle" | "completed" | "failed" | "interrupted" | "unavailable" | "degraded" | "stopped";
 type Options = {
   repository: GuideRepository; provider?: AnalysisDispatchProvider; readiness?: AnalysisAdmissionReadiness;
-  loadImage?: (guideId: string, stepId: string, signal: AbortSignal) => Promise<Uint8Array>;
+  quotaStore?: AnalysisQuotaStore;
+  inputBoundVerifier?: AnalysisInputBoundVerifier;
+  inputMeasurementVerifier?: AnalysisInputMeasurementVerifier;
+  inputMeasurementStage?: AnalysisMeasurementStage;
+  loadImage?: (guideId: string, stepId: string, signal: AbortSignal, inputFingerprint: string) => Promise<Uint8Array>;
   pollMs?: number; statusPollMs?: number; retryDelayMs?: number; leaseMs?: number; requestTimeoutMs?: number; ioTimeoutMs?: number;
   /** Test clock only. Omit in production so repository ownership uses its own DB clock. */
   clock?: () => Date;
@@ -141,7 +149,9 @@ export class DurableAnalysisDispatcher {
     const checked = verifyAnalysisReadiness({ raw, input, readiness, spending: { mode: "free_only" }, clock: () => this.time(), signal });
     // Never reinterpret an already reserved run with a different price, quota or retry policy.
     if (JSON.stringify(checked.snapshot.policy) !== JSON.stringify(policy)) throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
-    return checked.assertCurrent;
+    if (checked.snapshot.entitlement.mode !== "free_only") throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
+    return { assertCurrent: checked.assertCurrent, entitlement: checked.snapshot.entitlement, validUntil: checked.snapshot.validUntil,
+      inputApprovalId: checked.snapshot.inputApprovalId, inputTokenBound: checked.snapshot.runtime.inputTokenBound };
   }
   private async current(guideId: string, claimed: AnalysisRun, signal: AbortSignal, sending: boolean, watchTerminal = false) {
     const repository = this.options.repository;
@@ -163,13 +173,15 @@ export class DurableAnalysisDispatcher {
   }
 
   private async pass(): Promise<AnalysisDispatchOutcome> {
-    if (!this.options.provider || !this.options.readiness || !this.options.loadImage) return "disabled";
+    if (!this.options.provider || !this.options.readiness || !this.options.loadImage || !this.options.quotaStore ||
+        !this.options.inputBoundVerifier || (!this.options.inputMeasurementVerifier && !this.options.inputMeasurementStage)) return "disabled";
     const repository = this.options.repository;
     let active: { guideId: string; run: AnalysisRun } | undefined;
     const deadline = new AbortController();
     const signal = AbortSignal.any([this.shutdown.signal, deadline.signal]);
     const timer = setTimeout(() => deadline.abort(new DispatchStop("timeout")), this.leaseMs);
     try {
+      if (this.options.inputMeasurementStage) await this.io((s) => this.options.inputMeasurementStage!.recover(s), signal);
       const closures = await this.io(() => repository.listAnalysisClosures(20, this.repositoryTime()), signal);
       for (const candidate of closures) await this.io((s) => repository.closeAnalysisReservation(candidate.guideId,
         candidate.runId, this.repositoryTime(), () => s.throwIfAborted()), signal);
@@ -186,7 +198,7 @@ export class DurableAnalysisDispatcher {
         // Do not churn lease attempts just because entitlement is unavailable or yesterday's work is still queued.
         if (fundingDay(this.time()) !== funded.reservation.day) continue;
         let assertCurrent: () => void;
-        try { assertCurrent = await this.permission(candidate.guideId, run, funded.reservation.details.policy, signal); }
+        try { assertCurrent = (await this.permission(candidate.guideId, run, funded.reservation.details.policy, signal)).assertCurrent; }
         catch (error) {
           if (!(error instanceof AnalysisAdmissionError)) throw error;
           unavailable = true; continue; // Ineligible heads do not hide later work or consume claims.
@@ -254,7 +266,8 @@ export class DurableAnalysisDispatcher {
           if (funding.batches[batchIndex]?.status === "succeeded") break;
           if (fundingDay(this.time()) !== funding.reservation.day) throw new AnalysisAccountingError("ANALYSIS_DAY_ROLLOVER");
           const policy = funding.reservation.details.policy;
-          assertPermission = await this.permission(guideId, run, policy, signal);
+          const permission = await this.permission(guideId, run, policy, signal);
+          assertPermission = permission.assertCurrent;
           const previous = attempts.filter((a) => a.batchIndex === batchIndex).sort((a, b) => b.ordinal - a.ordinal)[0];
           let ordinal: 0 | 1 = 0;
           let dispatchId = randomUUID() as string;
@@ -280,7 +293,7 @@ export class DurableAnalysisDispatcher {
           try {
             for (const frame of [...batch.targets, ...batch.context]) {
               guard(signal);
-              const bytes = await this.io((s) => this.options.loadImage!(guideId, frame.stepId, s), signal);
+              const bytes = await this.io((s) => this.options.loadImage!(guideId, frame.stepId, s, run.manifest.fingerprint), signal);
               if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > ANALYSIS_LIMITS.maxImageBytes) {
                 throw new AnalysisContractError();
               }
@@ -290,9 +303,34 @@ export class DurableAnalysisDispatcher {
             if (error instanceof AnalysisContractError) throw new WorkFailure("AI_INVALID_OUTPUT");
             throw error;
           }
+          const inputBoundVerifier = this.options.inputBoundVerifier!;
+          const audit = auditGeminiInput({ ...batch, images }, permission.inputApprovalId, run.manifest.fingerprint);
+          const inputBound = verifyGeminiInputBound({ audit,
+            raw: await this.io((s) => inputBoundVerifier.inspect(structuredClone(audit), s), signal), verifier: inputBoundVerifier,
+            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenBound), clock: () => this.time(), signal });
+          const measurementVerifier = this.options.inputMeasurementStage ?? this.options.inputMeasurementVerifier!;
+          const measurementInput = { ...audit, projectRef: permission.entitlement.projectRef };
+          if (this.options.inputMeasurementStage) {
+            guard(signal);
+            await bounded((s) => this.options.inputMeasurementStage!.measureForAnalysis({ ...batch, images }, measurementInput,
+              { guideId, runId, batchIndex, generationOrdinal: ordinal, frameCount: run.manifest.frames.length, owner, policy }, s), signal, 20_000);
+            guard(signal);
+          }
+          const measured = verifyGeminiInputMeasurement({ input: measurementInput,
+            raw: await this.io((s) => measurementVerifier.inspect(structuredClone(measurementInput), s), signal), verifier: measurementVerifier,
+            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenBound, inputBound.evidence.totalInputTokenUpperBound),
+            clock: () => this.time(), signal });
+          const assertInputCurrent = (clock: () => Date = () => this.time()) => {
+            // Recheck bytes/metadata, not only the stored guide manifest, at the actual send boundary.
+            if (auditGeminiInput({ ...batch, images }, permission.inputApprovalId, run.manifest.fingerprint).requestFingerprint !== audit.requestFingerprint) {
+              throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
+            }
+            // Hashing a large payload takes time: check expiry AFTER hashing with a fresh clock.
+            inputBound.assertCurrent(clock()); measured.assertCurrent(clock());
+          };
           await this.current(guideId, run, signal, true);
           const sent = await this.io((s) => repository.executeAnalysisAccounting(guideId,
-            { type: "sending", ...identity, owner }, this.repositoryTime(), () => guard(s)), signal);
+            { type: "sending", ...identity, owner }, this.repositoryTime(), () => { guard(s); assertInputCurrent(); }), signal);
           if (!sent || sent.replayed || sent.attempt.status !== "sending") throw new DispatchStop("lost");
           let response: Awaited<ReturnType<AnalysisProvider["analyzeFrames"]>>;
           let sendPermits = 0;
@@ -306,15 +344,27 @@ export class DurableAnalysisDispatcher {
                 if (++sendPermits !== 1) throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
                 const sendSignal = AbortSignal.any([s, providerSignal]);
                 await this.current(guideId, run, sendSignal, true);
+                const sendCommand = { ...identity, owner, inputFingerprint: run.manifest.fingerprint };
+                const quotaCommand: AnalysisQuotaCharge = { requestKey: quotaRequestKey(guideId, sendCommand),
+                  projectRef: permission.entitlement.projectRef, model: GEMINI_TEST_MODEL,
+                  inputTokenBound: policy.maxInputTokensPerRequest, limits: permission.entitlement.providerLimits, notAfter: permission.validUntil };
+                const receipt = parseQuotaReceipt(await this.io((q) => this.options.quotaStore!.consume(quotaCommand, q, () => {
+                  guard(q); assertInputCurrent();
+                }), sendSignal));
                 let response: Promise<Response> | undefined;
                 const launched = await this.io((lockedSignal) => repository.launchAnalysisRequest(guideId,
-                  { ...identity, owner, inputFingerprint: run.manifest.fingerprint }, () => {
+                  sendCommand, (lockedClock) => {
                     guard(lockedSignal);
+                    assertInputCurrent(lockedClock);
+                    assertQuotaPermit(receipt, quotaCommand, this.time());
+                    assertQuotaPermit(receipt, quotaCommand, lockedClock());
                     requestLaunched = true;
                     response = send();
                     // Observe rejection even if the read-only transaction acknowledgement is lost.
                     void response.catch(() => undefined);
-                  }, this.repositoryTime(), () => guard(lockedSignal)), sendSignal);
+                  }, this.repositoryTime(), (lockedAt) => {
+                    guard(lockedSignal); assertInputCurrent(() => lockedAt); assertQuotaPermit(receipt, quotaCommand, lockedAt);
+                  }), sendSignal);
                 if (!launched || !response) throw new DispatchStop("lost");
                 return response;
               });

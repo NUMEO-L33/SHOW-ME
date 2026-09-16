@@ -5,6 +5,7 @@ import { ANALYSIS_CONSENT_VERSION, analysisManifest } from "./analysis-contract.
 import { analysisFundingPolicySchema, AnalysisFundingError, fundingDay, parseFundingCommand } from "./analysis-funding.js";
 import type { GuideRepository } from "./domain.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
+import { providerQuotaDay, providerQuotaLimitsSchema } from "./analysis-provider-quota.js";
 
 export class AnalysisAdmissionError extends Error {
   override name = "AnalysisAdmissionError";
@@ -13,7 +14,6 @@ export class AnalysisAdmissionError extends Error {
 
 const id = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const positive = z.number().int().positive().safe();
-const quota = z.object({ requests: positive, inputTokens: positive, outputTokens: positive }).strict();
 const spendingSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("free_only") }).strict(),
   z.object({ mode: z.literal("paid_capped"), approvalId: id, projectRef: id, dailyCostMicrousd: positive }).strict(),
@@ -25,11 +25,12 @@ const snapshotSchema = z.object({
   frameCount: positive.max(24), model: z.literal(GEMINI_TEST_MODEL), promptVersion: z.literal(GEMINI_PROMPT_VERSION),
   scope: z.literal("approved_synthetic"), inputApprovalId: id,
   // These are claims from a TRUSTED verifier, not proof derived from their spelling.
-  runtime: z.object({ repository: z.literal("postgres-0007"), dispatcher: z.literal("durable-accounted-v1"),
+  runtime: z.object({ repository: z.literal("postgres-0008"), dispatcher: z.literal("durable-accounted-v1"),
+    counting: z.literal("count-accounted-0010-v1").optional(),
     inputTokenBound: positive, boundIncludes: z.literal("prompt-schema-targets-context") }).strict(),
   policy: analysisFundingPolicySchema,
   entitlement: z.discriminatedUnion("mode", [
-    z.object({ mode: z.literal("free_only"), projectRef: id, evidenceId: id, paidFallback: z.literal(false), dailyQuota: quota }).strict(),
+    z.object({ mode: z.literal("free_only"), projectRef: id, evidenceId: id, paidFallback: z.literal(false), providerLimits: providerQuotaLimitsSchema }).strict(),
     z.object({ mode: z.literal("paid_capped"), projectRef: id, evidenceId: id, approvalId: id }).strict(),
   ]),
 }).strict();
@@ -82,7 +83,9 @@ export function verifyAnalysisReadiness(options: {
     const checked = Date.parse(snapshot.checkedAt);
     const expiry = Date.parse(snapshot.validUntil);
     if (checked > current.valueOf() || expiry <= current.valueOf() || expiry - checked > 30_000 || expiry <= checked ||
-        current.valueOf() < at.valueOf() || fundingDay(current) !== fundingDay(at)) unavailable();
+        current.valueOf() < at.valueOf() || fundingDay(current) !== fundingDay(at) ||
+        providerQuotaDay(current) !== providerQuotaDay(at) || fundingDay(new Date(checked)) !== fundingDay(current) ||
+        providerQuotaDay(new Date(checked)) !== providerQuotaDay(current)) unavailable();
     const valid: unknown = readiness.isCurrent(snapshot.id);
     if (valid !== true) {
       void Promise.resolve(valid).catch(() => undefined);
@@ -94,8 +97,12 @@ export function verifyAnalysisReadiness(options: {
   const { policy, entitlement } = snapshot;
   if ([policy.globalLimit, policy.guideLimit].some((limit) => Object.values(limit).some((value) => value === 0))) unavailable();
   if (spending.mode === "free_only") {
-    if (entitlement.mode !== "free_only" || ["requests", "inputTokens", "outputTokens"].some((key) =>
-      policy.globalLimit[key as keyof typeof entitlement.dailyQuota] > entitlement.dailyQuota[key as keyof typeof entitlement.dailyQuota])) unavailable();
+    // Configuration ceilings only: UTC app budgets are NOT Pacific provider windows.
+    // The trusted verifier/send adapter still needs atomic project-wide rate accounting.
+    // Input TPM is not a daily token allowance, and no daily output quota is invented.
+    if (entitlement.mode !== "free_only" ||
+        policy.globalLimit.requests > entitlement.providerLimits.requestsPerDay ||
+        policy.maxInputTokensPerRequest > entitlement.providerLimits.inputTokensPerMinute) unavailable();
   } else if (entitlement.mode !== "paid_capped" || entitlement.approvalId !== spending.approvalId ||
       entitlement.projectRef !== spending.projectRef || policy.globalLimit.costMicrousd > spending.dailyCostMicrousd) unavailable();
   assertCurrent();

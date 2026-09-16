@@ -23,6 +23,7 @@ import type { AnalysisRun } from "../analysis-state.js";
 import type { DraftDocument } from "../analysis-contract.js";
 import type { AnalysisBudgetWindow, AnalysisReservation, AnalysisStoredBatch } from "../analysis-funding.js";
 import type { AnalysisAccountingControl, AnalysisRequestAttempt } from "../analysis-accounting-contract.js";
+import type { AnalysisCountRecord } from "../analysis-count-accounting.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -180,6 +181,38 @@ export const analysisRequestAttempts = pgTable("analysis_request_attempts", {
 ]);
 
 export type GuideRow = typeof guides.$inferSelect;
+// No guide FK: deletion must never refund provider rate usage or allow a replay.
+export const analysisProviderQuotaCharges = pgTable("analysis_provider_quota_charges", {
+  requestKey: text("request_key").primaryKey(),
+  scopeKey: text("scope_key").notNull(),
+  chargedAt: text("charged_at").notNull(),
+  validUntil: text("valid_until").notNull(),
+  day: text("day").notNull(),
+  inputTokenBound: bigint("input_token_bound", { mode: "number" }).notNull(),
+}, (table) => [
+  index("analysis_provider_quota_scope_window_idx").on(table.scopeKey, table.validUntil),
+  check("analysis_provider_quota_hashes_check", sql`${table.requestKey} ~ '^[a-f0-9]{64}$' AND ${table.scopeKey} ~ '^[a-f0-9]{64}$'`),
+  check("analysis_provider_quota_bound_check", sql`${table.inputTokenBound} > 0 AND ${table.inputTokenBound} <= 9007199254740991`),
+  check("analysis_provider_quota_window_check", sql`${table.validUntil} > ${table.chargedAt}`),
+  check("analysis_provider_quota_time_check", sql`${table.chargedAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$' AND ${table.validUntil} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$' AND ${table.validUntil}::timestamptz <= ${table.chargedAt}::timestamptz + interval '5 seconds' AND ${table.day} = to_char(${table.chargedAt}::timestamptz AT TIME ZONE 'America/Los_Angeles', 'YYYY-MM-DD') AND ${table.day} = to_char((${table.validUntil}::timestamptz - interval '1 millisecond') AT TIME ZONE 'America/Los_Angeles', 'YYYY-MM-DD')`),
+]);
+
+// Independent countTokens slots. Never cascade numeric accounting on guide deletion.
+export const analysisCountAttempts = pgTable("analysis_count_attempts", {
+  requestKey: text("request_key").primaryKey(), guideId: text("guide_id").notNull(), runId: text("run_id").notNull(),
+  batchIndex: integer("batch_index").notNull(), generationOrdinal: integer("generation_ordinal").notNull(),
+  status: text("status").$type<AnalysisCountRecord["status"]>().notNull(),
+  payload: jsonb("payload").$type<Omit<AnalysisCountRecord, "requestKey" | "guideId" | "runId" | "batchIndex" | "generationOrdinal" | "status">>().notNull(),
+}, (table) => [
+  uniqueIndex("analysis_count_slot_unique").on(table.guideId, table.runId, table.batchIndex, table.generationOrdinal),
+  index("analysis_count_pending_idx").on(table.status, table.guideId, table.runId),
+  foreignKey({ columns: [table.guideId, table.runId], foreignColumns: [analysisReservations.guideId, analysisReservations.runId] }).onDelete("restrict"),
+  check("analysis_count_identity_check", sql`(${table.requestKey} ~ '^[a-f0-9]{64}$' AND ${table.batchIndex} BETWEEN 0 AND 5 AND ${table.generationOrdinal} BETWEEN 0 AND 1 AND ${table.payload}->>'operation' = 'countTokens' AND ${table.payload}->>'bindingHash' ~ '^[a-f0-9]{64}$' AND ${table.payload}->>'scopeKey' ~ '^[a-f0-9]{64}$') IS TRUE`),
+  check("analysis_count_status_check", sql`${table.status} IN ('reserved','sending','launch_claimed','settled','uncertain','overrun','released')`),
+  check("analysis_count_maximum_check", sql`((${table.payload}->'maximum'->>'requests')::numeric = 1 AND (${table.payload}->'maximum'->>'inputTokens')::numeric > 0 AND (${table.payload}->'maximum'->>'outputTokens')::numeric = 0 AND (${table.payload}->'maximum'->>'costMicrousd')::numeric > 0 AND (${table.payload}->>'accountingInputRate')::numeric > 0 AND (${table.payload}->>'accountingInputRate')::numeric <= 9007199254740991) IS TRUE`),
+  ...["requests", "inputTokens", "outputTokens", "costMicrousd"].map((field) => check(`analysis_count_${field}_check`, sql`((${table.payload}->'maximum'->>${sql.raw(`'${field}'`)})::numeric BETWEEN 0 AND 9007199254740991 AND (${table.payload}->'charged'->>${sql.raw(`'${field}'`)})::numeric BETWEEN 0 AND (${table.payload}->'maximum'->>${sql.raw(`'${field}'`)})::numeric AND trunc((${table.payload}->'maximum'->>${sql.raw(`'${field}'`)})::numeric) = (${table.payload}->'maximum'->>${sql.raw(`'${field}'`)})::numeric AND trunc((${table.payload}->'charged'->>${sql.raw(`'${field}'`)})::numeric) = (${table.payload}->'charged'->>${sql.raw(`'${field}'`)})::numeric) IS TRUE`)),
+]);
+
 export type NewGuideRow = typeof guides.$inferInsert;
 export type GuideStepRow = typeof guideSteps.$inferSelect;
 export type NewGuideStepRow = typeof guideSteps.$inferInsert;

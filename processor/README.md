@@ -15,6 +15,20 @@ Sites 앱은 Vinext/Next.js를 Cloudflare Worker에서 실행하므로 공개 �
 
 `DATA_DIR`은 처리 중인 파일을 두는 작업 공간일 뿐입니다. Replit에서 다시 배포하면 파일 시스템이 바뀔 수 있으므로, 원본이나 결과물을 로컬 디스크에만 보관하면 안 됩니다.
 
+## 합성 입력 토큰 검사 (개발용)
+
+`npm run processor:gemini:tokens`는 코드로 만든 6장(대상 4 + 문맥 2)의 **오프라인 준비 결과만** 출력하며 외부 호출은 없습니다. 임의 파일/URL/사용자 영상 입력은 받지 않습니다.
+
+2026-09-15 사용자 승인 후 `countTokens`를 정확히 1회 실행해 **7,199 입력 토큰**을 확인했습니다. 무료 플랜은 사용자 재확인이고 프로젝트 청구 등급의 자동 조회 증거는 아닙니다. 토큰 검사 자체는 생성 요청을 하지 않습니다. 이 값은 모든 영상의 입력 상한이 아니므로 서버 분석을 켜거나 입력 상한 근거로 자동 등록하지 않습니다.
+
+새 외부 전송 승인이 있을 때만 `-- --live --confirm-free-project --approve-synthetic-images`를 사용합니다. 과거 smoke 환경변수 동의만으로는 실행할 수 없습니다. 최대 20초·재시도 없음·리다이렉트 차단이며 체크아웃별 태평양 날짜의 예약은 하루 1개입니다. 실패해도 `processor/.data/gemini-token-probe`의 예약 파일을 지워 재시도하지 마세요. 이 한도는 계정 전체의 과금/사용량 통제가 아닙니다. [실측과 남은 조건](../docs/B5_QUOTA_INPUT_VERIFICATION.md).
+
+## 동일 합성 입력의 안내문 생성 검사 (개발용)
+
+`npm run processor:gemini:generation`도 기본은 오프라인입니다. 별도 생성 승인이 있을 때만 `-- --live --confirm-free-project --approve-synthetic-generation`으로 실행합니다. 토큰 계산용 동의는 거절하며, 앞선 6장의 전체 요청 fingerprint가 달라도 전송하지 않습니다. 기존 모델/프롬프트/출력 schema를 변경하지 않고 생성 1회·재시도 0·최대 60초를 적용합니다. 자체 로컬 예약은 태평양 날짜별 하루 1개이며 실패해도 지우지 않습니다.
+
+별도 승인된 생성 1회는 **입력 7,199 / 출력 425(사고 포함)**로 성공했습니다. 사전 입력 계산과 차이는 0이고, 한국어 안내문 4단계와 버튼 안의 클릭 위치를 확인했습니다. 결과는 `processor/.data/gemini-generation-probe/2026-09-15/result.json`에 검증된 내용만 저장했습니다. 개인정보 없는 단순 합성 화면이므로 실제 개인정보 탐지·모자이크 품질 검증은 아닙니다. 운영 입력 검증기에 이 단일 실측을 자동 등록하지 않습니다.
+
 ## 중앙 설정
 
 `src/config.ts`가 모든 환경 변수를 한 번에 읽고 검증합니다. 잘못된 설정은 서버가 요청을 받기 전에 `ConfigurationError`로 종료됩니다.
@@ -96,6 +110,8 @@ ffprobe와 ffmpeg의 업로드 입력에는 `file` 프로토콜 및 MP4/MOV/WebM
    npm run processor:test
    ```
 
+   프로세서 시험 파일은 메모리 급증을 막기 위해 최대 2개씩 동시에 실행합니다. 모든 시험은 그대로 포함하며, 실제 PostgreSQL 격리 시험은 별도 명령입니다.
+
 5. DB 스키마가 추가되거나 변경됐다면 migration을 생성하고 실제 DB에 적용한 뒤 서버를 다시 시작합니다.
 
    ```powershell
@@ -109,6 +125,10 @@ ffprobe와 ffmpeg의 업로드 입력에는 `file` 프로토콜 및 MP4/MOV/WebM
 
 ## Replit Reserved VM 배포 순서
 
+**2026-09-16 연결 준비:** 후속 화면 확인에서 ShowMe Replit 프로젝트 자체도 준비되지 않았음을 확인했습니다. 먼저 최신 코드를 GitHub에 반영하고 Replit으로 가져온 뒤 **Tools → Database**에서 개발 DB가 있는지 확인합니다. `npm run processor:preflight`는 현재 환경의 누락/형식만 비밀값 없이 확인하며, 모든 설정이 있어도 분석을 켜거나 외부 연결·DB 변경을 하지 않습니다. 아직 Publish나 운영 DB 생성은 하지 않습니다. [현재 점검 결과·다음 행동](../docs/B5_CONNECTION_PREFLIGHT.md).
+
+**현재 운영 연결은 보류 상태입니다.** Core 계정 화면과 월 추가 예산 $0.02 저장 보고는 받았지만 운영 DB/Storage 검증은 아직입니다. B5-B3b5에서 계산 원장→일회용 최종 전송→수치 정산→최신 실측→생성 경로를 연결했습니다. `quotaStore`/`inputBoundVerifier`/실측 검증기(또는 `inputMeasurementStage`)가 없으면 내부 worker는 `disabled`, 기본 새 분석 요청은 503입니다. 계산 단계는 명시적으로 주입해야 하며 서버 시작/HTTP에 등록하지 않았습니다. 조회는 무전송이고 상한/프로젝트/승인 근거 발급·운영 준비 검증도 남아 있습니다. [현재 구현·검증·남은 조건](../docs/B5_COUNT_EXECUTION.md)을 먼저 확인하세요. 아래는 조건 충족 후의 절차이며 지금 배포/과금을 켜라는 지시가 아닙니다.
+
 1. Replit Database와 App Storage 버킷을 프로젝트에 연결합니다.
 2. Replit Shell에서 `ffmpeg -version`과 `ffprobe -version`의 첫 줄이 같은 정확한 버전인지 확인합니다. 현재 코드가 검토한 분기는 8.0.3 이상, 8.1.2 이상, 9.0.1 이상이며 다른 분기는 코드 검토 전까지 거부됩니다.
 3. Secrets에 `DATABASE_URL`, `SHOWME_STORAGE=replit`, `CORS_ORIGINS=https://<게시된-Sites-도메인>`, `ASSET_TICKET_SECRET`, `EXPECTED_MEDIA_VERSION=<방금 확인한 정확한 버전>`과 필요한 pipeline 값을 등록합니다. 기본 버킷이 아닌 경우에만 `REPLIT_OBJECT_STORAGE_BUCKET_ID`를 넣습니다. `ASSET_TICKET_SECRET`은 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`로 생성할 수 있습니다.
@@ -121,6 +141,8 @@ ffprobe와 ffmpeg의 업로드 입력에는 `file` 프로토콜 및 MP4/MOV/WebM
 Replit은 배포 시 `REPLIT_DEPLOYMENT=1`을 자동으로 설정합니다. 이 상태에서 `SHOWME_STORAGE=local`이거나 `DATABASE_URL`이 없거나 정확한 `CORS_ORIGINS`가 없으면 중앙 설정이 즉시 종료합니다. 이는 업로드 성공처럼 보인 뒤 파일이나 상태가 사라지는 배포를 막기 위한 의도적인 fail-fast 동작입니다.
 
 ## 분석 저장·실행 호환성 — B2-A/B·B4-A·B4-B1/B2/B3
+
+최신 B5-B3b5는 PostgreSQL `0010_analysis_count_launch_claim.sql`까지 필요합니다. `claimAnalysisCountLaunch`로 확정한 일회용 티켓만 `launchAnalysisCount`에서 사용할 수 있습니다. 생성/계산은 같은 일일 한도에 각자 사용량을 기록하며 서로의 미사용분을 반환하지 않습니다. `AccountedGeminiMeasurements`를 내부 dispatcher에 명시적으로 주입하면 계산·실측·생성과 제한된 복구가 연결됩니다. HTTP/서버 자동 시작은 미연결이고 JSON v5 계산 저장 기능도 없습니다. 실제 PostgreSQL 43개·기본 473개를 검증했습니다. 계산용 수치 환산은 실제 청구액이나 무료 증거가 아니며 아래 B2–B4의 버전·검증 숫자는 당시 기록입니다.
 
 2026-09-15 B5-A: 격리된 **실제 PostgreSQL 16.15**에서 migration·다중 연결·취소 잠금·정산·SQL 제약·롤백·삭제 17개 시험을 통과했습니다. 기본 360개와 별도입니다. `npm run processor:postgres:verify`는 명시적인 로컬 Docker 엔진과 기존 이미지로 새 시험 DB만 만들고 정리합니다. `.env`/앱 DB URL은 사용하지 않습니다. 아래의 운영 적용·배포 DB·실제 저장소 검증은 계속 남아 있습니다. [재실행과 정확한 범위](../docs/B5_POSTGRES_VERIFICATION.md).
 

@@ -32,12 +32,12 @@ async function harness(context: TestContext) {
     id: "fixture-readiness-v1", checkedAt: now.toISOString(), validUntil: new Date(now.valueOf() + 20_000).toISOString(),
     guideId: h.guideId, inputFingerprint: command.expectedInputFingerprint, frameCount: 2,
     model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION, scope: "approved_synthetic", inputApprovalId: "fixture-input-approval",
-    runtime: { repository: "postgres-0007", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
+    runtime: { repository: "postgres-0008", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
     policy: { version: "fixture-policy", accountingOnly: true, price: { model: GEMINI_TEST_MODEL, version: "fixture-price",
       inputMicrousdPerMillionTokens: 100000, outputMicrousdPerMillionTokens: 200000 },
       maxInputTokensPerRequest: 1000, maxOutputTokensPerRequest: 8192, transientRetries: 1, globalLimit: { ...limits }, guideLimit: { ...limits } },
     entitlement: { mode: "free_only", projectRef: "private-project", evidenceId: "private-quota-evidence", paidFallback: false,
-      dailyQuota: { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000 } },
+      providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250_000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } },
   };
   let timestamp = now.valueOf(); let current = true;
   const inspections: AnalysisAdmissionInput[] = [];
@@ -119,6 +119,7 @@ test("missing, malformed, unready, stale or mismatched verifier evidence leaves 
     { ...h.snapshot, runtime: { ...h.snapshot.runtime, repository: "local-json" } },
     { ...h.snapshot, runtime: { ...h.snapshot.runtime, repository: "postgres-0004" } },
     { ...h.snapshot, runtime: { ...h.snapshot.runtime, repository: "postgres-0005" } },
+    { ...h.snapshot, runtime: { ...h.snapshot.runtime, repository: "postgres-0007" } },
     { ...h.snapshot, runtime: { ...h.snapshot.runtime, inputTokenBound: 1001 } },
     { ...h.snapshot, runtime: { ...h.snapshot.runtime, boundIncludes: "images-only" } },
     { ...h.snapshot, policy: { ...h.snapshot.policy, globalLimit: { ...limits, requests: 0 } } },
@@ -142,9 +143,12 @@ test("free-only policy rejects paid fallback, excessive free quotas and paid evi
   if (entitlement.mode !== "free_only") assert.fail();
   for (const e of [
     { ...entitlement, paidFallback: true },
-    { ...entitlement, dailyQuota: { ...entitlement.dailyQuota, requests: 99 } },
-    { ...entitlement, dailyQuota: { ...entitlement.dailyQuota, inputTokens: 999999 } },
-    { ...entitlement, dailyQuota: { ...entitlement.dailyQuota, outputTokens: 999999 } },
+    { ...entitlement, providerLimits: { ...entitlement.providerLimits, requestsPerDay: 99 } },
+    { ...entitlement, providerLimits: { ...entitlement.providerLimits, inputTokensPerMinute: 999 } },
+    { ...entitlement, providerLimits: { ...entitlement.providerLimits, requestsPerMinute: 0 } },
+    { ...entitlement, providerLimits: { ...entitlement.providerLimits, resetTimeZone: "UTC" } },
+    { mode: "free_only", projectRef: "project", evidenceId: "evidence", paidFallback: false,
+      dailyQuota: { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000 } },
     { mode: "paid_capped", projectRef: "project", evidenceId: "evidence", approvalId: "approval" },
   ]) {
     context.mock.method(h.readiness, "inspect", async () => ({ ...h.snapshot, entitlement: e }), { times: 1 });
@@ -168,11 +172,15 @@ test("paid contract needs explicit matching project, approval and spending cap (
 });
 
 test("revocation, expiry, midnight or abort while awaiting the writer rejects before commit", async (context) => {
-  for (const reason of ["revoked", "expired", "midnight", "aborted"] as const) {
+  for (const reason of ["revoked", "expired", "midnight", "pacific-midnight", "aborted"] as const) {
     const h = await harness(context); const before = await h.state();
     const controller = new AbortController();
     if (reason === "midnight") {
       const at = new Date("2026-09-14T23:59:59.000Z"); h.setTime(at);
+      h.snapshot.checkedAt = at.toISOString(); h.snapshot.validUntil = new Date(at.valueOf() + 20_000).toISOString();
+    }
+    if (reason === "pacific-midnight") {
+      const at = new Date("2026-09-14T06:59:59.000Z"); h.setTime(at);
       h.snapshot.checkedAt = at.toISOString(); h.snapshot.validUntil = new Date(at.valueOf() + 20_000).toISOString();
     }
     const reserve = h.repository.reserveAnalysisRequest.bind(h.repository);
@@ -180,10 +188,20 @@ test("revocation, expiry, midnight or abort while awaiting the writer rejects be
       if (reason === "revoked") h.setCurrent(false);
       if (reason === "expired") h.setTime(new Date(now.valueOf() + 20_000));
       if (reason === "midnight") h.setTime(new Date("2026-09-15T00:00:00.000Z"));
+      if (reason === "pacific-midnight") h.setTime(new Date("2026-09-14T07:00:00.000Z"));
       if (reason === "aborted") controller.abort(new Error("private abort reason"));
       return reserve(...args);
     });
     await assert.rejects(h.submit(h.command, controller.signal), (error: unknown) => error instanceof AnalysisAdmissionError);
+    assert.deepEqual(await h.state(), before);
+  }
+});
+
+test("a recent snapshot from before UTC or Pacific reset cannot admit work after the reset", async (context) => {
+  for (const midnight of ["2026-09-14T00:00:00.000Z", "2026-09-14T07:00:00.000Z"]) {
+    const h = await harness(context); const before = await h.state(); const at = Date.parse(midnight);
+    h.snapshot.checkedAt = new Date(at - 1000).toISOString(); h.snapshot.validUntil = new Date(at + 10_000).toISOString();
+    h.setTime(new Date(at)); await assert.rejects(h.submit(), /ANALYSIS_UNAVAILABLE/);
     assert.deepEqual(await h.state(), before);
   }
 });

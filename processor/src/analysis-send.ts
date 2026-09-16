@@ -21,8 +21,8 @@ export interface AnalysisSendRepository {
    * Read-only locked boundary. launch MUST synchronously start (not await) one request.
    * Never retry this operation after an ambiguous acknowledgement: external work cannot roll back.
    */
-  launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: () => void,
-    now?: Date, beforeLaunch?: () => void): Promise<boolean>;
+  launchAnalysisRequest(guideId: string, command: AnalysisSendCommand, launch: (lockedClock: () => Date) => void,
+    now?: Date, beforeLaunch?: (lockedAt: Date) => void): Promise<boolean>;
 }
 export function canLaunchAnalysisRequest(options: { guide: GuideWithSteps; analysis: AnalysisState;
   reservation: AnalysisReservation; batches: AnalysisStoredBatch[]; attempts: AnalysisRequestAttempt[];

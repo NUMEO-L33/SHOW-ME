@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 
 import type { AnalysisAdmissionInput, AnalysisAdmissionSnapshot } from "../src/analysis-admission.js";
-import { ANALYSIS_CONSENT_VERSION, ANALYSIS_LIMITS, analysisManifest } from "../src/analysis-contract.js";
+import { ANALYSIS_CONSENT_VERSION, ANALYSIS_LIMITS, analysisBatches, analysisManifest } from "../src/analysis-contract.js";
 import { DurableAnalysisDispatcher, type AnalysisDispatchProvider } from "../src/analysis-dispatcher.js";
 import type { AnalysisFundingCommand, AnalysisFundingPolicy } from "../src/analysis-funding.js";
 import { analysisAccountingControls, analysisRequestAttempts, analysisRuns, guides } from "../src/db/schema.js";
@@ -13,6 +13,12 @@ import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/gemini/request.
 import { JsonGuideRepository } from "../src/repository.js";
 import { createAnalysisHarness, fakeOutput } from "./helpers/analysis-fixtures.js";
 import { postgresAccountingFixture } from "./helpers/accounting-postgres-fixture.js";
+import { providerQuotaFixture } from "./helpers/provider-quota-fixture.js";
+import { AnalysisQuotaChargeError } from "../src/analysis-quota-charge.js";
+import { inputBoundFixture } from "./helpers/input-bound-fixture.js";
+import { inputMeasurementFixture } from "./helpers/input-measurement-fixture.js";
+import { GeminiInputMeasurements } from "../src/gemini/input-measurement.js";
+import type { AnalysisMeasurementStage } from "../src/gemini/counted-measurements.js";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
 const limits = { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000, costMicrousd: 1_000_000 };
@@ -40,9 +46,9 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
     id: "dispatch-fixture", checkedAt: clock().toISOString(), validUntil: new Date(timestamp + 20_000).toISOString(),
     guideId: h.guideId, inputFingerprint: command.expectedInputFingerprint, frameCount: count,
     model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION, scope: "approved_synthetic", inputApprovalId: "fictional-input",
-    runtime: { repository: "postgres-0007", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
+    runtime: { repository: "postgres-0008", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
     policy: selectedPolicy, entitlement: { mode: "free_only", projectRef: "private-project", evidenceId: "private-evidence", paidFallback: false,
-      dailyQuota: { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000 } },
+      providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250_000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } },
   };
   const inspections: AnalysisAdmissionInput[] = [];
   const readiness = {
@@ -56,10 +62,16 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
       signal.throwIfAborted(); calls.push(input.targets.map((f) => f.stepId));
       return { status: "completed", output: fakeOutput(input.targets.map((f) => f.stepId)), inputTokens: 100, outputTokens: 20 };
     } };
-  const loadImage = async (_guideId: string, stepId: string) => { loads.push(stepId); return new Uint8Array([255, 216, 255, 217]); };
+  const loadImage = async (guideId: string, stepId: string, signal: AbortSignal, inputFingerprint: string) => {
+    assert.equal(guideId, h.guideId); assert.equal(inputFingerprint, command.expectedInputFingerprint);
+    signal.throwIfAborted(); loads.push(stepId); return new Uint8Array([255, 216, 255, 217]);
+  };
   const workers: DurableAnalysisDispatcher[] = [];
+  const quotaStore = providerQuotaFixture(clock);
+  const inputBoundVerifier = inputBoundFixture(clock);
+  const inputMeasurementVerifier = inputMeasurementFixture(clock);
   const make = (overrides: Partial<ConstructorParameters<typeof DurableAnalysisDispatcher>[0]> = {}) => {
-    const worker = new DurableAnalysisDispatcher({ repository: h.repository, provider, readiness, loadImage, clock,
+    const worker = new DurableAnalysisDispatcher({ repository: h.repository, provider, readiness, loadImage, clock, quotaStore, inputBoundVerifier, inputMeasurementVerifier,
       leaseMs: 10_000, statusPollMs: 10, retryDelayMs: 1, ...overrides });
     workers.push(worker); return worker;
   };
@@ -78,17 +90,190 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
     assert.ok(await h.repository.executeAnalysisAccounting(h.guideId, { type: "sending", ...identity, owner }, clock()));
     return { ...identity, owner };
   };
-  return { ...h, command, snapshot, selectedPolicy, readiness, inspections, provider, calls, loads, loadImage, clock, make, state, run, claim, seedSent,
+  return { ...h, command, snapshot, selectedPolicy, readiness, inspections, provider, calls, loads, loadImage, clock, make, state, run, claim, seedSent, quotaStore, inputBoundVerifier, inputMeasurementVerifier,
     advance: (ms: number) => { timestamp += ms; }, revoke: () => { current = false; } };
 }
 
 test("dispatcher is disabled by default and is never registered in startup or HTTP", async (context) => {
   const h = await harness(context); const before = await h.state();
-  for (const missing of [{ provider: undefined }, { readiness: undefined }, { loadImage: undefined }]) {
+  for (const missing of [{ provider: undefined }, { readiness: undefined }, { loadImage: undefined }, { quotaStore: undefined }, { inputBoundVerifier: undefined }, { inputMeasurementVerifier: undefined }]) {
     assert.equal(await h.make(missing).tick(), "disabled");
   }
   assert.deepEqual(await h.state(), before); assert.deepEqual(h.calls, []); assert.deepEqual(h.loads, []);
   for (const path of ["processor/src/index.ts", "processor/src/server.ts"]) assert.ok(!(await readFile(path, "utf8")).includes("analysis-dispatcher"));
+});
+
+test("dispatcher explicitly measures each batch before generation and never uses an offline fallback on failure", async (t) => {
+  for (const failed of [false, true]) {
+    const h = await harness(t, 8); const events: string[] = [];
+    const cache = new GeminiInputMeasurements({ clock: h.clock, counter: { contract: "separately-metered-countTokens-v1",
+      async execute() { events.push("count"); if (failed) throw new Error("fictional count failure"); return { totalTokens: 321 }; } } });
+    const stage: AnalysisMeasurementStage = { inspect: cache.inspect.bind(cache), isCurrent: cache.isCurrent.bind(cache),
+      async recover() { events.push("recover"); }, async measureForAnalysis(input, scope, context, signal) {
+        assert.equal(context.guideId, h.guideId); assert.equal(context.frameCount, 8); assert.equal(context.generationOrdinal, 0);
+        assert.equal(context.owner.attemptCount, 1); assert.deepEqual(context.policy, h.selectedPolicy);
+        return cache.measure(input, scope, signal);
+      } };
+    const analyze = h.provider.analyzeFrames; h.provider.analyzeFrames = async (...args) => { events.push("generate"); return analyze(...args); };
+    assert.equal(await h.make({ inputMeasurementStage: stage }).tick(), failed ? "unavailable" : "completed");
+    assert.deepEqual(events, failed ? ["recover", "count"] : ["recover", "count", "generate", "count", "generate"]);
+    assert.equal(h.quotaStore.receipts.length, failed ? 0 : 2);
+  }
+});
+
+test("a stage alone supplies offline measurements but disabled dispatchers cannot trigger even recovery", async (t) => {
+  const h = await harness(t, 2); let recovered = 0; let measured = 0;
+  const stage: AnalysisMeasurementStage = { ...h.inputMeasurementVerifier, async recover() { recovered++; },
+    async measureForAnalysis() { measured++; } };
+  assert.equal(await h.make({ provider: undefined, inputMeasurementStage: stage }).tick(), "disabled");
+  assert.equal(recovered, 0); assert.equal(measured, 0);
+  assert.equal(await h.make({ inputMeasurementVerifier: undefined, inputMeasurementStage: stage }).tick(), "completed");
+  assert.equal(recovered, 1); assert.equal(measured, 1);
+});
+
+test("quota denial, invalid receipt or ambiguous commit acknowledgement prevents any actual send", async (context) => {
+  for (const kind of ["denied", "invalid", "ack-lost"] as const) {
+    const h = await harness(context, 2); let sends = 0;
+    h.provider.analyzeFrames = async (_input, signal, authorize) => {
+      await authorize(signal, async () => { sends += 1; return new Response(); });
+      assert.fail("must not return from refused quota");
+    };
+    const consume = h.quotaStore.consume.bind(h.quotaStore);
+    h.quotaStore.consume = async (...args) => {
+      if (kind === "denied") throw new AnalysisQuotaChargeError("PROVIDER_QUOTA_LIMIT");
+      const receipt = await consume(...args);
+      if (kind === "ack-lost") throw new Error("private commit acknowledgement");
+      return { ...receipt, requestKey: "0".repeat(64) };
+    };
+    assert.equal(await h.make().tick(), "failed"); assert.equal(sends, 0);
+    assert.equal(h.quotaStore.receipts.length, kind === "denied" ? 0 : 1);
+    assert.equal((await h.state()).funding.attempts[0].status, "uncertain");
+  }
+});
+
+test("a quota permit is durable before the locked launch and cannot outlive its deadline", async (context) => {
+  for (const expired of [false, true]) {
+    const h = await harness(context, 2); let sends = 0;
+    const consume = h.quotaStore.consume.bind(h.quotaStore);
+    h.quotaStore.consume = async (...args) => { const receipt = await consume(...args); if (expired) h.advance(5000); return receipt; };
+    h.provider.analyzeFrames = async (input, signal, authorize) => {
+      await authorize(signal, async () => { assert.equal(h.quotaStore.receipts.length, 1); sends += 1; return new Response(); });
+      return { status: "completed", output: fakeOutput(input.targets.map((f) => f.stepId)), inputTokens: 100, outputTokens: 20 };
+    };
+    assert.equal(await h.make().tick(), expired ? "failed" : "completed"); assert.equal(sends, expired ? 0 : 1);
+    assert.equal(h.quotaStore.receipts.length, 1);
+  }
+});
+
+test("cancellation after quota COMMIT still blocks launch without refunding the charge", async (context) => {
+  const h = await harness(context, 2); const consume = h.quotaStore.consume.bind(h.quotaStore);
+  h.quotaStore.consume = async (...args) => {
+    const receipt = await consume(...args);
+    await h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: h.command.runId }); return receipt;
+  };
+  await h.make().tick(); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 1);
+  assert.equal((await h.run()).status, "cancelled");
+});
+
+test("unverified or oversized total input evidence blocks sending before provider quota is consumed", async (context) => {
+  for (const oversized of [false, true]) {
+    const h = await harness(context, 2); const inspect = h.inputBoundVerifier.inspect.bind(h.inputBoundVerifier);
+    h.inputBoundVerifier.inspect = async (...args) => oversized ? { ...await inspect(...args) as object, totalInputTokenUpperBound: 1001 } : args[0];
+    assert.equal(await h.make().tick(), "unavailable"); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 0);
+    assert.equal((await h.state()).funding.attempts.filter((a: { status: string }) => a.status === "sending").length, 0);
+  }
+});
+
+test("revoking exact-input evidence after quota COMMIT prevents the final send", async (context) => {
+  const h = await harness(context, 2); const consume = h.quotaStore.consume.bind(h.quotaStore);
+  h.quotaStore.consume = async (...args) => {
+    const receipt = await consume(...args); h.inputBoundVerifier.isCurrent = () => false; return receipt;
+  };
+  assert.equal(await h.make().tick(), "unavailable"); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 1);
+});
+
+test("a pause after the prelaunch check still cannot send with an expired quota permit", async (context) => {
+  const h = await harness(context, 2); const launch = h.repository.launchAnalysisRequest.bind(h.repository);
+  context.mock.method(h.repository, "launchAnalysisRequest", (...args: Parameters<typeof launch>) => {
+    const [guideId, command, callback, at, before] = args;
+    return launch(guideId, command, (lockedClock) => { h.advance(5000); return callback(lockedClock); }, at, before);
+  });
+  assert.equal(await h.make().tick(), "failed"); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 1);
+});
+
+test("missing, oversized or differently approved measured input blocks generation before quota charge", async (context) => {
+  for (const kind of ["missing", "oversized", "project", "approval", "request", "manifest"] as const) {
+    const h = await harness(context, 2); const inspect = h.inputMeasurementVerifier.inspect;
+    h.inputMeasurementVerifier.inspect = async (...args) => {
+      const record = await inspect(...args) as object;
+      return kind === "missing" ? null : { ...record, ...({
+        oversized: { measuredInputTokens: 1001 }, project: { projectRef: "other" }, approval: { inputApprovalId: "other" },
+        request: { requestFingerprint: "b".repeat(64) }, manifest: { inputFingerprint: "c".repeat(64) },
+      }[kind]) };
+    };
+    assert.equal(await h.make().tick(), "unavailable"); assert.equal(h.quotaStore.receipts.length, 0); assert.deepEqual(h.calls, []);
+    assert.equal((await h.run()).status, "failed");
+    assert.equal((await h.state()).funding.attempts[0].status, "released");
+  }
+});
+
+test("measurement cannot exceed a stricter reviewed upper bound even if the overall policy is larger", async (context) => {
+  const h = await harness(context, 2); const inspect = h.inputBoundVerifier.inspect;
+  h.inputBoundVerifier.inspect = async (...args) => ({ ...await inspect(...args) as object, totalInputTokenUpperBound: 99 });
+  assert.equal(await h.make().tick(), "unavailable"); assert.equal(h.quotaStore.receipts.length, 0); assert.deepEqual(h.calls, []);
+});
+
+test("expiry after measurement lookup but before sending leaves no sent attempt or quota charge", async (context) => {
+  const h = await harness(context, 2); const inspect = h.inputMeasurementVerifier.inspect;
+  h.inputMeasurementVerifier.inspect = async (...args) => {
+    const record = { ...await inspect(...args) as object, validUntil: new Date(h.clock().valueOf() + 1).toISOString() };
+    h.advance(1); return record;
+  };
+  assert.equal(await h.make().tick(), "unavailable"); assert.equal(h.quotaStore.receipts.length, 0); assert.deepEqual(h.calls, []);
+});
+
+test("measurement revocation after quota commit prevents sending without refunding the charge", async (context) => {
+  const h = await harness(context, 2); const consume = h.quotaStore.consume.bind(h.quotaStore);
+  h.quotaStore.consume = async (...args) => { const receipt = await consume(...args); h.inputMeasurementVerifier.isCurrent = () => false; return receipt; };
+  assert.equal(await h.make().tick(), "unavailable"); assert.equal(h.quotaStore.receipts.length, 1); assert.deepEqual(h.calls, []);
+});
+
+test("mutating target/context pixels or metadata after measurement cannot reach the actual fetch", async (context) => {
+  for (const kind of ["target", "context", "metadata"] as const) {
+    const h = await harness(context, 8); const analyze = h.provider.analyzeFrames;
+    h.provider.analyzeFrames = async (input, signal, authorize) => {
+      if (kind === "metadata") input.targets[0].timestampMs++;
+      else input.images[kind === "target" ? 0 : input.images.length - 1].bytes[3] = 0;
+      return analyze(input, signal, authorize);
+    };
+    assert.equal(await h.make().tick(), "unavailable"); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 0);
+  }
+});
+
+test("final launch callback checks measurement again after the repository prelaunch check", async (context) => {
+  const h = await harness(context, 2); const launch = h.repository.launchAnalysisRequest.bind(h.repository);
+  context.mock.method(h.repository, "launchAnalysisRequest", (...args: Parameters<typeof launch>) => {
+    const [guideId, command, callback, at, before] = args;
+    return launch(guideId, command, (lockedClock) => { h.inputMeasurementVerifier.isCurrent = () => false; return callback(lockedClock); }, at, before);
+  });
+  assert.equal(await h.make().tick(), "unavailable"); assert.equal(h.quotaStore.receipts.length, 1); assert.deepEqual(h.calls, []);
+});
+
+test("separately prepared concrete measurements feed the worker without any hidden count during lookup", async (context) => {
+  const h = await harness(context, 8); let counts = 0;
+  const cache = new GeminiInputMeasurements({ clock: h.clock, counter: {
+    contract: "separately-metered-countTokens-v1", async execute() { counts++; return { totalTokens: 100 }; },
+  } });
+  // Fictional metering executor; prepare records explicitly BEFORE the generation worker runs.
+  for (const batch of analysisBatches(analysisManifest(h.guide).frames)) {
+    const images = [...batch.targets, ...batch.context].map((frame) => ({ stepId: frame.stepId, mimeType: "image/jpeg" as const,
+      bytes: new Uint8Array([255, 216, 255, 217]) }));
+    await cache.measure({ ...batch, images }, { projectRef: "private-project", inputApprovalId: "fictional-input",
+      inputFingerprint: h.command.expectedInputFingerprint }, new AbortController().signal);
+  }
+  assert.equal(counts, 2);
+  assert.equal(await h.make({ inputMeasurementVerifier: cache }).tick(), "completed");
+  assert.equal(counts, 2); assert.equal(h.calls.length, 2); assert.equal(h.quotaStore.receipts.length, 2);
 });
 
 test("one pass processes six ordered batches with sending recorded before each provider invocation", async (context) => {
@@ -307,10 +492,10 @@ test("request timeout keeps uncertain usage, fails safely and ignores late provi
 
 test("stop interrupts a hanging image read promptly and leaves completed work recoverable", async (context) => {
   const h = await harness(context); const entered = deferred<void>(); const image = deferred<Uint8Array>(); let calls = 0;
-  const worker = h.make({ loadImage: async (_g, step) => {
+  const worker = h.make({ loadImage: async (_g, step, signal, fingerprint) => {
     // First batch uses targets 0..3 and context 4; pause at the next batch's first image.
     if (++calls === 6) { entered.resolve(); return image.promise; }
-    return h.loadImage(_g, step);
+    return h.loadImage(_g, step, signal, fingerprint);
   } });
   const tick = worker.tick(); await entered.promise; await worker.stop(); assert.equal(await tick, "stopped");
   assert.equal((await h.state()).funding.batches[0].status, "succeeded");
