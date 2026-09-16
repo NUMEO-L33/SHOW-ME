@@ -140,6 +140,21 @@ test("functional tests declare their loaders and HTTP test dependencies directly
   assert.ok(client.scripts.typecheck.includes("tsconfig.test.json"));
 });
 
+test("media tests share platform-aware tool selection instead of importing bundled binaries directly", () => {
+  const directory = join(root, "artifacts/api-server/tests");
+  for (const file of filesBelow(directory)) {
+    const name = relative(directory, file).replace(/\\/g, "/");
+    if (name === "helpers/media-binaries.ts") continue;
+    assert.equal(/["']ff(?:mpeg|probe)-static["']/.test(readFileSync(file, "utf8")), false,
+      `${name} must select media tools through helpers/media-binaries.ts`);
+  }
+  for (const name of ["analysis-images", "media", "pipeline", "upload-flow"]) {
+    const source = read(`artifacts/api-server/tests/${name}.test.ts`);
+    assert.match(source, /import \{ testMediaPaths \} from "\.\/helpers\/media-binaries\.js";/);
+    assert.match(source, /const \{ ffmpegPath(?:, ffprobePath)? \} = testMediaPaths\(\);/);
+  }
+});
+
 test("PostgreSQL verification remains a separate guarded local fixture command", () => {
   const source = read("artifacts/api-server/scripts/verify-postgres.mjs");
   assert.match(source, /process\.argv\[2\] !== "--local-docker"/);

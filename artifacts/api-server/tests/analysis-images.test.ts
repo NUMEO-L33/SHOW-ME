@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { test, type TestContext } from "node:test";
@@ -13,9 +12,10 @@ import type { GuideWithSteps } from "../src/processor/domain.js";
 import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
 import { LocalStorage, type Storage } from "../src/processor/storage.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
+import { testMediaPaths } from "./helpers/media-binaries.js";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
-const ffmpegPath = createRequire(import.meta.url)("ffmpeg-static") as string;
+const { ffmpegPath } = testMediaPaths();
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 let synthetic: ReturnType<typeof syntheticAnalysisInput> | undefined;
 async function fixture(context: TestContext) {
