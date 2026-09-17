@@ -4,6 +4,8 @@
 
 ## 변경 범위
 
+**2026-09-17 최신 변경:** Replit `00d54a4`에서 페이지 대기 상태의 실제 FFmpeg 정체와 이미지 1개 실패를 확인한 뒤, 같은 Nixpkgs 커밋·FFmpeg 8.1.2의 `full` 의존성을 `headless`로 교체했다. 로더/기존 이미지 검사/시간 제한은 그대로다. [수정 근거와 한 번 실행할 확인 절차](REPLIT_HEADLESS_MEDIA.md). 아직 Replit headless 성능/호환 검증 전이므로 해결 완료가 아니다.
+
 - `scripts/post-merge.sh`에서 scaffold DB의 `push` 호출을 제거했다. 기존 잠금 파일 기반 의존성 설치는 유지한다. 실제 ShowMe SQL migration이나 서버 시작 코드는 바꾸지 않는다.
 - `.gitignore`에서 실제 환경 파일·인증 키·로컬 영상/프레임 데이터·도구 상태 제외를 복구했다. `.env.example`은 추적 가능하게 유지한다. 이미 추적 중인 파일은 삭제하거나 추적 해제하지 않는다.
 - `.gitattributes`에서 셸 스크립트를 LF로 고정했다. Windows에서 편집 후 Linux의 후처리 실행이 깨지는 것을 방지한다.

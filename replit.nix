@@ -8,7 +8,9 @@ let
     overlays = [];
   };
 in
-assert showmePkgs.ffmpeg_8-full.version == "8.1.2";
+assert showmePkgs.ffmpeg_8-headless.version == "8.1.2";
 {
-  deps = [ showmePkgs.ffmpeg_8-full ];
+  # Same reviewed release/pin, without full-only GUI/audio/ML integrations.
+  # Keep the real decoder and the image reader's original deadline unchanged.
+  deps = [ showmePkgs.ffmpeg_8-headless ];
 }

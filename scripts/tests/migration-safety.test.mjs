@@ -86,6 +86,44 @@ test("Replit media checks remain mandatory and do not silently fall back", () =>
   assert.match(binary, /assertReviewedMediaBinaryPair\(ffmpeg, ffprobe, config\.expectedMediaVersion\)/);
 });
 
+function assertHeadlessMediaDependency(source) {
+  assert.match(source, /https:\/\/github\.com\/NixOS\/nixpkgs\/archive\/1559d3daa3ecc813a650b79375ea61b6741b8746\.tar\.gz/);
+  assert.match(source, /assert showmePkgs\.ffmpeg_8-headless\.version == "8\.1\.2";/);
+  assert.match(source, /deps = \[ showmePkgs\.ffmpeg_8-headless \];/);
+  assert.doesNotMatch(source, /ffmpeg_8-full|\.override(?:Attrs)?\b/);
+}
+
+test("Replit uses the pinned headless FFmpeg without changing the reviewed version", () => {
+  assertHeadlessMediaDependency(read("replit.nix"));
+  const loader = read("artifacts/api-server/src/processor/analysis-images.ts");
+  assert.match(loader, /const timeoutMs = options\.timeoutMs \?\? 4500;/);
+  assert.match(loader, /timeoutMs > 5000/);
+  assert.match(loader, /await decodeJpeg\(bytes, selected\.width, selected\.height, ffmpegPath, controller\.signal\);/);
+});
+
+test("the media dependency guard rejects full fallback, unpinned source and version relaxation", () => {
+  const source = read("replit.nix");
+  for (const changed of [
+    source.replaceAll("ffmpeg_8-headless", "ffmpeg_8-full"),
+    source.replace("1559d3daa3ecc813a650b79375ea61b6741b8746", "master"),
+    source.replace('== "8.1.2"', '== "8.1.0"'),
+    source.replace("deps = [ showmePkgs.ffmpeg_8-headless ];", "deps = [ showmePkgs.ffmpeg_8-full ];"),
+  ]) assert.throws(() => assertHeadlessMediaDependency(changed));
+});
+
+test("headless verification runs the original images once without warm-up or production calls", () => {
+  const source = read("scripts/check-replit-media.sh");
+  assert.ok(!readFileSync(join(root, "scripts/check-replit-media.sh"), "utf8").includes("\r"));
+  assert.match(source, /set -euo pipefail/);
+  assert.match(source, /import \.\/replit\.nix \{ inherit pkgs; \}/);
+  assert.match(source, /HEADLESS_MEDIA_NOT_SELECTED/);
+  assert.match(source, /MEDIA_PAIR_MISMATCH/);
+  assert.match(source, /export SHOWME_TEST_FFMPEG_PATH="\$showme_test_ffmpeg"/);
+  assert.match(source, /export SHOWME_TEST_FFPROBE_PATH="\$showme_test_ffprobe"/);
+  assert.equal((source.match(/exec node scripts\/run-tests\.mjs images/g) ?? []).length, 1);
+  assert.doesNotMatch(source, /-version|diagnose-images\.mjs|--test-skip-pattern|DATABASE_URL|GEMINI_API_KEY|run dev|run start|while\s|until\s/);
+});
+
 function filesBelow(directory) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = join(directory, entry.name);
