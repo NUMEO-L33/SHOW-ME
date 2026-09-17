@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { AnalysisAccountingError, retryableHttpStatusSchema, type AnalysisAccountingCommand } from "./analysis-accounting-contract.js";
 import { AnalysisAdmissionError, verifyAnalysisReadiness, type AnalysisAdmissionReadiness } from "./analysis-admission.js";
 import { ANALYSIS_LIMITS, AnalysisContractError, analysisBatches, analysisManifest, type AnalysisProvider } from "./analysis-contract.js";
+import { ANALYSIS_IMAGE_BUDGET } from "./analysis-image-policy.js";
 import { fundingDay, type AnalysisFundingPolicy } from "./analysis-funding.js";
 import type { AnalysisErrorCode, AnalysisRun } from "./analysis-state.js";
 import { ownsAnalysisWork, workTime, workAvailableAt, type AnalysisWorkCandidate, type AnalysisWorkCursor } from "./analysis-work.js";
@@ -30,6 +31,7 @@ type Options = {
   inputMeasurementStage?: AnalysisMeasurementStage;
   loadImage?: (guideId: string, stepId: string, signal: AbortSignal, inputFingerprint: string) => Promise<Uint8Array>;
   pollMs?: number; statusPollMs?: number; retryDelayMs?: number; leaseMs?: number; requestTimeoutMs?: number; ioTimeoutMs?: number;
+  imageTimeoutMs?: number;
   /** Test clock only. Omit in production so repository ownership uses its own DB clock. */
   clock?: () => Date;
 };
@@ -76,6 +78,7 @@ export class DurableAnalysisDispatcher {
   private readonly leaseMs: number;
   private readonly requestTimeoutMs: number;
   private readonly ioTimeoutMs: number;
+  private readonly imageTimeoutMs: number;
   private shutdown = new AbortController();
   private flight?: Promise<AnalysisDispatchOutcome>;
   private loop?: Promise<void>;
@@ -95,6 +98,7 @@ export class DurableAnalysisDispatcher {
     this.leaseMs = duration(options.leaseMs ?? ANALYSIS_LIMITS.timeoutMs, ANALYSIS_LIMITS.timeoutMs);
     this.requestTimeoutMs = duration(options.requestTimeoutMs ?? 60_000, 60_000);
     this.ioTimeoutMs = duration(options.ioTimeoutMs ?? 5000, 5000);
+    this.imageTimeoutMs = duration(options.imageTimeoutMs ?? ANALYSIS_IMAGE_BUDGET.maxTotalMs, ANALYSIS_IMAGE_BUDGET.maxTotalMs);
   }
 
   getStatus() {
@@ -293,15 +297,21 @@ export class DurableAnalysisDispatcher {
           try {
             for (const frame of [...batch.targets, ...batch.context]) {
               guard(signal);
-              const bytes = await this.io((s) => this.options.loadImage!(guideId, frame.stepId, s, run.manifest.fingerprint), signal);
+              const bytes = await bounded((s) => this.options.loadImage!(guideId, frame.stepId, s, run.manifest.fingerprint),
+                signal, this.imageTimeoutMs, new WorkFailure("AI_TIMEOUT"));
               if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > ANALYSIS_LIMITS.maxImageBytes) {
                 throw new AnalysisContractError();
               }
               images.push({ stepId: frame.stepId, mimeType: "image/jpeg", bytes: new Uint8Array(bytes) });
             }
           } catch (error) {
+            // Cancellation/lease loss wins. Local image failures must not trigger
+            // automatic lease recovery/retries or reach any external provider.
+            signal.throwIfAborted();
+            if (error instanceof WorkFailure || error instanceof DispatchStop ||
+                error instanceof AnalysisAdmissionError || error instanceof AnalysisAccountingError) throw error;
             if (error instanceof AnalysisContractError) throw new WorkFailure("AI_INVALID_OUTPUT");
-            throw error;
+            throw new WorkFailure("AI_PROVIDER_FAILED");
           }
           const inputBoundVerifier = this.options.inputBoundVerifier!;
           const audit = auditGeminiInput({ ...batch, images }, permission.inputApprovalId, run.manifest.fingerprint);

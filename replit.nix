@@ -11,6 +11,6 @@ in
 assert showmePkgs.ffmpeg_8-headless.version == "8.1.2";
 {
   # Same reviewed release/pin, without full-only GUI/audio/ML integrations.
-  # Keep the real decoder and the image reader's original deadline unchanged.
+  # Image I/O and decoder deadlines are bounded separately in application code.
   deps = [ showmePkgs.ffmpeg_8-headless ];
 }

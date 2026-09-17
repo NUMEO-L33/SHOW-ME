@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { z } from "zod";
 
 import { ANALYSIS_LIMITS, analysisManifest } from "./analysis-contract.js";
+import { ANALYSIS_IMAGE_BUDGET } from "./analysis-image-policy.js";
 import { attemptFrameObjectKey } from "./asset-lifecycle.js";
 import type { GuideRepository } from "./domain.js";
 import type { Storage } from "./storage.js";
@@ -62,30 +63,43 @@ function checkJpeg(bytes: Buffer, width: number, height: number) {
   invalid();
 }
 
+// One decoder per Node process, no implicit queue or retry. A timed-out OS child
+// keeps its slot until close, even when SIGKILL was successfully requested.
+let decoderActive = false;
+
 /** Decode locally and count exactly one RGB frame; discard pixels without buffering them. */
 function decodeJpeg(bytes: Buffer, width: number, height: number, binary: string, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.reject(new AnalysisImageError());
+  if (signal.aborted || decoderActive) return Promise.reject(new AnalysisImageError());
+  decoderActive = true;
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, [
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn(binary, [
       "-hide_banner", "-loglevel", "error", "-xerror", "-max_alloc", "67108864",
       "-protocol_whitelist", "pipe", "-f", "mjpeg", "-err_detect", "explode", "-threads", "1", "-i", "pipe:0",
       "-map", "0:v:0", "-frames:v", "1", "-threads", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
-    ], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
-    let failed = false; let size = 0;
+    ], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] }); }
+    catch { decoderActive = false; reject(new AnalysisImageError()); return; }
+    let failed = false; let closed = false; let size = 0;
     const fail = () => {
       if (failed) return;
-      failed = true; child.kill("SIGKILL");
+      failed = true;
       signal.removeEventListener("abort", fail);
+      child.stdin?.destroy(); child.stdout?.destroy();
+      if (!closed && child.exitCode === null && child.signalCode === null) {
+        try { child.kill("SIGKILL"); } catch { /* Keep the occupied slot until close. */ }
+      }
       reject(new AnalysisImageError());
     };
     child.on("error", fail);
-    child.stdin.on("error", fail);
-    child.stdout.on("error", fail);
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdin!.on("error", fail);
+    child.stdout!.on("error", fail);
+    child.stdout!.on("data", (chunk: Buffer) => {
+      if (failed) return;
       size += chunk.length;
       if (size > width * height * 3) fail();
     });
     child.once("close", (code) => {
+      closed = true; decoderActive = false;
       signal.removeEventListener("abort", fail);
       if (failed) return;
       if (signal.aborted || code !== 0 || size !== width * height * 3) { fail(); return; }
@@ -93,7 +107,7 @@ function decodeJpeg(bytes: Buffer, width: number, height: number, binary: string
     });
     signal.addEventListener("abort", fail, { once: true });
     if (signal.aborted) { fail(); return; }
-    child.stdin.end(bytes);
+    child.stdin!.end(bytes);
   });
 }
 
@@ -105,7 +119,12 @@ function decodeJpeg(bytes: Buffer, width: number, height: number, binary: string
 export function createPrivateAnalysisImageLoader(options: {
   repository: Pick<GuideRepository, "getGuideById">; storage: Pick<Storage, "openRead">;
   approval: ApprovedSyntheticImages; isApprovalCurrent: (approvalId: string) => boolean;
-  ffmpegPath: string; timeoutMs?: number; clock?: () => Date;
+  ffmpegPath: string;
+  /** Cumulative repository/storage/validation time, excluding the decoder. */
+  ioTimeoutMs?: number;
+  /** Includes OS launch and decoding; no claim of a separate decoder-ready signal. */
+  decodeTimeoutMs?: number;
+  clock?: () => Date;
 }) {
   const parsed = approvalSchema.safeParse(options.approval);
   if (!parsed.success || typeof options.ffmpegPath !== "string" || !options.ffmpegPath.trim()) invalid();
@@ -114,8 +133,10 @@ export function createPrivateAnalysisImageLoader(options: {
   if (hashes.size !== approval.images.length || Date.parse(approval.expiresAt) <= Date.parse(approval.createdAt)) invalid();
   const { repository, storage, isApprovalCurrent, ffmpegPath } = options;
   const clock = options.clock ?? (() => new Date());
-  const timeoutMs = options.timeoutMs ?? 4500;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) invalid();
+  const ioTimeoutMs = options.ioTimeoutMs ?? ANALYSIS_IMAGE_BUDGET.ioMs;
+  const decodeTimeoutMs = options.decodeTimeoutMs ?? ANALYSIS_IMAGE_BUDGET.decodeMs;
+  if (!Number.isSafeInteger(ioTimeoutMs) || ioTimeoutMs < 1 || ioTimeoutMs > ANALYSIS_IMAGE_BUDGET.maxIoMs ||
+      !Number.isSafeInteger(decodeTimeoutMs) || decodeTimeoutMs < 1 || decodeTimeoutMs > ANALYSIS_IMAGE_BUDGET.decodeMs) invalid();
 
   return async (guideId: string, stepId: string, parent: AbortSignal, inputFingerprint: string): Promise<Uint8Array> => {
     const controller = new AbortController();
@@ -129,9 +150,20 @@ export function createPrivateAnalysisImageLoader(options: {
       rejectStopped(new AnalysisImageError());
     }, { once: true });
     parent.addEventListener("abort", stop, { once: true });
-    const timer = setTimeout(stop, timeoutMs);
+    const started = performance.now();
+    const totalDeadline = started + ioTimeoutMs + decodeTimeoutMs;
+    let phaseDeadline = started + ioTimeoutMs;
+    let phaseTimer = setTimeout(stop, ioTimeoutMs);
+    const timer = setTimeout(stop, ioTimeoutMs + decodeTimeoutMs);
+    const phase = (ms: number) => {
+      clearTimeout(phaseTimer);
+      phaseDeadline = performance.now() + ms;
+      if (ms <= 0) stop();
+      else phaseTimer = setTimeout(stop, ms);
+    };
     if (parent.aborted) stop();
     const guard = () => {
+      if (performance.now() >= Math.min(phaseDeadline, totalDeadline)) stop();
       if (controller.signal.aborted) invalid();
       const at = clock().valueOf();
       if (!Number.isFinite(at) || at < lastTime || at < Date.parse(approval.createdAt) || at >= Date.parse(approval.expiresAt)) invalid();
@@ -181,8 +213,14 @@ export function createPrivateAnalysisImageLoader(options: {
       const bytes = Buffer.concat(chunks, size);
       if (createHash("sha256").update(bytes).digest("hex") !== hashes.get(stepId)) invalid();
       checkJpeg(bytes, selected.width, selected.height);
+      guard();
+      const remainingIoMs = phaseDeadline - performance.now();
+      if (remainingIoMs <= 0) invalid();
+      phase(decodeTimeoutMs);
       await decodeJpeg(bytes, selected.width, selected.height, ffmpegPath, controller.signal);
       guard();
+      // The final ownership check gets only the unused I/O budget, not a fresh one.
+      phase(remainingIoMs);
       const latest = await frame();
       if (latest.key !== selected.key) invalid();
       guard();
@@ -191,7 +229,7 @@ export function createPrivateAnalysisImageLoader(options: {
     try { return await Promise.race([read(), stopped]); }
     catch { throw new AnalysisImageError(); } // No key, path, storage detail or arbitrary abort reason escapes.
     finally {
-      clearTimeout(timer); parent.removeEventListener("abort", stop);
+      clearTimeout(timer); clearTimeout(phaseTimer); parent.removeEventListener("abort", stop);
       stop(); // Invalidates every late continuation, including a delayed repository lookup.
     }
   };

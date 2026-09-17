@@ -96,9 +96,15 @@ function assertHeadlessMediaDependency(source) {
 test("Replit uses the pinned headless FFmpeg without changing the reviewed version", () => {
   assertHeadlessMediaDependency(read("replit.nix"));
   const loader = read("artifacts/api-server/src/processor/analysis-images.ts");
-  assert.match(loader, /const timeoutMs = options\.timeoutMs \?\? 4500;/);
-  assert.match(loader, /timeoutMs > 5000/);
+  const budgets = read("artifacts/api-server/src/processor/analysis-image-policy.ts");
+  assert.match(budgets, /ioMs: 4_500/);
+  assert.match(budgets, /maxIoMs: 5_000/);
+  assert.match(budgets, /decodeMs: 10_000/);
+  assert.match(budgets, /maxTotalMs: 15_000/);
+  assert.match(loader, /ioTimeoutMs > ANALYSIS_IMAGE_BUDGET.maxIoMs/);
+  assert.match(loader, /decodeTimeoutMs > ANALYSIS_IMAGE_BUDGET.decodeMs/);
   assert.match(loader, /await decodeJpeg\(bytes, selected\.width, selected\.height, ffmpegPath, controller\.signal\);/);
+  assert.match(loader, /phase\(remainingIoMs\)/);
 });
 
 test("the media dependency guard rejects full fallback, unpinned source and version relaxation", () => {

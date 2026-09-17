@@ -34,7 +34,7 @@ subscribe("child_process", ({ process: child }) => {
     const index = records.filter(({ child: item }) => isDecoder(item)).indexOf(record);
     emit("IMAGE_PROCESS_WAIT", snapshot(record, index));
     // Async, bounded /proc metadata reads only after a stall. No warm-up, pipe
-    // consumption, child listeners or changes to the existing 4.5s deadline.
+    // consumption, child listeners or changes to the application's deadlines.
     const sampleStarted = performance.now();
     void captureLinuxChildState(child).then((os) => {
       emit("IMAGE_PROCESS_OS_STATE", {

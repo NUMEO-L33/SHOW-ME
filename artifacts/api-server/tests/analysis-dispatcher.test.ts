@@ -460,6 +460,46 @@ test("revocation during image loading prevents a send and bounds frame bytes", a
   }
 });
 
+test("image loading has its own finite budget and can exceed the ordinary 5s I/O deadline", async (context) => {
+  const h = await harness(context, 2); let loads = 0;
+  const worker = h.make({ statusPollMs: 1000, loadImage: async (...args) => {
+    if (++loads === 1) await delay(5200);
+    return h.loadImage(...args);
+  } });
+  assert.equal(await worker.tick(), "completed"); assert.equal(loads, 2); assert.equal(h.calls.length, 1);
+});
+
+test("image deadline aborts uncooperative reads and never retries or sends their late output", async (context) => {
+  const h = await harness(context, 2); const late = deferred<Uint8Array>();
+  let loads = 0; let imageSignal: AbortSignal | undefined;
+  const worker = h.make({ imageTimeoutMs: 30, loadImage: async (_g, _s, signal) => {
+    loads++; imageSignal = signal; return late.promise;
+  } });
+  assert.equal(await worker.tick(), "failed"); assert.equal(imageSignal?.aborted, true);
+  assert.equal((await h.run()).errorCode, "AI_TIMEOUT");
+  late.resolve(new Uint8Array([1])); await delay(10);
+  h.advance(10_001); assert.equal(await worker.tick(), "idle");
+  assert.equal(loads, 1); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 0);
+  assert.equal((await h.state()).funding.attempts[0].status, "released");
+});
+
+test("a failed private image read terminates unsent work rather than retrying on a later lease", async (context) => {
+  const h = await harness(context, 2); let loads = 0;
+  const worker = h.make({ loadImage: async () => { loads++; throw new Error("private decoder path"); } });
+  assert.equal(await worker.tick(), "failed"); assert.equal((await h.run()).status, "failed");
+  h.advance(10_001); assert.equal(await worker.tick(), "idle");
+  assert.equal(loads, 1); assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 0);
+  assert.equal((await h.state()).funding.attempts[0].status, "released");
+});
+
+test("image-specific budgets cannot remove the global cap or relax ordinary I/O limits", async (context) => {
+  const h = await harness(context, 2);
+  for (const imageTimeoutMs of [0, -1, 0.5, NaN, Infinity, 15001]) {
+    assert.throws(() => h.make({ imageTimeoutMs }));
+  }
+  assert.throws(() => h.make({ ioTimeoutMs: 5001 }));
+});
+
 test("cancellation during an uncooperative provider aborts locally and never applies its late output", async (context) => {
   const h = await harness(context, 2); const entered = deferred<void>(); const late = deferred<Awaited<ReturnType<AnalysisDispatchProvider["analyzeFrames"]>>>();
   let providerSignal!: AbortSignal;

@@ -13,7 +13,7 @@ if (process.argv.length !== 2) {
   const cwd = join(root, "artifacts/api-server");
   const loader = pathToFileURL(createRequire(join(cwd, "package.json")).resolve("tsx")).href;
   console.log("IMAGE_PROCESS_CHECK", process.version, process.platform);
-  console.log("Diagnostic run only: default tests/4.5s deadline unchanged; no application environment or .env.");
+  console.log("Diagnostic run only: application image budgets apply (4.5s cumulative I/O + 10s decoder); no application environment or .env.");
   const child = spawn(process.execPath, [
     "--import", loader, "--import", new URL("./observe-image-process.mjs", import.meta.url).href,
     "--test", "--test-concurrency=2", "tests/analysis-images.test.ts",

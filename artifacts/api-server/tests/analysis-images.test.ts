@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import childProcess, { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { test, type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { analysisManifest, ANALYSIS_LIMITS } from "../src/processor/analysis-contract.js";
 import { AnalysisImageError, createPrivateAnalysisImageLoader, type ApprovedSyntheticImages } from "../src/processor/analysis-images.js";
@@ -14,6 +18,8 @@ import { LocalStorage, type Storage } from "../src/processor/storage.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
 import { testMediaPaths } from "./helpers/media-binaries.js";
 import { traceMediaProcess } from "./helpers/media-trace.js";
+import { holdDecoderCompletion } from "./helpers/decoder-completion.js";
+import { ANALYSIS_IMAGE_BUDGET } from "../src/processor/analysis-image-policy.js";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
 const { ffmpegPath } = testMediaPaths();
@@ -120,7 +126,7 @@ test("approval must cover all target/context frames and cannot be changed by mut
   assert.ok(await h.load(loader));
   assert.throws(() => h.make({ approval: { ...h.approval, images: [h.approval.images[0], h.approval.images[0]] } }), safeError);
   assert.throws(() => h.make({ approval: { ...h.approval, scope: "user-video" } as never }), safeError);
-  assert.throws(() => h.make({ timeoutMs: 5001 }), safeError);
+  assert.throws(() => h.make({ ioTimeoutMs: 5001 }), safeError);
 });
 
 test("missing, deleted, failed or reprocessed guides are rejected before any image read", async (context) => {
@@ -242,7 +248,7 @@ test("abort before reading performs no storage I/O and sanitizes the abort reaso
 test("timeout closes a late SDK stream and observes late stream errors", async (context) => {
   const h = await fixture(context); let release!: (value: Readable) => void;
   const storage: Pick<Storage, "openRead"> = { openRead() { return new Promise((resolve) => { release = resolve; }); } };
-  await assert.rejects(h.load(h.make({ storage, timeoutMs: 30 })), safeError);
+  await assert.rejects(h.load(h.make({ storage, ioTimeoutMs: 30 })), safeError);
   const late = new PassThrough(); release(late);
   await new Promise((resolve) => setImmediate(resolve)); assert.equal(late.destroyed, true);
   late.emit("error", new Error("private SDK key"));
@@ -258,7 +264,7 @@ test("abort interrupts a stalled stream without waiting for an uncooperative pro
 
 test("late repository completion cannot start storage work after timeout", async (context) => {
   const h = await fixture(context); let release!: (value: GuideWithSteps) => void; let reads = 0;
-  const loader = h.make({ timeoutMs: 30, repository: { getGuideById() { return new Promise((resolve) => { release = resolve; }); } },
+  const loader = h.make({ ioTimeoutMs: 30, repository: { getGuideById() { return new Promise((resolve) => { release = resolve; }); } },
     storage: { async openRead() { reads += 1; throw new Error("private path"); } } });
   await assert.rejects(h.load(loader), safeError); release(h.guide);
   await new Promise((resolve) => setImmediate(resolve)); assert.equal(reads, 0);
@@ -274,4 +280,89 @@ test("private image reader remains absent from startup and HTTP registration", a
   for (const path of ["src/processor/index.ts", "src/processor/server.ts"]) {
     assert.ok(!(await readFile(path, "utf8")).includes("analysis-images"));
   }
+});
+
+test("image budgets are finite, keep I/O short and include launch time in decoding", async (context) => {
+  const h = await fixture(context);
+  assert.deepEqual(ANALYSIS_IMAGE_BUDGET, { ioMs: 4500, maxIoMs: 5000, decodeMs: 10000, maxTotalMs: 15000 });
+  assert.equal(ANALYSIS_IMAGE_BUDGET.maxIoMs + ANALYSIS_IMAGE_BUDGET.decodeMs, ANALYSIS_IMAGE_BUDGET.maxTotalMs);
+  for (const value of [0, -1, NaN, Infinity, 1.5]) {
+    assert.throws(() => h.make({ ioTimeoutMs: value }), safeError);
+    assert.throws(() => h.make({ decodeTimeoutMs: value }), safeError);
+  }
+  assert.throws(() => h.make({ decodeTimeoutMs: 10001 }), safeError);
+});
+
+test("real JPEG completion beyond the former 4.5s/5s deadlines succeeds without skipping decoding", async (context) => {
+  const h = await fixture(context); const held = holdDecoderCompletion(context);
+  const started = performance.now();
+  const pending = h.load().then((bytes) => ({ bytes }), (error: unknown) => ({ error }));
+  const native = await held.nativeClosed;
+  assert.equal(native.code, 0); assert.equal(native.outputBytes, 640 * 360 * 3);
+  await delay(5200); held.release();
+  const result = await pending;
+  assert.ok("bytes" in result); assert.deepEqual(Buffer.from(result.bytes), Buffer.from(h.input.images[0].bytes));
+  assert.ok(performance.now() - started >= 5200); assert.equal(held.calls(), 1);
+});
+
+test("a delayed real corrupt JPEG decoder result still fails despite a matching approved hash", async (context) => {
+  const h = await fixture(context); const held = holdDecoderCompletion(context);
+  const bytes = Buffer.from(h.input.images[0].bytes); const table = bytes.indexOf(Buffer.from([255, 196]));
+  assert.ok(table >= 0); bytes.fill(255, table + 5, table + 21);
+  const approval = structuredClone(h.approval); approval.images[0].sha256 = sha256(bytes);
+  const pending = h.load(h.make({ approval, storage: { async openRead() { return Readable.from([bytes]); } } }))
+    .then(() => undefined, (error: unknown) => error);
+  const native = await held.nativeClosed;
+  assert.notEqual(native.code, 0); assert.equal(native.outputBytes, 0);
+  await delay(5200); held.release();
+  assert.ok(safeError(await pending)); assert.equal(held.calls(), 1);
+});
+
+test("the final ownership read shares the remaining I/O budget instead of receiving a reset", async (context) => {
+  const h = await fixture(context); let reads = 0;
+  const loader = h.make({ ioTimeoutMs: 400,
+    storage: { async openRead(key) { await delay(150); return h.storage.openRead(key); } },
+    repository: { async getGuideById(id) { if (++reads === 2) await delay(300); return h.repository.getGuideById(id); } },
+  });
+  await assert.rejects(h.load(loader), safeError); assert.equal(reads, 2);
+});
+
+test("deletion, expiry and revocation during decoder completion cannot release approved bytes", async (context) => {
+  for (const kind of ["deleted", "expired", "revoked"] as const) await context.test(kind, async (t) => {
+    const h = await fixture(t); const held = holdDecoderCompletion(t);
+    const pending = h.load().then(() => undefined, (error: unknown) => error);
+    assert.equal((await held.nativeClosed).code, 0);
+    if (kind === "deleted") h.setGuide(null);
+    if (kind === "expired") h.setTime(now.valueOf() + 60_000);
+    if (kind === "revoked") h.setCurrent(false);
+    held.release(); assert.ok(safeError(await pending));
+  });
+});
+
+test("abort discards a real decoded result and another loader cannot overlap its unclosed child", async (context) => {
+  const h = await fixture(context); const held = holdDecoderCompletion(context);
+  const controller = new AbortController();
+  const pending = h.load(h.make(), controller.signal).then(() => undefined, (error: unknown) => error);
+  assert.equal((await held.nativeClosed).code, 0);
+  controller.abort("private reason"); assert.ok(safeError(await pending));
+  await assert.rejects(h.load(h.make()), safeError); assert.equal(held.calls(), 1);
+  held.release(); held.restore();
+  assert.deepEqual(Buffer.from(await h.load()), Buffer.from(h.input.images[0].bytes));
+});
+
+test("a stalled decoder times out, closes pipes and keeps its slot until actual close without retry", async (context) => {
+  const h = await fixture(context); let spawned = 0; let kills = 0;
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(), stdout: new PassThrough(), exitCode: null, signalCode: null, killed: false,
+    kill() { kills++; this.killed = true; return true; },
+  });
+  const patched = context.mock.method(childProcess, "spawn", () => { spawned++; return child as unknown as ChildProcess; });
+  syncBuiltinESMExports();
+  const restore = () => { patched.mock.restore(); syncBuiltinESMExports(); };
+  context.after(() => { child.emit("close", null, "SIGKILL"); restore(); });
+  await assert.rejects(h.load(h.make({ decodeTimeoutMs: 30 })), safeError);
+  assert.equal(kills, 1); assert.equal(child.stdin.destroyed, true); assert.equal(child.stdout.destroyed, true);
+  await assert.rejects(h.load(h.make()), safeError); assert.equal(spawned, 1);
+  child.emit("close", null, "SIGKILL"); restore();
+  assert.deepEqual(Buffer.from(await h.load()), Buffer.from(h.input.images[0].bytes));
 });
