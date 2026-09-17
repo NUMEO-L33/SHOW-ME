@@ -11,6 +11,7 @@ test("internal commands reject unknown operations and fields before mutation", (
   assert.throws(() => parseAnalysisCommand({ type: "publish" }), AnalysisContractError);
   assert.throws(() => parseAnalysisCommand({ type: "initialize", originalUrl: "private" }), AnalysisContractError);
   assert.throws(() => parseAnalysisCommand({ type: "save-draft", expectedRevision: 0 }), AnalysisContractError);
+  assert.throws(() => parseAnalysisCommand({ type: "save-editor-draft", expectedRevision: 0, expectedInputFingerprint: "a".repeat(64) }), AnalysisContractError);
   assert.throws(() => parseAnalysisCommand({ type: "claim", runId: "r", attemptId: "a", expectedAttemptCount: -1, leaseMs: 1 }), AnalysisContractError);
 });
 

@@ -46,6 +46,7 @@ export type AnalysisCommand =
   | ({ type: "finish"; output: unknown; inputTokens: number; outputTokens: number } & AttemptIdentity)
   | ({ type: "fail"; errorCode: AnalysisErrorCode } & AttemptIdentity)
   | { type: "cancel"; runId: string }
+  | { type: "save-editor-draft"; expectedRevision: number; expectedInputFingerprint: string; document: unknown }
   | { type: "save-draft"; expectedRevision: number; document: unknown };
 
 const opaque = z.string().min(1).max(128);
@@ -72,12 +73,14 @@ const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("fail"), ...attemptFields, errorCode }).strict(),
   z.object({ type: z.literal("cancel"), runId: opaque }).strict(),
   z.object({ type: z.literal("save-draft"), expectedRevision: revision, document: z.unknown() }).strict(),
+  z.object({ type: z.literal("save-editor-draft"), expectedRevision: revision,
+    expectedInputFingerprint: z.string().regex(/^[a-f0-9]{64}$/), document: z.unknown() }).strict(),
 ]);
 
 export function parseAnalysisCommand(raw: unknown): AnalysisCommand {
   const parsed = commandSchema.safeParse(raw);
   if (!parsed.success || (parsed.data.type === "finish" && parsed.data.output === undefined) ||
-      (parsed.data.type === "save-draft" && parsed.data.document === undefined)) throw new AnalysisContractError();
+      ((parsed.data.type === "save-draft" || parsed.data.type === "save-editor-draft") && parsed.data.document === undefined)) throw new AnalysisContractError();
   return parsed.data as AnalysisCommand;
 }
 
@@ -133,6 +136,22 @@ export function transitionAnalysis(
   const manifest = analysisManifest(guide);
   const state = structuredClone(previous);
   const timestamp = now.toISOString();
+  if (command.type === "save-editor-draft") {
+    if (command.expectedInputFingerprint !== manifest.fingerprint ||
+        (state.draft && state.draft.inputFingerprint !== manifest.fingerprint)) return null;
+    const document = parseDraftDocument(command.document, manifest.frames);
+    const current = state.draft;
+    // A retry after a lost acknowledgement is safe only for the immediately
+    // preceding identical write. Never silently rebase a stale editor.
+    if (current && current.revision === command.expectedRevision + 1 &&
+        JSON.stringify(current.document) === JSON.stringify(document)) return state;
+    if ((current?.revision ?? 0) !== command.expectedRevision) return null;
+    state.draft = {
+      revision: command.expectedRevision + 1, inputFingerprint: manifest.fingerprint, document,
+      createdAt: current?.createdAt ?? timestamp, updatedAt: timestamp,
+    };
+    return state;
+  }
   if (command.type === "request") {
     // HTTP admission binds its authenticated media snapshot to the same atomic
     // transition that creates the initial draft and run. No partial initialization.

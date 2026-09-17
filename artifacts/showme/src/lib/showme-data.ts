@@ -1,9 +1,13 @@
+import type { EditorStep } from "./draft-client.js";
+
 export type GuideStep = {
   id: number | string;
   shortLabel: string;
   instruction: string;
   screen: "home" | "account" | "recipient" | "amount" | "confirm" | "frame";
   target: { x: number; y: number };
+  targetVisible?: boolean;
+  draft?: EditorStep;
   privacyCount: number;
   privacyEnabled: boolean;
   frameUrl?: string;

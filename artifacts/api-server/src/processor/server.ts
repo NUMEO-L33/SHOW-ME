@@ -11,6 +11,7 @@ import { rateLimit } from "express-rate-limit";
 
 import { createAssetTicket, verifyAssetTicket } from "./asset-token.js";
 import { AnalysisApiError, createAnalysisRouter, type AnalysisAdmission } from "./analysis-api.js";
+import { createDraftRouter } from "./draft-api.js";
 import { DurableAnalysisAdmission } from "./analysis-admission.js";
 import {
   cleanupStorageKeys,
@@ -363,7 +364,7 @@ export function createProcessorApp({
       if (!origin || config.corsOrigins.includes("*") || config.corsOrigins.includes(origin)) callback(null, true);
       else callback(new HttpError(403, "허용되지 않은 웹사이트예요.", "ORIGIN_NOT_ALLOWED"));
     },
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Authorization", "Content-Type", "X-ShowMe-Guide-Id"],
   }));
   app.use((request, _response, next) => {
@@ -413,6 +414,10 @@ export function createProcessorApp({
     }
     next();
   });
+
+  app.use("/api/guides/:guideId/draft", createDraftRouter({
+    repository, authenticate: (request) => requireGuideAccess(request, repository),
+  }));
 
   app.use("/api/guides/:guideId/analysis", createAnalysisRouter({
     repository, admission: analysisAdmission ?? new DurableAnalysisAdmission({ repository }),

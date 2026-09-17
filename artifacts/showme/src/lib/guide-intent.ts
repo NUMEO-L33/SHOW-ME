@@ -14,6 +14,7 @@ export function readGuideIntent(value: unknown): GuideIntent {
 
 export function validateGuideIntent(value: GuideIntent): string | null {
   if (!value.goal.trim()) return "무엇을 알려주고 싶은지 한 문장으로 적어 주세요.";
+  if (/[<>\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value.goal)) return "목적에는 < > 같은 기호나 제어 문자를 사용할 수 없어요.";
   for (const key of Object.keys(INTENT_LIMITS) as (keyof GuideIntent)[]) {
     if (value[key].length > INTENT_LIMITS[key]) return "입력할 수 있는 글자 수를 초과했어요.";
   }

@@ -143,6 +143,13 @@ const draftElementSchema = z.discriminatedUnion("type", [
 export const draftDocumentSchema = z.object({
   schemaVersion: z.literal(1),
   title: plainText(120),
+  // Optional for legacy drafts. This is human-authored context, not AI consent
+  // or a provider prompt. Persisting it never starts an analysis run.
+  intent: z.object({
+    goal: plainText(120),
+    audience: z.string().trim().max(120),
+    notes: z.string().trim().max(1000),
+  }).strict().optional(),
   steps: z.array(z.object({
     id, activeFrameStepId: id, sourceStepIds: z.array(id).min(1).max(ANALYSIS_LIMITS.maxFrames),
     shortLabel: plainText(60), instruction: plainText(500),

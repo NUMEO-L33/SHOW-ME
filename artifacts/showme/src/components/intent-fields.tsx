@@ -11,7 +11,7 @@ export function IntentFields({ value, onChange, prefix, error }: {
   return <fieldset className="space-y-4">
     <legend className="text-base font-extrabold text-[#172033]">어떤 안내서를 만들까요?</legend>
     <p className="text-sm leading-6 text-muted-foreground" id={`${prefix}-help`}>
-      목적을 먼저 기록해 주세요. 현재는 장면 추출만 가능하며, 이 내용은 이 브라우저에만 저장돼요. AI 전송·설명 생성은 아직 실행하지 않습니다. 비밀번호·계좌번호 등 민감한 정보는 적지 마세요.
+      목적을 먼저 기록해 주세요. 입력 내용은 비공개 서버 초안에 저장할 수 있어요. AI 전송·설명 생성은 아직 실행하지 않습니다. 비밀번호·계좌번호 등 민감한 정보는 적지 마세요.
     </p>
     <div>
       <label htmlFor={`${prefix}-goal`} className="text-sm font-bold">무엇을 알려주고 싶나요? <span className="text-primary">필수</span></label>

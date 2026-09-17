@@ -12,6 +12,8 @@ const job: ActiveJob = {
 test("intent requires a nonblank goal, but audience and notes are optional", () => {
   assert.ok(validateGuideIntent({ ...EMPTY_INTENT, goal: " \n " }));
   assert.equal(validateGuideIntent({ ...EMPTY_INTENT, goal: "사진 보내기" }), null);
+  assert.ok(validateGuideIntent({ ...EMPTY_INTENT, goal: "<안내>" }));
+  assert.ok(validateGuideIntent({ ...EMPTY_INTENT, goal: "안내\u0000" }));
   for (const [key, limit] of Object.entries(INTENT_LIMITS)) {
     assert.ok(validateGuideIntent({ goal: "목적", audience: "", notes: "", [key]: "a".repeat(limit + 1) }));
   }

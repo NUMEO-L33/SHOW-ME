@@ -261,7 +261,7 @@ export function GuideScreen({ step, compact = false, showTarget = true, classNam
           {step.screen === "confirm" && <ConfirmScreen masked={masked} />}
         </>
       )}
-      {showTarget && (
+      {showTarget && step.targetVisible !== false && (
         <span
           aria-hidden="true"
           className="tap-marker absolute z-20 -translate-x-1/2 -translate-y-1/2"

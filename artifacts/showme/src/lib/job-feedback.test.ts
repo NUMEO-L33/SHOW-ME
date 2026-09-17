@@ -60,12 +60,12 @@ test("checking and failed states omit old progress; upload progress is explicitl
   assert.match(uploading, /서버 접수 완료를 의미하지는 않습니다/);
 });
 
-test("intent form has labelled bounded fields and does not claim server persistence or AI use", () => {
+test("intent form has labelled bounded fields, describes private draft storage and does not claim AI use", () => {
   const html = renderToStaticMarkup(createElement(IntentFields, { prefix: "test", value: { ...EMPTY_INTENT, goal: "<script>bad()</script>" }, onChange: () => {} }));
   assert.match(html, /for="test-goal"/);
   assert.match(html, /maxLength="120"/i);
   assert.match(html, /maxLength="1000"/i);
-  assert.match(html, /이 브라우저에만 저장/);
+  assert.match(html, /비공개 서버 초안에 저장할 수 있어요/);
   assert.match(html, /AI 전송·설명 생성은 아직 실행하지 않습니다/);
   assert.doesNotMatch(html, /<script>/);
 });

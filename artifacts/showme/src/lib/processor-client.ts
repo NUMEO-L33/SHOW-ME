@@ -189,7 +189,7 @@ function invalidResponse(): never {
 
 // Include body reading in the deadline; a connected but stalled response must
 // not leave the UI in an unbounded wait. Never expose request URLs or tokens.
-async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+export async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
   const abort = new AbortController();
   const cancel = () => abort.abort();
   if (options.signal?.aborted) abort.abort();
