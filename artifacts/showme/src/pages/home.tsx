@@ -38,6 +38,7 @@ import { DEFAULT_GUIDE_TITLE, EMPTY_INTENT, readGuideIntent, titleForGuide, vali
 import { jobIssueFor, type JobIssue } from "@/lib/job-feedback";
 import { parsePersistedActiveJob, type ActiveJob, type PersistedActiveJob } from "@/lib/job-recovery";
 import { draftDocument, draftSteps, draftFailure, getDraft, putDraft, type DraftSnapshot } from "@/lib/draft-client";
+import { DraftAutosave } from "@/lib/draft-autosave";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -320,15 +321,17 @@ type ReviewScreenProps = {
   isLiveDraft: boolean;
   onFrameError?: () => void;
   intent: GuideIntent;
-  onIntentSave: (intent: GuideIntent) => Promise<boolean>;
-  onSave: () => Promise<boolean>;
+  onIntentApply: (intent: GuideIntent) => boolean;
+  onSave: () => void;
   onReload: () => Promise<void>;
   draftDirty: boolean;
   draftSaving: boolean;
+  draftLoading: boolean;
   draftError: string | null;
+  onCompositionChange: (composing: boolean) => void;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentSave, onSave, onReload, draftDirty, draftSaving, draftError }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -340,6 +343,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
   const [intentError, setIntentError] = useState<string | null>(null);
   const [reloadOpen, setReloadOpen] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => onCompositionChange(false), [onCompositionChange]);
   const activeStep = steps[activeIndex] ?? steps[0];
   const isLandscapeFrame = Boolean(activeStep.frameWidth && activeStep.frameHeight && activeStep.frameWidth > activeStep.frameHeight);
   const enabledMasks = steps.reduce((sum, step) => sum + (step.privacyEnabled ? step.privacyCount : 0), 0);
@@ -352,7 +356,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
   };
 
   const updateActiveStep = (changes: Partial<GuideStep>, privacyChanged = false) => {
-    if (draftSaving) return;
+    if (draftLoading) return;
     setSteps((current) => current.map((step, index) => index === activeIndex ? { ...step, ...changes } : step));
     markSaving();
     if (privacyChanged) setPrivacyConfirmed(false);
@@ -385,16 +389,16 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
   };
 
   const removeStep = () => {
-    if (steps.length <= 1 || draftSaving) return;
+    if (steps.length <= 1 || draftLoading) return;
     const removed = activeStep.shortLabel;
     setSteps((current) => current.filter((_, index) => index !== activeIndex));
     setActiveIndex(Math.max(0, activeIndex - 1));
     markSaving();
-    toast.info(isLiveDraft ? `‘${removed}’ 단계를 편집 목록에서 뺐어요. 서버 저장을 눌러 반영해 주세요.` : `‘${removed}’ 단계를 삭제했어요.`);
+    toast.info(isLiveDraft ? `‘${removed}’ 단계를 편집 목록에서 뺐어요. 변경 내용은 자동 저장됩니다.` : `‘${removed}’ 단계를 삭제했어요.`);
   };
 
   const mergeStep = () => {
-    if (draftSaving) return;
+    if (draftLoading) return;
     if (activeIndex === 0) {
       toast.info("첫 단계는 이전 단계와 합칠 수 없어요.");
       return;
@@ -411,7 +415,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
     } : step).filter((_, index) => index !== activeIndex));
     setActiveIndex(activeIndex - 1);
     markSaving();
-    toast.info(isLiveDraft ? "두 단계를 편집 목록에서 합쳤어요. 서버 저장을 눌러 반영해 주세요." : "두 단계를 하나로 합쳤어요.");
+    toast.info(isLiveDraft ? "두 단계를 편집 목록에서 합쳤어요. 변경 내용은 자동 저장됩니다." : "두 단계를 하나로 합쳤어요.");
   };
 
   const regenerate = () => {
@@ -433,7 +437,8 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
   };
 
   return (
-    <main className="min-h-screen bg-[#f4f6fa] text-[#172033]">
+    <main className="min-h-screen bg-[#f4f6fa] text-[#172033]"
+      onCompositionStart={() => onCompositionChange(true)} onCompositionEnd={() => onCompositionChange(false)}>
       <header className="sticky top-0 z-40 border-b border-[#dfe3eb] bg-white/95 px-4 backdrop-blur sm:px-5">
         <div className="mx-auto flex min-h-[68px] max-w-[1540px] flex-wrap items-center gap-3 py-2 sm:flex-nowrap sm:py-0">
           <Logo compact />
@@ -442,7 +447,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
             <Input
               value={title}
               maxLength={120}
-              disabled={draftSaving}
+              disabled={draftLoading}
               onChange={(event) => { setTitle(event.target.value); markSaving(); }}
               className="h-10 max-w-[420px] border-transparent bg-transparent px-2 text-[15px] font-extrabold shadow-none hover:bg-[#f5f6f8] focus-visible:bg-white"
               aria-label="가이드 제목"
@@ -451,14 +456,15 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           <div className="ml-auto flex flex-wrap items-center justify-end gap-2 sm:flex-nowrap">
             <span className="hidden items-center gap-1.5 px-2 text-xs font-bold text-[#748096] md:flex" aria-live="polite">
               {isLiveDraft
-                ? draftSaving ? <><LoaderCircle className="size-3.5 animate-spin" />서버 저장 확인 중</>
+                ? draftLoading ? <><LoaderCircle className="size-3.5 animate-spin" />저장본 불러오는 중</>
+                  : draftSaving ? <><LoaderCircle className="size-3.5 animate-spin" />자동 저장 중</>
                   : draftError ? <><CircleAlert className="size-3.5 text-[#a7463a]" />저장 확인 필요</>
-                  : draftDirty ? <><Clock3 className="size-3.5 text-[#7a6a45]" />저장하지 않은 변경</>
-                  : <><CheckCircle2 className="size-3.5 text-[#2f876b]" />서버 저장됨</>
+                  : draftDirty ? <><Clock3 className="size-3.5 text-[#7a6a45]" />자동 저장 대기</>
+                  : <><CheckCircle2 className="size-3.5 text-[#2f876b]" />자동 저장됨</>
                 : saveState === "saving" ? <><LoaderCircle className="size-3.5 animate-spin" />저장 중</> : <><CheckCircle2 className="size-3.5 text-[#2f876b]" />저장됨</>}
             </span>
-            {isLiveDraft && <Button variant="outline" disabled={draftSaving || (!draftDirty && !draftError)} onClick={() => { void onSave(); }}>
-              {draftSaving ? "저장 확인 중…" : "서버 저장"}
+            {isLiveDraft && draftError && <Button variant="outline" disabled={draftSaving || draftLoading} onClick={onSave}>
+              다시 저장
             </Button>}
             {isLiveDraft && onDeleteDraft && (
               <Button
@@ -489,7 +495,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
       </header>
 
       {isLiveDraft && <div className="border-b bg-white px-5 py-3 sm:hidden"><label htmlFor="mobile-guide-title" className="text-xs font-bold">가이드 제목</label>
-        <Input id="mobile-guide-title" value={title} maxLength={120} disabled={draftSaving} onChange={event => setTitle(event.target.value)} className="mt-1" />
+        <Input id="mobile-guide-title" value={title} maxLength={120} disabled={draftLoading} onChange={event => setTitle(event.target.value)} className="mt-1" />
       </div>}
       {isLiveDraft && <section className="mx-auto flex max-w-[1540px] flex-wrap items-center justify-between gap-3 border-b border-[#dfe3eb] bg-white px-5 py-4" aria-label="제작 의도">
         <div className="min-w-0 flex-1"><p className="text-xs font-bold text-muted-foreground">제작 의도 · 비공개 서버 초안</p>
@@ -497,29 +503,29 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           {intent.audience && <p className="mt-1 break-words text-sm text-muted-foreground">대상: {intent.audience}</p>}
           <p className="mt-1 text-xs text-muted-foreground">AI에는 아직 적용되지 않았어요. 수정해도 설명 재생성이나 기존 편집 덮어쓰기는 실행하지 않습니다.</p>
         </div>
-        <Button variant="outline" disabled={draftSaving} onClick={() => { setIntentDraft({ ...intent }); setIntentError(null); setIntentOpen(true); }}>제작 의도 수정</Button>
+        <Button variant="outline" disabled={draftLoading} onClick={() => { setIntentDraft({ ...intent }); setIntentError(null); setIntentOpen(true); }}>제작 의도 수정</Button>
       </section>}
       {isLiveDraft && <section className="mx-auto flex max-w-[1540px] flex-wrap items-center justify-between gap-3 border-b bg-white px-5 py-3" aria-label="서버 저장 상태">
         <p role={draftError ? "alert" : "status"} className={`text-sm ${draftError ? "text-[#a7463a]" : "text-muted-foreground"}`}>
-          {draftSaving ? "서버 응답을 확인하고 있어요. 완료 전에는 창을 닫지 마세요." : draftError || (draftDirty ? "아직 서버에 저장하지 않은 변경이 있어요. 서버 저장 버튼을 눌러 주세요." : "현재 편집 내용이 서버에 저장되어 있어요.")}
+          {draftLoading ? "서버 저장본을 불러오고 있어요." : draftSaving ? "자동 저장 중이에요. 계속 편집할 수 있어요. 저장 완료 전에는 창을 닫지 마세요." : draftError || (draftDirty ? "수정을 멈추면 약 1초 뒤 자동 저장해요. 저장 완료 전에는 창을 닫지 마세요." : "현재 편집 내용이 서버에 자동 저장되어 있어요.")}
         </p>
-        <Button variant="ghost" disabled={draftSaving} onClick={() => setReloadOpen(true)}>최신 저장본 불러오기</Button>
+        <Button variant="ghost" disabled={draftSaving || draftLoading} onClick={() => setReloadOpen(true)}>최신 저장본 불러오기</Button>
       </section>}
       <Dialog open={reloadOpen} onOpenChange={setReloadOpen}><DialogContent>
         <DialogHeader><DialogTitle>서버 저장본으로 다시 열까요?</DialogTitle><DialogDescription>현재 화면에서 저장하지 않은 편집은 버려집니다. 필요한 내용은 먼저 복사해 두세요. 불러오기에 실패하면 현재 입력은 유지됩니다.</DialogDescription></DialogHeader>
         <DialogFooter><Button variant="outline" onClick={() => setReloadOpen(false)}>취소</Button><Button onClick={() => { setReloadOpen(false); void onReload(); }}>입력을 버리고 불러오기</Button></DialogFooter>
       </DialogContent></Dialog>
-      <Dialog open={intentOpen} onOpenChange={setIntentOpen}>
+      <Dialog open={intentOpen} onOpenChange={(open) => { setIntentOpen(open); if (!open) onCompositionChange(false); }}>
         <DialogContent className="max-h-[90dvh] overflow-y-auto">
-          <DialogHeader><DialogTitle>제작 의도 수정</DialogTitle><DialogDescription>목적과 현재 화면의 제목·단계 편집을 함께 비공개 서버 초안에 저장합니다. AI 설명 생성은 실행하지 않습니다.</DialogDescription></DialogHeader>
-          <fieldset disabled={draftSaving}><IntentFields prefix="review-intent" value={intentDraft} error={intentError} onChange={(next) => { setIntentDraft(next); setIntentError(null); }} /></fieldset>
-          <DialogFooter><Button variant="outline" disabled={draftSaving} onClick={() => setIntentOpen(false)}>취소</Button><Button disabled={draftSaving} onClick={async () => {
+          <DialogHeader><DialogTitle>제작 의도 수정</DialogTitle><DialogDescription>적용을 누르면 목적과 현재 편집 내용을 비공개 서버 초안에 자동 저장합니다. 이 창에서 입력 중인 목적은 적용 전에는 전송하지 않습니다. AI 설명 생성은 실행하지 않습니다.</DialogDescription></DialogHeader>
+          <fieldset disabled={draftLoading}><IntentFields prefix="review-intent" value={intentDraft} error={intentError} onChange={(next) => { setIntentDraft(next); setIntentError(null); }} /></fieldset>
+          <DialogFooter><Button variant="outline" disabled={draftLoading} onClick={() => { setIntentOpen(false); onCompositionChange(false); }}>취소</Button><Button disabled={draftLoading} onClick={() => {
             const error = validateGuideIntent(intentDraft);
             setIntentError(error);
             if (error) return;
-            if (await onIntentSave(readGuideIntent(intentDraft))) setIntentOpen(false);
-            else setIntentError("서버 저장을 확인하지 못했어요. 입력은 유지했습니다. 창을 닫고 저장 상태 안내를 확인해 주세요.");
-          }}>{draftSaving ? "저장 확인 중…" : "서버에 함께 저장"}</Button></DialogFooter>
+            if (onIntentApply(readGuideIntent(intentDraft))) { setIntentOpen(false); onCompositionChange(false); }
+            else setIntentError("목적을 적용하지 못했어요. 입력은 유지했습니다. 현재 작업 상태를 확인해 주세요.");
+          }}>적용</Button></DialogFooter>
         </DialogContent>
       </Dialog>
       <div className="mx-auto grid min-h-[calc(100vh-68px)] max-w-[1540px] lg:grid-cols-[210px_minmax(0,1fr)_300px] xl:grid-cols-[238px_minmax(0,1fr)_330px]">
@@ -553,7 +559,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           <div className="mx-auto flex h-full max-w-[800px] flex-col">
             {isLiveDraft && (
               <p role="note" className="mb-3 rounded-xl border border-[#e3d6ad] bg-[#fffbeb] p-3 text-sm font-semibold leading-6 text-[#786238]">
-                설명과 누를 위치는 직접 편집한 뒤 서버 저장을 눌러 주세요. 저장하지 않은 변경은 새로고침하면 사라져요. AI 분석·개인정보 가림·공개 공유는 아직 실행하지 않습니다.
+                설명과 누를 위치를 편집하면 약 1초 뒤 자동 저장됩니다. ‘자동 저장됨’을 확인한 뒤 창을 닫아 주세요. AI 분석·개인정보 가림·공개 공유는 아직 실행하지 않습니다.
               </p>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -601,7 +607,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
             <Textarea
               id="step-instruction"
               maxLength={500}
-              disabled={draftSaving}
+              disabled={draftLoading}
               value={activeStep.instruction}
               onChange={(event) => updateActiveStep({ instruction: event.target.value })}
               className="mt-2 min-h-[104px] resize-none rounded-[14px] border-[#dfe3eb] bg-[#fafbfc] p-3 text-base font-bold leading-6 shadow-none"
@@ -626,8 +632,8 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
 
           <div className="space-y-2 px-5 py-5">
             <Button variant="outline" className="h-11 w-full justify-start rounded-[12px] border-[#dfe3eb] font-extrabold" onClick={regenerate} disabled={isLiveDraft || regenerating}><RefreshCcw className="size-4 text-[#4f6df5]" />{isLiveDraft ? "AI 설명 생성 준비 중" : "이 단계 다시 만들기"}</Button>
-            <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#626d82]" onClick={mergeStep} disabled={activeIndex === 0 || draftSaving || (isLiveDraft && [activeStep, steps[activeIndex - 1]].some(step => step?.draft?.elements.some(e => e.type === "privacy-mask")))}><GitMerge className="size-4" />이전 단계와 합치기</Button>
-            <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#b64444] hover:bg-[#fff1f1] hover:text-[#a73838]" onClick={removeStep} disabled={steps.length <= 1 || draftSaving}><Trash2 className="size-4" />이 단계 삭제</Button>
+            <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#626d82]" onClick={mergeStep} disabled={activeIndex === 0 || draftLoading || (isLiveDraft && [activeStep, steps[activeIndex - 1]].some(step => step?.draft?.elements.some(e => e.type === "privacy-mask")))}><GitMerge className="size-4" />이전 단계와 합치기</Button>
+            <Button variant="ghost" className="h-11 w-full justify-start rounded-[12px] font-extrabold text-[#b64444] hover:bg-[#fff1f1] hover:text-[#a73838]" onClick={removeStep} disabled={steps.length <= 1 || draftLoading}><Trash2 className="size-4" />이 단계 삭제</Button>
           </div>
         </aside>
       </div>
@@ -770,7 +776,10 @@ export default function Home() {
   const [activeJob, setActiveJob] = useState<ActiveJob | null>(null);
   const [draftSnapshot, setDraftSnapshot] = useState<DraftSnapshot | null>(null);
   const [draftSaving, setDraftSaving] = useState(false);
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftComposing, setDraftComposing] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const draftAutosaveRef = useRef<DraftAutosave | null>(null);
   const draftRequestRef = useRef<AbortController | null>(null);
   const [fileName, setFileName] = useState("screen-recording.mp4");
   const [title, setTitle] = useState(DEFAULT_GUIDE_TITLE);
@@ -792,16 +801,51 @@ export default function Home() {
   }, [title, steps, activeJob, draftSnapshot, processingKind]);
 
   useEffect(() => {
-    if (!draftDirty && !draftSaving) return;
+    if (!draftDirty && !draftSaving && !draftError) return;
     const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [draftDirty, draftSaving]);
-  useEffect(() => () => draftRequestRef.current?.abort(), []);
+  }, [draftDirty, draftSaving, draftError]);
+  useEffect(() => () => {
+    draftRequestRef.current?.abort();
+    draftAutosaveRef.current?.dispose();
+    draftAutosaveRef.current = null;
+  }, []);
+
+  const onDraftCompositionChange = useCallback((composing: boolean) => {
+    if (composing) draftAutosaveRef.current?.suspend(true);
+    setDraftComposing(composing);
+  }, []);
+
+  useEffect(() => {
+    const autosave = draftAutosaveRef.current;
+    if (!autosave || !activeJob || activeJob.phase === "deleting") return;
+    autosave.suspend(draftComposing || draftLoading || (mode !== "review" && mode !== "viewer"));
+    try { autosave.update(draftDocument(title, steps, activeJob.intent)); }
+    catch { autosave.update(null, "자동 저장을 멈췄어요. 제목과 설명은 비워 둘 수 없으며 제목 120자·설명 500자 이내로 입력해 주세요. < > 같은 문자는 사용할 수 없습니다."); }
+  }, [title, steps, activeJob, draftSnapshot, draftComposing, draftLoading, mode]);
 
   const adoptDraft = (snapshot: DraftSnapshot, media: Awaited<ReturnType<typeof getGuide>>, job: ActiveJob) => {
     const restored = draftSteps(snapshot.document, media);
     const next = { ...job, intent: readGuideIntent(snapshot.document.intent) };
+    draftAutosaveRef.current?.dispose();
+    const autosave = new DraftAutosave({
+      initial: snapshot,
+      write: (base, document, signal) => putDraft(next, base, document, signal),
+      onSaved: (saved) => {
+        if (draftAutosaveRef.current !== autosave || activeJobRef.current?.guideId !== next.guideId || activeJobRef.current.phase === "deleting") return;
+        setDraftSnapshot(saved);
+        // Do not write the response back into inputs: the user may have edited again.
+        try { persistActiveJob(activeJobRef.current, fileName); } catch { /* keep the original recovery key */ }
+      },
+      onStatus: (status) => {
+        if (draftAutosaveRef.current !== autosave) return;
+        setDraftSaving(status.saving);
+        setDraftError(status.error);
+      },
+    });
+    draftAutosaveRef.current = autosave;
+    setDraftSaving(false);
     setDraftSnapshot(snapshot);
     setDraftError(null);
     setSteps(restored);
@@ -1235,6 +1279,9 @@ export default function Home() {
     }
     toast.dismiss();
     draftRequestRef.current?.abort();
+    draftAutosaveRef.current?.dispose();
+    draftAutosaveRef.current = null;
+    setDraftSaving(false);
     const deletingJob: ActiveJob = {
       ...activeJob,
       phase: "deleting",
@@ -1314,48 +1361,29 @@ export default function Home() {
 
   const previewTitle = useMemo(() => title.trim() || DEFAULT_GUIDE_TITLE, [title]);
 
-  const saveEditor = async (intent = activeJob?.intent ?? EMPTY_INTENT): Promise<boolean> => {
-    if (!activeJob || !draftSnapshot || activeJob.phase === "deleting" || draftRequestRef.current) return false;
-    let document;
-    try { document = draftDocument(title, steps, intent); }
-    catch { setDraftError("제목과 설명은 비워 둘 수 없어요. 제목 120자·설명 500자 이내이며 < > 같은 문자는 사용할 수 없습니다."); return false; }
-    const abort = new AbortController();
-    draftRequestRef.current = abort;
-    setDraftSaving(true);
-    setDraftError(null);
-    try {
-      const saved = await putDraft(activeJob, draftSnapshot, document, abort.signal);
-      if (abort.signal.aborted || activeJobRef.current?.guideId !== activeJob.guideId || activeJobRef.current.phase === "deleting") return false;
-      setDraftSnapshot(saved);
-      setTitle(saved.document.title);
-      setSteps(current => current.map((step, index) => ({ ...step, shortLabel: saved.document.steps[index].shortLabel,
-        instruction: saved.document.steps[index].instruction, draft: saved.document.steps[index] })));
-      const next = { ...activeJob, intent: readGuideIntent(saved.document.intent) };
-      activeJobRef.current = next;
-      setActiveJob(next);
-      try { persistActiveJob(next, fileName); } catch { /* server save succeeded; keep original credential */ }
-      toast.success("비공개 초안을 서버에 저장했어요.");
-      return true;
-    } catch (error) {
-      if (!abort.signal.aborted) setDraftError(draftFailure(error));
-      return false;
-    } finally {
-      if (draftRequestRef.current === abort) draftRequestRef.current = null;
-      setDraftSaving(false);
-    }
+  const applyEditorIntent = (intent: GuideIntent): boolean => {
+    if (!activeJob || !draftSnapshot || activeJob.phase === "deleting" || draftLoading || validateGuideIntent(intent)) return false;
+    const next = { ...activeJob, intent: readGuideIntent(intent) };
+    activeJobRef.current = next;
+    setActiveJob(next);
+    return true;
   };
 
   const reloadDraft = async () => {
-    if (!activeJob || activeJob.phase === "deleting" || draftRequestRef.current) return;
+    if (!activeJob || activeJob.phase === "deleting" || draftRequestRef.current || draftAutosaveRef.current?.saving) return;
+    draftAutosaveRef.current?.suspend(true);
     const abort = new AbortController();
     draftRequestRef.current = abort;
-    setDraftSaving(true);
+    setDraftLoading(true);
     try {
       const media = await getGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, abort.signal);
       const snapshot = await getDraft(activeJob, abort.signal);
       if (!abort.signal.aborted && activeJobRef.current?.guideId === activeJob.guideId && activeJobRef.current.phase !== "deleting") adoptDraft(snapshot, media, activeJob);
-    } catch (error) { if (!abort.signal.aborted) setDraftError(draftFailure(error)); }
-    finally { if (draftRequestRef.current === abort) draftRequestRef.current = null; setDraftSaving(false); }
+    } catch (error) { if (!abort.signal.aborted) {
+      if (draftAutosaveRef.current) draftAutosaveRef.current.pause(error);
+      else setDraftError(draftFailure(error));
+    } }
+    finally { if (draftRequestRef.current === abort) draftRequestRef.current = null; setDraftLoading(false); }
   };
 
   if (mode === "viewer") {
@@ -1394,12 +1422,14 @@ export default function Home() {
           isLiveDraft={processingKind === "video"}
           onFrameError={() => { void refreshFrameTickets(); }}
           intent={activeJob?.intent ?? EMPTY_INTENT}
-          onIntentSave={saveEditor}
-          onSave={() => saveEditor()}
+          onIntentApply={applyEditorIntent}
+          onSave={() => draftAutosaveRef.current?.retry()}
           onReload={reloadDraft}
           draftDirty={draftDirty}
           draftSaving={draftSaving}
+          draftLoading={draftLoading}
           draftError={draftError}
+          onCompositionChange={onDraftCompositionChange}
         />
       )}
       {mode === "published" && (
