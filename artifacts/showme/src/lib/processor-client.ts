@@ -183,6 +183,30 @@ async function readJson(response: Response) {
   return payload;
 }
 
+function invalidResponse(): never {
+  throw new ProcessorClientError("작업 서버의 응답 형식을 확인할 수 없어요.", undefined, "INVALID_RESPONSE");
+}
+
+// Include body reading in the deadline; a connected but stalled response must
+// not leave the UI in an unbounded wait. Never expose request URLs or tokens.
+async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  if (options.signal?.aborted) abort.abort();
+  else options.signal?.addEventListener("abort", cancel, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; abort.abort(); }, 15_000);
+  try {
+    return await read(await fetch(url, { ...options, signal: abort.signal, redirect: "error" }));
+  } catch (error) {
+    if (timedOut) throw new ProcessorClientError("서버 응답 시간이 초과됐어요.", undefined, "REQUEST_TIMEOUT");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", cancel);
+  }
+}
+
 function withAbsoluteAssetUrls(baseUrl: string, guide: ProcessorGuide): ProcessorGuide {
   return {
     ...guide,
@@ -199,16 +223,22 @@ function withAbsoluteAssetUrls(baseUrl: string, guide: ProcessorGuide): Processo
 }
 
 export async function getGuide(baseUrl: string, guideId: string, editToken: string, signal?: AbortSignal) {
-  const response = await fetch(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}`, {
+  return boundedRequest(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}`, {
     headers: { Authorization: `Bearer ${editToken}` },
     cache: "no-store",
     signal,
+  }, async (response) => {
+    const payload = (await readJson(response)) as { guide?: ProcessorGuide; assetExpiresAt?: number } | null;
+    const guide = payload?.guide;
+    if (!guide || guide.id !== guideId || !Array.isArray(guide.steps) ||
+      !["uploading", "queued", "probing", "extracting", "ready", "failed"].includes(guide.status) ||
+      !Number.isFinite(guide.progress) || guide.progress < 0 || guide.progress > 100 ||
+      (guide.status === "ready" && guide.steps.length === 0)) invalidResponse();
+    return {
+      ...withAbsoluteAssetUrls(baseUrl, guide),
+      assetExpiresAt: payload?.assetExpiresAt,
+    };
   });
-  const payload = (await readJson(response)) as { guide: ProcessorGuide; assetExpiresAt?: number };
-  return {
-    ...withAbsoluteAssetUrls(baseUrl, payload.guide),
-    assetExpiresAt: payload.assetExpiresAt,
-  };
 }
 
 export async function retryGuide(baseUrl: string, guideId: string, editToken: string, signal?: AbortSignal) {
@@ -221,13 +251,16 @@ export async function retryGuide(baseUrl: string, guideId: string, editToken: st
 }
 
 export async function deleteGuide(baseUrl: string, guideId: string, editToken: string, signal?: AbortSignal) {
-  const response = await fetch(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}`, {
+  return boundedRequest(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${editToken}` },
     signal,
+  }, async (response) => {
+    if (response.status === 204) return { pending: false };
+    // The server deliberately uses the same 404 for an absent guide and a bad
+    // credential. It is NOT proof of deletion: preserve the recovery key.
+    const payload = await readJson(response) as { status?: unknown } | null;
+    if (response.status === 202 && payload?.status === "deleting") return { pending: true };
+    return invalidResponse();
   });
-  if (response.status === 404) return { pending: false, missing: true };
-  if (response.status === 204) return { pending: false, missing: false };
-  const payload = await readJson(response) as { status?: unknown };
-  return { pending: response.status === 202 && payload.status === "deleting", missing: false };
 }

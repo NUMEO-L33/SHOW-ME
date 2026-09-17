@@ -32,6 +32,11 @@ import { toast } from "sonner";
 import { GuideScreen } from "@/components/guide-screen";
 import { PublicGuide } from "@/components/public-guide";
 import { ScreenRecorder } from "@/components/screen-recorder";
+import { IntentFields } from "@/components/intent-fields";
+import { JobProgress } from "@/components/job-progress";
+import { DEFAULT_GUIDE_TITLE, EMPTY_INTENT, readGuideIntent, titleForGuide, validateGuideIntent, type GuideIntent } from "@/lib/guide-intent";
+import { jobIssueFor, type JobIssue } from "@/lib/job-feedback";
+import { parsePersistedActiveJob, saveJobIntent, type ActiveJob, type PersistedActiveJob } from "@/lib/job-recovery";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -43,7 +48,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { GUIDE_TITLE, INITIAL_GUIDE_STEPS, type GuideStep } from "@/lib/showme-data";
@@ -62,43 +66,9 @@ import {
 
 type AppMode = "upload" | "processing" | "review" | "viewer" | "published";
 type SaveState = "saved" | "saving";
-type StartRequest = { kind: "sample" } | { kind: "video"; file: File };
-type ActiveJob = {
-  guideId: string;
-  editToken: string;
-  baseUrl: string;
-  phase: "uploading" | "processing" | "failed" | "deleting";
-  startedAt: number;
-  deletionMissingGraceUntil?: number;
-};
+type StartRequest = { kind: "sample" } | { kind: "video"; file: File; intent: GuideIntent };
 const LEGACY_ACTIVE_JOB_STORAGE_KEY = "showme:active-processing-job";
 const ACTIVE_JOB_SESSION_KEY = "showme:active-processing-guide-id";
-const UPLOAD_RECOVERY_GRACE_MS = 20 * 60_000;
-
-type PersistedActiveJob = ActiveJob & { fileName: string };
-
-function parsePersistedActiveJob(value: string | null): PersistedActiveJob | null {
-  if (!value) return null;
-  try {
-    const parsed = JSON.parse(value) as Partial<PersistedActiveJob>;
-    if (
-      typeof parsed.guideId !== "string" ||
-      typeof parsed.editToken !== "string" ||
-      typeof parsed.baseUrl !== "string"
-    ) return null;
-    return {
-      guideId: parsed.guideId,
-      editToken: parsed.editToken,
-      baseUrl: parsed.baseUrl,
-      phase: parsed.phase === "deleting" ? "deleting" : parsed.phase === "uploading" ? "uploading" : parsed.phase === "failed" ? "failed" : "processing",
-      startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : Date.now() - UPLOAD_RECOVERY_GRACE_MS,
-      deletionMissingGraceUntil: typeof parsed.deletionMissingGraceUntil === "number" ? parsed.deletionMissingGraceUntil : undefined,
-      fileName: typeof parsed.fileName === "string" ? parsed.fileName : "화면 녹화 영상",
-    };
-  } catch {
-    return null;
-  }
-}
 
 function persistActiveJob(job: ActiveJob, fileName: string): void {
   persistRecoverableCredentials(
@@ -164,6 +134,8 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [intent, setIntent] = useState<GuideIntent>({ ...EMPTY_INTENT });
+  const [intentError, setIntentError] = useState<string | null>(null);
 
   const chooseFile = (nextFile?: File) => {
     if (!nextFile) return;
@@ -211,7 +183,7 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
             <span className="text-primary">따라 하기 쉬운 안내서</span>로.
           </h1>
           <p className="mt-5 max-w-[610px] text-[17px] font-medium leading-7 text-muted-foreground sm:text-[18px]">
-            중요한 장면과 누를 곳, 쉬운 설명을 AI가 알아서 정리합니다. <span className="whitespace-nowrap">완성된 링크만 카카오톡으로 보내세요.</span>
+            안내할 목적을 적고, 영상 속 장면을 단계별로 확인하세요. 현재는 화면 추출을 시험할 수 있으며 AI 설명·편집 저장·공유는 준비 중입니다.
           </p>
 
           <div className="mt-9 rounded-[28px] border border-border/80 bg-card p-3 shadow-[0_28px_80px_rgba(20,32,61,.1)] sm:p-4">
@@ -269,6 +241,11 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
                 onError={(message) => toast.error(message)}
               />
             </div>
+            {file && <div className="mt-5 rounded-2xl border border-[#e0e5f0] bg-[#f8faff] p-4 sm:p-5">
+              <IntentFields prefix="upload-intent" value={intent} error={intentError}
+                onChange={(next) => { setIntent(next); setIntentError(null); }} />
+              <p className="mt-3 text-xs leading-5 text-muted-foreground">버튼을 누르기 전에는 파일과 입력 내용을 전송하지 않습니다. 시작할 때 복구 기록과 함께 이 브라우저에 저장합니다.</p>
+            </div>}
             {!file && (
               <button
                 className="mx-auto mt-3 block min-h-11 px-3 text-sm font-extrabold text-[#5069d9] underline decoration-[#bfc8f3] underline-offset-4 sm:hidden"
@@ -280,15 +257,21 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
             <div className="flex flex-col gap-3 px-1 pb-1 pt-4 sm:flex-row sm:items-center sm:justify-between">
               <p className="flex items-center gap-2 text-[13px] font-semibold text-muted-foreground">
                 <ShieldCheck className="size-4 text-[#257a61]" />
-                개인정보는 게시 전에 꼭 확인할 수 있어요
+                현재는 실제 장면 추출만 시험할 수 있어요
               </p>
               <Button
                 size="lg"
                 disabled={!file}
                 className="h-12 rounded-[14px] px-6 text-[15px] font-extrabold shadow-[0_10px_24px_rgba(255,105,78,.22)]"
-                onClick={() => file && onStart({ kind: "video", file })}
+                onClick={() => {
+                  if (!file) return;
+                  const error = validateGuideIntent(intent);
+                  setIntentError(error);
+                  if (error) { document.getElementById("upload-intent-goal")?.focus(); return; }
+                  onStart({ kind: "video", file, intent: readGuideIntent(intent) });
+                }}
               >
-                가이드 만들기
+                장면 추출 시작
                 <ArrowRight className="size-4" />
               </Button>
             </div>
@@ -299,11 +282,11 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
           <div className="absolute -right-12 -top-12 size-32 rounded-full border-[28px] border-primary/10" />
           <div className="relative rotate-[1.25deg] rounded-[30px] border border-[#dfe4ef] bg-white p-6 shadow-[0_26px_70px_rgba(24,35,64,.12)]">
             <div className="mb-7 flex items-center justify-between">
-              <div><p className="text-xs font-bold text-muted-foreground">AI가 정리하는 중</p><p className="mt-1 text-lg font-black tracking-[-0.03em] text-[#172033]">5단계로 딱 맞게</p></div>
+              <div><p className="text-xs font-bold text-muted-foreground">현재 이용 가능한 흐름</p><p className="mt-1 text-lg font-black tracking-[-0.03em] text-[#172033]">목적 기록부터 장면 확인까지</p></div>
               <span className="grid size-11 place-items-center rounded-2xl bg-[#eef1ff] text-[#4f6df5]"><MonitorSmartphone className="size-5" /></span>
             </div>
             <div className="space-y-3">
-              {["필요한 장면만 고르기", "누를 곳과 설명 표시", "개인정보 찾아 가리기"].map((label, index) => (
+              {["목적과 대상 기록", "영상에서 장면 추출", "추출한 화면 확인"].map((label, index) => (
                 <div key={label} className="flex items-center gap-3 rounded-2xl border border-[#e9ecf3] bg-[#fbfcff] p-3.5">
                   <span className={`grid size-8 shrink-0 place-items-center rounded-full text-sm font-black ${index === 2 ? "bg-primary text-white" : "bg-[#eaf6f1] text-[#257a61]"}`}>{index === 2 ? "3" : <Check className="size-4" strokeWidth={3} />}</span>
                   <span className="text-sm font-extrabold text-[#25304a]">{label}</span>
@@ -311,104 +294,13 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
               ))}
             </div>
             <div className="mt-5 rounded-2xl bg-[#172033] p-4 text-white">
-              <p className="text-xs font-bold text-white/55">완성 예상 시간</p>
+              <p className="text-xs font-bold text-white/55">다음 개발 단계</p>
               <div className="mt-1 flex items-end justify-between">
-                <p className="text-2xl font-black tracking-[-0.05em]">약 1분</p>
-                <div className="flex items-center gap-1.5 text-xs font-bold text-[#aeb9ff]"><span className="size-1.5 rounded-full bg-[#7f95ff]" />자동 저장</div>
+                <p className="text-lg font-black tracking-[-0.05em]">AI 설명 · 편집 저장 · 공유</p>
               </div>
             </div>
           </div>
         </aside>
-      </section>
-    </main>
-  );
-}
-
-const PROCESSING_STEPS = [
-  { label: "영상 확인", threshold: 10 },
-  { label: "화면을 단계로 나누기", threshold: 28 },
-  { label: "설명과 누를 위치 만들기", threshold: 54 },
-  { label: "개인정보 가림 준비", threshold: 82 },
-];
-
-function ProcessingScreen({
-  progress,
-  fileName,
-  statusMessage,
-  errorMessage,
-  onCancel,
-  onRetry,
-  retrying = false,
-  cancelLabel = "다른 영상 선택",
-}: {
-  progress: number;
-  fileName: string;
-  statusMessage?: string;
-  errorMessage?: string | null;
-  onCancel: () => void;
-  onRetry?: () => void;
-  retrying?: boolean;
-  cancelLabel?: string;
-}) {
-  const activeIndex = Math.min(PROCESSING_STEPS.length - 1, PROCESSING_STEPS.filter((item) => progress >= item.threshold).length);
-
-  return (
-    <main className="min-h-screen bg-[#f7f8fc] px-5 text-[#172033]">
-      <header className="mx-auto flex h-[76px] max-w-[960px] items-center justify-between"><Logo /><span className="hidden text-sm font-bold text-muted-foreground sm:block">가이드 만드는 중</span></header>
-      <section className="mx-auto grid max-w-[960px] place-items-center pb-16 pt-8 sm:pt-16">
-        <div className="w-full max-w-[680px] rounded-[30px] border border-[#e1e5ed] bg-white p-5 shadow-[0_28px_80px_rgba(20,32,61,.09)] sm:p-9">
-          <div className="flex flex-col gap-5 border-b border-[#eaedf2] pb-7 sm:flex-row sm:items-center">
-            <div className="relative grid size-20 shrink-0 place-items-center rounded-[24px] bg-[#fff0ed] text-primary">
-              <Video className="size-8" />
-              <span className="absolute -right-1 -top-1 grid size-7 place-items-center rounded-full border-4 border-white bg-[#4f6df5] text-white"><Sparkles className="size-3" /></span>
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-bold text-[#758097]">{fileName}</p>
-              <h1 className="mt-1 text-[clamp(1.65rem,5vw,2.25rem)] font-black tracking-[-0.045em]">
-                {errorMessage ? "영상을 처리하지 못했어요" : "화면 녹화를 단계로 나누고 있어요"}
-              </h1>
-              <p className="mt-2 text-[15px] font-medium leading-6 text-muted-foreground">
-                {errorMessage ?? statusMessage ?? "업로드 뒤에는 창을 닫아도 서버에서 처리가 이어집니다."}
-              </p>
-            </div>
-          </div>
-
-          <div className="py-7">
-            <div className="mb-3 flex items-end justify-between"><p className="text-sm font-extrabold text-[#4f5a71]">전체 진행</p><p className="text-2xl font-black tabular-nums text-[#4f6df5]">{Math.round(progress)}%</p></div>
-            <Progress value={progress} className={`h-3 bg-[#e8ebf5] ${errorMessage ? "[&_[data-slot=progress-indicator]]:bg-[#d75c4d]" : "[&_[data-slot=progress-indicator]]:bg-[#4f6df5]"}`} aria-label={`가이드 생성 ${Math.round(progress)}%`} />
-          </div>
-
-          {errorMessage ? (
-            <div className="rounded-[16px] border border-[#f0cdc7] bg-[#fff7f5] p-4 text-sm font-semibold leading-6 text-[#854a40]" role="alert">
-              {onRetry
-                ? "원본 영상은 7일간 보관돼요. 같은 파일을 다시 올리지 않고 처리를 재시도할 수 있습니다."
-                : "영상 선택 화면으로 돌아가 파일과 연결 상태를 확인해 주세요."}
-            </div>
-          ) : <div className="space-y-2.5" aria-live="polite">
-            {PROCESSING_STEPS.map((item, index) => {
-              const done = index < activeIndex || progress >= 100;
-              const active = index === activeIndex && progress < 100;
-              return (
-                <div key={item.label} className={`flex items-center gap-3 rounded-[16px] border px-4 py-3.5 transition-colors ${active ? "border-[#cfd7ff] bg-[#f5f7ff]" : "border-transparent"}`}>
-                  <span className={`grid size-8 shrink-0 place-items-center rounded-full ${done ? "bg-[#e7f5ef] text-[#257a61]" : active ? "bg-[#4f6df5] text-white" : "bg-[#eef0f4] text-[#929bad]"}`}>
-                    {done ? <Check className="size-4" strokeWidth={3} /> : active ? <LoaderCircle className="size-4 animate-spin" /> : <span className="text-xs font-black">{index + 1}</span>}
-                  </span>
-                  <span className={`text-[15px] font-extrabold ${done ? "text-[#597064]" : active ? "text-[#293a7a]" : "text-[#8a93a5]"}`}>{item.label}</span>
-                  {active && <span className="ml-auto text-xs font-bold text-[#6a78bd]">처리 중</span>}
-                  {done && <span className="ml-auto text-xs font-bold text-[#3f856e]">완료</span>}
-                </div>
-              );
-            })}
-          </div>}
-
-          <div className="mt-7 flex items-center justify-between rounded-[16px] bg-[#f6f7fa] px-4 py-3 text-sm">
-            <p className="flex items-center gap-2 font-semibold text-[#6e788d]"><Clock3 className="size-4" />{errorMessage ? "처리 기록을 안전하게 남겼어요" : `진행률 ${Math.round(progress)}%`}</p>
-            <div className="flex items-center gap-3">
-              {errorMessage && onRetry && <button className="font-extrabold text-primary hover:text-[#d94f38] disabled:opacity-50" onClick={onRetry} disabled={retrying}>{retrying ? "다시 준비 중" : "다시 시도"}</button>}
-              <button className="font-extrabold text-[#68738b] hover:text-[#172033]" onClick={onCancel}>{cancelLabel}</button>
-            </div>
-          </div>
-        </div>
       </section>
     </main>
   );
@@ -426,15 +318,20 @@ type ReviewScreenProps = {
   onDeleteDraft?: () => void;
   isLiveDraft: boolean;
   onFrameError?: () => void;
+  intent: GuideIntent;
+  onIntentSave: (intent: GuideIntent) => boolean;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentSave }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [privacyConfirmed, setPrivacyConfirmed] = useState(false);
   const [shareOriginal, setShareOriginal] = useState(false);
+  const [intentOpen, setIntentOpen] = useState(false);
+  const [intentDraft, setIntentDraft] = useState<GuideIntent>(intent);
+  const [intentError, setIntentError] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeStep = steps[activeIndex] ?? steps[0];
   const isLandscapeFrame = Boolean(activeStep.frameWidth && activeStep.frameHeight && activeStep.frameWidth > activeStep.frameHeight);
@@ -570,6 +467,26 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
         </div>
       </header>
 
+      {isLiveDraft && <section className="mx-auto flex max-w-[1540px] flex-wrap items-center justify-between gap-3 border-b border-[#dfe3eb] bg-white px-5 py-4" aria-label="제작 의도">
+        <div className="min-w-0 flex-1"><p className="text-xs font-bold text-muted-foreground">제작 의도 · 이 브라우저에만 저장</p>
+          <p className="mt-1 break-words text-sm font-bold">{intent.goal || "아직 목적을 입력하지 않았어요."}</p>
+          {intent.audience && <p className="mt-1 break-words text-sm text-muted-foreground">대상: {intent.audience}</p>}
+          <p className="mt-1 text-xs text-muted-foreground">AI에는 아직 적용되지 않았어요. 수정해도 설명 재생성이나 기존 편집 덮어쓰기는 실행하지 않습니다.</p>
+        </div>
+        <Button variant="outline" onClick={() => { setIntentDraft({ ...intent }); setIntentError(null); setIntentOpen(true); }}>제작 의도 수정</Button>
+      </section>}
+      <Dialog open={intentOpen} onOpenChange={setIntentOpen}>
+        <DialogContent className="max-h-[90dvh] overflow-y-auto">
+          <DialogHeader><DialogTitle>제작 의도 수정</DialogTitle><DialogDescription>입력 내용을 이 브라우저의 작업 복구 기록에 저장합니다. 서버 저장과 AI 적용은 아직 연결 전입니다.</DialogDescription></DialogHeader>
+          <IntentFields prefix="review-intent" value={intentDraft} error={intentError} onChange={(next) => { setIntentDraft(next); setIntentError(null); }} />
+          <DialogFooter><Button variant="outline" onClick={() => setIntentOpen(false)}>취소</Button><Button onClick={() => {
+            const error = validateGuideIntent(intentDraft);
+            setIntentError(error);
+            if (error) return;
+            if (onIntentSave(readGuideIntent(intentDraft))) setIntentOpen(false);
+          }}>이 브라우저에 저장</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
       <div className="mx-auto grid min-h-[calc(100vh-68px)] max-w-[1540px] lg:grid-cols-[210px_minmax(0,1fr)_300px] xl:grid-cols-[238px_minmax(0,1fr)_330px]">
         <aside className="border-b border-[#dfe3eb] bg-white lg:border-b-0 lg:border-r" aria-label="가이드 단계">
           <div className="hidden items-center justify-between px-4 pb-3 pt-5 lg:flex"><h2 className="text-sm font-black">단계 <span className="text-[#728097]">{steps.length}</span></h2><Button size="icon" variant="ghost" aria-label="단계 추가" onClick={() => toast.info("새 단계는 영상에서 다시 만들 수 있어요.")}><Plus className="size-4" /></Button></div>
@@ -808,11 +725,14 @@ export default function Home() {
   const [processingKind, setProcessingKind] = useState<"sample" | "video">("sample");
   const [processingMessage, setProcessingMessage] = useState<string>();
   const [processingError, setProcessingError] = useState<string | null>(null);
+  const [jobIssue, setJobIssue] = useState<JobIssue | null>(null);
+  const [hasServerStatus, setHasServerStatus] = useState(false);
+  const [checkVersion, setCheckVersion] = useState(0);
   const [retrying, setRetrying] = useState(false);
   const [processingRetryable, setProcessingRetryable] = useState(false);
   const [activeJob, setActiveJob] = useState<ActiveJob | null>(null);
   const [fileName, setFileName] = useState("screen-recording.mp4");
-  const [title, setTitle] = useState(GUIDE_TITLE);
+  const [title, setTitle] = useState(DEFAULT_GUIDE_TITLE);
   const [steps, setSteps] = useState<GuideStep[]>(INITIAL_GUIDE_STEPS);
   const [activeIndex, setActiveIndex] = useState(0);
   const previousMode = useRef<AppMode>("review");
@@ -823,6 +743,10 @@ export default function Home() {
   const retryAbortRef = useRef<AbortController | null>(null);
   const refreshingAssetsRef = useRef(false);
   const lastAssetRefreshAtRef = useRef(0);
+
+  useEffect(() => {
+    document.title = mode === "upload" ? "ShowMe · 화면 안내서 만들기" : `${title.trim() || DEFAULT_GUIDE_TITLE} · ShowMe`;
+  }, [mode, title]);
 
   useEffect(() => {
     stepsRef.current = steps;
@@ -864,6 +788,7 @@ export default function Home() {
           phase: parsed.phase === "deleting" ? "deleting" : "processing",
           startedAt: parsed.startedAt,
           deletionMissingGraceUntil: parsed.deletionMissingGraceUntil,
+          intent: parsed.intent,
         };
         if (parsed.phase === "uploading") {
           // The File object cannot survive a reload. Grant exactly one fresh
@@ -875,9 +800,12 @@ export default function Home() {
           try { window.sessionStorage.setItem(ACTIVE_JOB_SESSION_KEY, restoredJob.guideId); } catch { /* no-op */ }
         }
         setFileName(restoredFileName);
+        setTitle(titleForGuide(parsed.intent));
         setProcessingKind("video");
         setProcessingMessage("이전에 올린 영상의 처리 상태를 확인하고 있어요.");
-        setProgress(12);
+        setProgress(0);
+        setHasServerStatus(false);
+        setJobIssue(null);
         setActiveJob(restoredJob);
         setMode("processing");
       } catch { /* browser storage can be unavailable */ }
@@ -898,16 +826,13 @@ export default function Home() {
         const result = await deleteGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, requestAbort.signal);
         if (stopped) return;
         failures = 0;
-        if (result.missing && Date.now() < (activeJob.deletionMissingGraceUntil ?? 0)) {
-          setProcessingMessage("업로드 취소가 서버에 반영됐는지 다시 확인하고 있어요.");
-          timer = setTimeout(remove, 1_500);
-          return;
-        }
+        setJobIssue(null);
         if (!result.pending) {
           clearActiveJobCredentials(activeJob.guideId);
           setActiveJob(null);
           setProcessingError(null);
           setProcessingRetryable(false);
+          setTitle(DEFAULT_GUIDE_TITLE);
           setMode("upload");
           toast.success("원본 영상과 추출 화면을 삭제했어요.");
           return;
@@ -919,8 +844,11 @@ export default function Home() {
       } catch (error) {
         if (stopped || requestAbort.signal.aborted) return;
         failures += 1;
-        setProcessingMessage(error instanceof Error ? error.message : "개인 영상 삭제를 다시 시도하고 있어요.");
-        timer = setTimeout(remove, Math.min(30_000, 1_500 * 2 ** failures));
+        const issue = jobIssueFor(error, activeJob.startedAt);
+        // A 404 may mean a credential mismatch, never a confirmed deletion.
+        if (error instanceof ProcessorClientError && error.status === 404) issue.autoRetry = false;
+        setJobIssue(issue);
+        if (issue.autoRetry) timer = setTimeout(remove, Math.min(30_000, 1_500 * 2 ** Math.min(failures, 5)));
       }
     };
 
@@ -930,7 +858,7 @@ export default function Home() {
       requestAbort.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [activeJob, mode, processingKind]);
+  }, [activeJob, mode, processingKind, checkVersion]);
 
   useEffect(() => {
     if (mode !== "processing" || processingKind !== "video" || !activeJob || activeJob.phase !== "processing") return;
@@ -945,6 +873,8 @@ export default function Home() {
         const latest = await getGuide(activeJob.baseUrl, activeJob.guideId, activeJob.editToken, requestAbort.signal);
         if (stopped) return;
         failures = 0;
+        setJobIssue(null);
+        setHasServerStatus(true);
         setProcessingError(null);
         setProcessingRetryable(false);
         if (latest.status === "failed") {
@@ -954,8 +884,11 @@ export default function Home() {
         }
         if (latest.status === "ready") {
           setSteps(latest.steps);
+          setTitle(titleForGuide(activeJob.intent, latest.title));
+          setActiveIndex(0);
+          setProgress(100);
           setMode("review");
-          toast.success("가이드 초안이 완성됐어요.");
+          toast.success("장면 추출을 마쳤어요. 화면을 확인해 주세요.");
           return;
         }
         setProcessingMessage(latest.statusMessage || "영상을 처리하고 있어요.");
@@ -966,8 +899,9 @@ export default function Home() {
       } catch (error) {
         if (stopped || requestAbort.signal.aborted) return;
         failures += 1;
-        setProcessingMessage(error instanceof Error ? error.message : "서버의 작업 상태를 확인하고 있어요.");
-        timer = setTimeout(poll, Math.min(30_000, 1_500 * 2 ** failures));
+        const issue = jobIssueFor(error, activeJob.startedAt);
+        setJobIssue(issue);
+        if (issue.autoRetry) timer = setTimeout(poll, Math.min(30_000, 1_500 * 2 ** Math.min(failures, 5)));
       }
     };
 
@@ -977,7 +911,7 @@ export default function Home() {
       requestAbort.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [activeJob, fileName, mode, processingKind]);
+  }, [activeJob, fileName, mode, processingKind, checkVersion]);
 
   const refreshFrameTickets = useCallback(async () => {
     const now = Date.now();
@@ -1060,6 +994,9 @@ export default function Home() {
             throw new Error("먼저 현재 영상 작업을 완료하거나 안전하게 삭제해 주세요.");
           }
           setFileName("showme-example.mp4");
+          setTitle(GUIDE_TITLE);
+          setSteps(INITIAL_GUIDE_STEPS);
+          setJobIssue(null);
           setProcessingKind("sample");
           setProcessingMessage("예시 흐름을 준비하고 있어요.");
           setProcessingError(null);
@@ -1106,17 +1043,21 @@ export default function Home() {
       return;
     }
     if (request.kind === "sample") {
+      setTitle(GUIDE_TITLE);
       setFileName("showme-example.mp4");
       setSteps(INITIAL_GUIDE_STEPS);
       setProcessingKind("sample");
       setProcessingMessage("예시 흐름을 준비하고 있어요.");
       setProcessingError(null);
       setActiveJob(null);
+      setJobIssue(null);
       setProgress(4);
       setMode("processing");
       return;
     }
 
+    const intentError = validateGuideIntent(request.intent);
+    if (intentError) { toast.error(intentError); return; }
     const baseUrl = configuredProcessorUrl();
     if (!baseUrl) {
       toast.error("실제 영상 처리 서버를 연결한 뒤 사용할 수 있어요.");
@@ -1132,6 +1073,7 @@ export default function Home() {
       baseUrl,
       phase: "uploading",
       startedAt: Date.now(),
+      intent: readGuideIntent(request.intent),
     };
     const persistedUploadJob = JSON.stringify({ ...uploadJob, fileName: request.file.name });
     try {
@@ -1147,19 +1089,22 @@ export default function Home() {
     }
 
     setFileName(request.file.name);
+    setTitle(titleForGuide(uploadJob.intent));
     setProcessingKind("video");
     setProcessingMessage("화면 녹화 영상을 안전하게 올리고 있어요.");
     setProcessingError(null);
+    setJobIssue(null);
+    setHasServerStatus(false);
     setProcessingRetryable(false);
     setActiveJob(uploadJob);
-    setProgress(2);
+    setProgress(0);
     setMode("processing");
 
     void createGuide(
       baseUrl,
       request.file,
       identity,
-      (uploadPercent) => setProgress(Math.max(2, Math.min(12, uploadPercent * 0.12))),
+      (uploadPercent) => setProgress(Math.max(0, Math.min(100, uploadPercent))),
       uploadAbort.signal,
     ).then((created) => {
       if (created.guideId !== identity.guideId) throw new Error("업로드 식별자가 일치하지 않아요.");
@@ -1167,7 +1112,7 @@ export default function Home() {
       uploadAbortRef.current = null;
       const job: ActiveJob = { ...uploadJob, phase: "processing" };
       setActiveJob(job);
-      setProgress(14);
+      setProgress(0);
       setProcessingMessage("업로드가 끝났어요. 영상 방향과 장면을 확인하고 있어요.");
       try {
         persistActiveJob(job, request.file.name);
@@ -1191,6 +1136,7 @@ export default function Home() {
       }
       const uncertainJob: ActiveJob = { ...uploadJob, phase: "processing", startedAt: Date.now() };
       setActiveJob(uncertainJob);
+      setJobIssue(jobIssueFor(error, uncertainJob.startedAt));
       setProcessingMessage("업로드 응답이 끊겨 서버의 작업 상태를 다시 확인하고 있어요.");
       try {
         persistActiveJob(uncertainJob, request.file.name);
@@ -1207,6 +1153,7 @@ export default function Home() {
       toast.info("개인 영상을 안전하게 삭제하고 있어요.");
       return;
     }
+    toast.dismiss();
     const deletingJob: ActiveJob = {
       ...activeJob,
       phase: "deleting",
@@ -1218,9 +1165,10 @@ export default function Home() {
     retryAbortRef.current?.abort();
     retryAbortRef.current = null;
     setProcessingError(null);
+    setJobIssue(null);
     setProcessingRetryable(false);
     setActiveJob(deletingJob);
-    setProgress((current) => Math.max(current, 12));
+    setProgress(0);
     setProcessingMessage("서버 작업을 멈추고 개인 영상을 안전하게 삭제하고 있어요.");
     try {
       persistRecoverableCredentials(
@@ -1252,6 +1200,8 @@ export default function Home() {
         activeJobRef.current.phase === "deleting"
       ) return;
       setProcessingError(null);
+      setJobIssue(null);
+      setHasServerStatus(false);
       setProcessingRetryable(false);
       setProcessingMessage("원본 영상으로 다시 처리하고 있어요.");
       setProgress(16);
@@ -1274,14 +1224,28 @@ export default function Home() {
 
   const publishGuide = () => {
     try {
-      window.localStorage.setItem("showme:published-guide", JSON.stringify({ title: title.trim() || GUIDE_TITLE, steps }));
+      window.localStorage.setItem("showme:published-guide", JSON.stringify({ title: title.trim() || DEFAULT_GUIDE_TITLE, steps }));
     } catch {
       // The in-app preview still works when browser storage is unavailable.
     }
     setMode("published");
   };
 
-  const previewTitle = useMemo(() => title.trim() || GUIDE_TITLE, [title]);
+  const previewTitle = useMemo(() => title.trim() || DEFAULT_GUIDE_TITLE, [title]);
+
+  const saveIntent = (intent: GuideIntent): boolean => {
+    if (!activeJob || activeJob.phase === "deleting") return false;
+    try {
+      const next = saveJobIntent(window.localStorage, activeJob, fileName, intent);
+      activeJobRef.current = next;
+      setActiveJob(next);
+      toast.success("제작 의도를 이 브라우저에 저장했어요. AI 재생성은 실행하지 않았어요.");
+      return true;
+    } catch {
+      toast.error("제작 의도를 저장하지 못했어요. 기존 기록과 편집 내용은 유지됩니다.");
+      return false;
+    }
+  };
 
   if (mode === "viewer") {
     return <PublicGuide title={previewTitle} steps={steps} onExit={() => setMode(previousMode.current)} />;
@@ -1291,15 +1255,18 @@ export default function Home() {
     <>
       {mode === "upload" && <UploadScreen onStart={start} />}
       {mode === "processing" && (
-        <ProcessingScreen
+        <JobProgress
+          phase={activeJob?.phase === "deleting" ? "deleting" : processingError ? "failed" : processingKind === "sample" ? "sample" : activeJob?.phase === "uploading" ? "uploading" : hasServerStatus ? "processing" : "checking"}
           progress={progress}
           fileName={fileName}
-          statusMessage={processingMessage}
+          message={processingMessage}
+          issue={jobIssue}
           errorMessage={processingError}
           onCancel={cancelProcessing}
           onRetry={processingError && activeJob && processingRetryable ? retryProcessing : undefined}
           retrying={retrying}
-          cancelLabel={activeJob?.phase === "deleting" ? "삭제 중…" : activeJob?.phase === "processing" ? "삭제하고 나가기" : "다른 영상 선택"}
+          canCancel={Boolean(activeJob)}
+          onCheck={() => { setJobIssue(null); setHasServerStatus(false); setCheckVersion((value) => value + 1); }}
         />
       )}
       {mode === "review" && (
@@ -1315,6 +1282,8 @@ export default function Home() {
           onDeleteDraft={cancelProcessing}
           isLiveDraft={processingKind === "video"}
           onFrameError={() => { void refreshFrameTickets(); }}
+          intent={activeJob?.intent ?? EMPTY_INTENT}
+          onIntentSave={saveIntent}
         />
       )}
       {mode === "published" && (
