@@ -1,3 +1,4 @@
+import { privateLogError } from "./private-log.js";
 import { randomUUID } from "node:crypto";
 
 import type { Guide, GuideRepository } from "./domain.js";
@@ -139,7 +140,7 @@ export class DurableProcessingDispatcher {
         event: "durable_dispatch_failed",
         consecutiveFailures: this.consecutiveFailures,
         retryInMs: delayMs,
-        message: error instanceof Error ? error.message : String(error),
+        message: privateLogError(error),
       }));
       this.schedule(delayMs);
     }

@@ -1,3 +1,4 @@
+import { privateLogError } from "./private-log.js";
 export type QueueTask = () => Promise<void>;
 
 export class QueueCapacityError extends Error {
@@ -69,7 +70,7 @@ export class ProcessingQueue {
       void next
         .task()
         .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = privateLogError(error);
           console.error(JSON.stringify({ event: "queue_task_failed", key: next.key, message }));
         })
         .finally(() => {

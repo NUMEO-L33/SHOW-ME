@@ -52,12 +52,13 @@ test("deletion errors never masquerade as success, and manual check is explicitl
   assert.doesNotMatch(html, /삭제했어요|12%|<progress/);
 });
 
-test("checking and failed states omit old progress; upload progress is explicitly transmission only", () => {
+test("checking, failed and redirect-safe uploads never invent a percentage", () => {
   assert.doesNotMatch(render({ phase: "checking" }), /<progress|12%/);
   assert.doesNotMatch(render({ phase: "failed", errorMessage: "처리 실패" }), /<progress|12%/);
   const uploading = render({ phase: "uploading", progress: 100 });
   assert.match(uploading, /파일 전송/);
-  assert.match(uploading, /서버 접수 완료를 의미하지는 않습니다/);
+  assert.match(uploading, /정확한 전송률은 제공하지 않습니다/);
+  assert.doesNotMatch(uploading, /<progress|100%/);
 });
 
 test("intent form has labelled bounded fields, describes private draft storage and does not claim AI use", () => {

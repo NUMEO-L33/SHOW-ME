@@ -1,4 +1,5 @@
 import type { GuideStep } from "@/lib/showme-data";
+import { privateApiDestination, privateProcessorOrigin } from "./private-destination.js";
 
 export type ProcessorStatus =
   | "uploading"
@@ -83,26 +84,8 @@ function normalizedBaseUrl(baseUrl: string) {
 }
 
 export function configuredProcessorUrl() {
-  const configured = import.meta.env.VITE_SHOWME_PROCESSOR_URL?.trim();
-  if (configured) {
-    try {
-      const target = new URL(configured);
-      if (!["http:", "https:"].includes(target.protocol) || target.username || target.password) return null;
-      if (typeof window !== "undefined") {
-        const pageIsLocal = ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
-        const targetIsLocal = ["localhost", "127.0.0.1", "::1"].includes(target.hostname);
-        if (!pageIsLocal && targetIsLocal) return null;
-        if (window.location.protocol === "https:" && target.protocol !== "https:") return null;
-      }
-      return normalizedBaseUrl(target.toString());
-    } catch {
-      return null;
-    }
-  }
-  if (typeof window !== "undefined") {
-    return window.location.origin;
-  }
-  return "";
+  const configured = import.meta.env?.VITE_SHOWME_PROCESSOR_URL?.trim();
+  return privateProcessorOrigin(configured || (typeof window === "undefined" ? "" : window.location.origin));
 }
 
 export function createUploadIdentity(): UploadIdentity {
@@ -129,52 +112,28 @@ function errorFromPayload(status: number, payload: unknown) {
   return new ProcessorClientError("영상 처리 서버에 연결하지 못했어요.", status);
 }
 
-export function createGuide(
+export async function createGuide(
   baseUrl: string,
   file: File,
   identity: UploadIdentity,
   onUploadProgress: (percent: number) => void,
   signal?: AbortSignal,
 ) {
-  return new Promise<CreatedGuide>((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    const form = new FormData();
-    form.append("video", file, file.name);
-
-    const abort = () => request.abort();
-    signal?.addEventListener("abort", abort, { once: true });
-
-    request.open("POST", `${normalizedBaseUrl(baseUrl)}/api/guides`);
-    request.setRequestHeader("Authorization", `Bearer ${identity.editToken}`);
-    request.setRequestHeader("X-ShowMe-Guide-Id", identity.guideId);
-    request.responseType = "json";
-    request.timeout = 20 * 60 * 1000;
-    request.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) onUploadProgress((event.loaded / event.total) * 100);
-    });
-    request.addEventListener("load", () => {
-      signal?.removeEventListener("abort", abort);
-      const body = request.response as unknown;
-      if (request.status >= 200 && request.status < 300) {
-        resolve(body as CreatedGuide);
-      } else {
-        reject(errorFromPayload(request.status, body));
-      }
-    });
-    request.addEventListener("error", () => {
-      signal?.removeEventListener("abort", abort);
-      reject(new ProcessorClientError("영상 처리 서버에 연결하지 못했어요."));
-    });
-    request.addEventListener("timeout", () => {
-      signal?.removeEventListener("abort", abort);
-      reject(new ProcessorClientError("영상 업로드 시간이 초과됐어요. 다시 시도해 주세요."));
-    });
-    request.addEventListener("abort", () => {
-      signal?.removeEventListener("abort", abort);
-      reject(new DOMException("업로드를 취소했습니다.", "AbortError"));
-    });
-    request.send(form);
-  });
+  const form = new FormData();
+  form.append("video", file, file.name);
+  // XHR follows redirects before load/error handlers can inspect them. Fetch
+  // rejects the redirect itself; never forward private video to its Location.
+  // Fetch has no portable upload progress event. Do not invent percentages.
+  const created = await boundedRequest(`${normalizedBaseUrl(baseUrl)}/api/guides`, {
+    method: "POST", body: form, signal,
+    headers: { Authorization: `Bearer ${identity.editToken}`, "X-ShowMe-Guide-Id": identity.guideId },
+  }, async response => {
+    const body = await readJson(response) as Partial<CreatedGuide> | null;
+    if (body?.guideId !== identity.guideId || !["uploading", "queued", "probing", "extracting", "ready", "failed"].includes(body?.status ?? "")) invalidResponse();
+    return body as CreatedGuide;
+  }, 20 * 60_000);
+  onUploadProgress(100);
+  return created;
 }
 
 async function readJson(response: Response) {
@@ -189,15 +148,19 @@ function invalidResponse(): never {
 
 // Include body reading in the deadline; a connected but stalled response must
 // not leave the UI in an unbounded wait. Never expose request URLs or tokens.
-export async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+export async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>, timeoutMs = 15_000): Promise<T> {
+  const destination = privateApiDestination(url);
+  if (!destination) throw new ProcessorClientError("다른 주소로의 전송을 차단했어요. 이 앱과 같은 주소의 서버만 사용할 수 있습니다.", undefined, "PRIVATE_DESTINATION_BLOCKED");
+  options.signal?.throwIfAborted();
   const abort = new AbortController();
   const cancel = () => abort.abort();
   if (options.signal?.aborted) abort.abort();
   else options.signal?.addEventListener("abort", cancel, { once: true });
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; abort.abort(); }, 15_000);
+  const timer = setTimeout(() => { timedOut = true; abort.abort(); }, timeoutMs);
   try {
-    return await read(await fetch(url, { ...options, signal: abort.signal, redirect: "error" }));
+    return await read(await fetch(destination, { ...options, signal: abort.signal, redirect: "error",
+      mode: "same-origin", credentials: "same-origin", referrerPolicy: "no-referrer", cache: "no-store" }));
   } catch (error) {
     if (timedOut) throw new ProcessorClientError("서버 응답 시간이 초과됐어요.", undefined, "REQUEST_TIMEOUT");
     throw error;
@@ -208,16 +171,23 @@ export async function boundedRequest<T>(url: string, options: RequestInit, read:
 }
 
 function withAbsoluteAssetUrls(baseUrl: string, guide: ProcessorGuide): ProcessorGuide {
+  const origin = privateProcessorOrigin(baseUrl);
+  if (!origin) invalidResponse();
+  const assetUrl = (value: string | undefined, stepId: string, variant: string) => {
+    if (!value) return undefined;
+    const expectedPath = `/api/guides/${encodeURIComponent(guide.id)}/assets/${encodeURIComponent(stepId)}/${variant}`;
+    if (typeof value !== "string" || /\s|\\/.test(value) || !value.startsWith(`${expectedPath}?`) && value !== expectedPath) invalidResponse();
+    const target = new URL(value, origin);
+    if (target.origin !== origin || target.pathname !== expectedPath || target.hash ||
+        [...target.searchParams.keys()].some(key => key !== "asset_token")) invalidResponse();
+    return target.href;
+  };
   return {
     ...guide,
     steps: guide.steps.map((step) => ({
       ...step,
-      frameUrl: step.frameUrl
-        ? `${normalizedBaseUrl(baseUrl)}${step.frameUrl}`
-        : undefined,
-      thumbnailUrl: step.thumbnailUrl
-        ? `${normalizedBaseUrl(baseUrl)}${step.thumbnailUrl}`
-        : undefined,
+      frameUrl: assetUrl(step.frameUrl, String(step.id), "frame"),
+      thumbnailUrl: assetUrl(step.thumbnailUrl, String(step.id), "thumbnail"),
     })),
   };
 }
@@ -242,12 +212,11 @@ export async function getGuide(baseUrl: string, guideId: string, editToken: stri
 }
 
 export async function retryGuide(baseUrl: string, guideId: string, editToken: string, signal?: AbortSignal) {
-  const response = await fetch(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}/retry`, {
+  return boundedRequest(`${normalizedBaseUrl(baseUrl)}/api/guides/${encodeURIComponent(guideId)}/retry`, {
     method: "POST",
     headers: { Authorization: `Bearer ${editToken}` },
     signal,
-  });
-  return (await readJson(response)) as { status: ProcessorStatus };
+  }, async response => (await readJson(response)) as { status: ProcessorStatus });
 }
 
 export async function deleteGuide(baseUrl: string, guideId: string, editToken: string, signal?: AbortSignal) {

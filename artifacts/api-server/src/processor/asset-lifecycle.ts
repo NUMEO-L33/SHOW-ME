@@ -1,3 +1,4 @@
+import { privateLogError } from "./private-log.js";
 import { rm } from "node:fs/promises";
 
 import type { DeleteGuideOptions, Guide, GuideRepository, GuideWithSteps } from "./domain.js";
@@ -101,7 +102,7 @@ export async function putPrivateAsset(
         console.error(JSON.stringify({
           event: "late_private_asset_cleanup_failed",
           key,
-          message: lateError instanceof Error ? lateError.message : String(lateError),
+          message: privateLogError(lateError),
         }));
       });
     }
@@ -153,7 +154,7 @@ export async function materializePrivateAsset(
         console.error(JSON.stringify({
           event: "late_private_materialization_cleanup_failed",
           key,
-          message: lateError instanceof Error ? lateError.message : String(lateError),
+          message: privateLogError(lateError),
         }));
       });
     }
@@ -288,7 +289,7 @@ export function deferActiveGuideDeletion(
       console.error(JSON.stringify({
         event: "active_deletion_heartbeat_failed",
         guideId: guide.id,
-        message: error instanceof Error ? error.message : String(error),
+        message: privateLogError(error),
       }));
     }).finally(() => { heartbeatInFlight = undefined; });
   }, 10_000);
@@ -308,7 +309,7 @@ export function deferActiveGuideDeletion(
     console.error(JSON.stringify({
       event: "deferred_private_guide_deletion_failed",
       guideId: guide.id,
-      message: error instanceof Error ? error.message : String(error),
+      message: privateLogError(error),
     }));
     // Keep the durable ACTIVE row. The lifecycle sweeper retries after grace.
   });

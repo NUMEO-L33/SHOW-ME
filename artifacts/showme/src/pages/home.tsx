@@ -139,6 +139,12 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
   const [intent, setIntent] = useState<GuideIntent>({ ...EMPTY_INTENT });
   const [intentError, setIntentError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const discardSelected = () => { setFile(null); if (inputRef.current) inputRef.current.value = ""; };
+    window.addEventListener("pagehide", discardSelected);
+    return () => window.removeEventListener("pagehide", discardSelected);
+  }, []);
+
   const chooseFile = (nextFile?: File) => {
     if (!nextFile) return;
     const supported = ["video/mp4", "video/quicktime", "video/webm"].includes(nextFile.type) || /\.(mp4|mov|webm)$/i.test(nextFile.name);
@@ -243,6 +249,10 @@ function UploadScreen({ onStart }: { onStart: (request: StartRequest) => void })
                 onError={(message) => toast.error(message)}
               />
             </div>
+            <p className="mt-3 px-1 text-xs leading-5 text-muted-foreground">녹화·파일 선택만으로는 영상을 전송하지 않아요. ‘장면 추출 시작’을 누르면 원본 영상과 추출 화면을 이 앱의 Replit 서버·저장소에서 처리·보관합니다. 외부 AI 전송과 공개 공유는 하지 않습니다.</p>
+            {file && <Button type="button" variant="ghost" className="mt-1" onClick={() => {
+              setFile(null); if (inputRef.current) inputRef.current.value = "";
+            }}>선택한 영상 비우기</Button>}
             {file && <div className="mt-5 rounded-2xl border border-[#e0e5f0] bg-[#f8faff] p-4 sm:p-5">
               <IntentFields prefix="upload-intent" value={intent} error={intentError}
                 onChange={(next) => { setIntent(next); setIntentError(null); }} />

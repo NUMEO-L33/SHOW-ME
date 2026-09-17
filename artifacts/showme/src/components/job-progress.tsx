@@ -19,7 +19,7 @@ export type JobProgressProps = {
 export function JobProgress({ phase, fileName, progress, message, issue, errorMessage, onCancel, onCheck, onRetry, retrying, canCancel }: JobProgressProps) {
   const deleting = phase === "deleting";
   const failed = Boolean(errorMessage);
-  const showProgress = !deleting && !issue && !failed && phase !== "checking";
+  const showProgress = !deleting && !issue && !failed && phase !== "checking" && phase !== "uploading";
   const title = deleting ? "원본 영상과 추출 화면을 삭제하고 있어요"
     : failed ? "영상을 처리하지 못했어요"
     : issue ? issue.title
@@ -47,11 +47,11 @@ export function JobProgress({ phase, fileName, progress, message, issue, errorMe
           {issue && <p>{issue.autoRetry ? "기존 작업에 자동으로 다시 연결합니다." : "자동 조회를 멈췄어요. 연결을 확인한 뒤 아래 버튼으로 다시 조회할 수 있어요."}</p>}
           {!deleting && phase !== "sample" && !issue && !failed && <p>현재는 장면 추출 단계입니다. AI 설명·누를 위치·개인정보 분석은 아직 실행하지 않습니다.</p>}
           {phase === "sample" && <p>실제 파일을 업로드하거나 분석하지 않는 예시입니다.</p>}
+          {phase === "uploading" && !issue && !failed && <p>파일 전송과 서버 접수 응답을 기다리고 있어요. 정확한 전송률은 제공하지 않습니다.</p>}
         </div>
         {showProgress && <div className="mt-7">
-          <div className="mb-2 flex justify-between text-sm font-bold"><span>{phase === "uploading" ? "파일 전송" : phase === "sample" ? "예시 화면 준비" : "서버가 보고한 진행률"}</span><span>{percent}%</span></div>
-          <progress className="h-3 w-full overflow-hidden rounded-full accent-[#4f6df5]" value={percent} max={100} aria-label={phase === "uploading" ? "파일 전송률" : "보고된 진행률"} />
-          {phase === "uploading" && <p className="mt-2 text-xs text-muted-foreground">전송률 100%가 서버 접수 완료를 의미하지는 않습니다.</p>}
+          <div className="mb-2 flex justify-between text-sm font-bold"><span>{phase === "sample" ? "예시 화면 준비" : "서버가 보고한 진행률"}</span><span>{percent}%</span></div>
+          <progress className="h-3 w-full overflow-hidden rounded-full accent-[#4f6df5]" value={percent} max={100} aria-label="보고된 진행률" />
         </div>}
         <div className="mt-8 flex flex-wrap gap-3 border-t border-[#eaedf2] pt-5">
           {issue && !issue.autoRetry && <button type="button" className="min-h-11 rounded-xl bg-[#172033] px-4 text-sm font-bold text-white" onClick={onCheck}>{deleting ? "삭제 다시 확인" : "상태 다시 확인"}</button>}

@@ -336,7 +336,7 @@ function serializeGuide(guide: GuideWithSteps, assetToken: string, maxAttempts: 
 async function streamAsset(response: Response, storage: Storage, key: string) {
   const stream = await storage.openRead(key);
   response.setHeader("Content-Type", "image/jpeg");
-  response.setHeader("Cache-Control", "private, max-age=300");
+  response.setHeader("Cache-Control", "no-store");
   stream.once("error", () => {
     if (!response.headersSent) response.status(404).json({ error: "화면 이미지를 찾을 수 없어요.", code: "ASSET_NOT_FOUND" });
     else response.destroy();
@@ -359,6 +359,13 @@ export function createProcessorApp({
     : randomBytes(32);
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
+  app.use((_request, response, next) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("Referrer-Policy", "no-referrer");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    next();
+  });
   app.use(cors({
     origin(origin, callback) {
       if (!origin || config.corsOrigins.includes("*") || config.corsOrigins.includes(origin)) callback(null, true);
@@ -903,7 +910,7 @@ export function createProcessorApp({
     const code = error instanceof HttpError ? error.code : "INTERNAL_ERROR";
     const message = error instanceof HttpError ? error.message : "서버에서 요청을 처리하지 못했어요.";
     if (status >= 500) {
-      console.error(JSON.stringify({ event: "http_error", code, message: error instanceof Error ? error.message : String(error) }));
+      console.error(JSON.stringify({ event: "http_error", code, message }));
     }
     response.status(status).json({ error: message, code });
   });

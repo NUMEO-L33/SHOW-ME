@@ -1,3 +1,4 @@
+import { privateLogError } from "./private-log.js";
 import { extname, join } from "node:path";
 import { mkdir, rm, rmdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -311,7 +312,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
           guideId: id,
           attemptId,
           attemptCount,
-          message: stateError instanceof Error ? stateError.message : String(stateError),
+          message: privateLogError(stateError),
         }));
         // A successful COMMIT can lose its acknowledgement. Preserve assets
         // until a later dispatcher/deletion pass can establish durable state.
@@ -340,7 +341,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
           guideId: id,
           attemptId,
           attemptCount,
-          message: caught instanceof Error ? caught.message : String(caught),
+          message: privateLogError(caught),
         }));
       }
       if (
@@ -391,7 +392,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
               guideId: id,
               attemptId,
               attemptCount,
-              message: caught instanceof Error ? caught.message : String(caught),
+              message: privateLogError(caught),
             }));
           }
         }
@@ -428,7 +429,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
               guideId: id,
               attemptId,
               attemptCount,
-              message: caught instanceof Error ? caught.message : String(caught),
+              message: privateLogError(caught),
             }));
             throw caught;
           }
@@ -448,7 +449,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
         attemptId,
         attemptCount,
         code: failure.code,
-        message: error instanceof Error ? error.message : String(error),
+        message: privateLogError(error),
       }));
       throw cleanupError ?? error;
     } finally {
@@ -461,7 +462,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
           guideId: id,
           attemptId,
           attemptCount,
-          message: error instanceof Error ? error.message : String(error),
+          message: privateLogError(error),
         }));
       }
       try {
@@ -471,7 +472,7 @@ export function createGuidePipeline({ config, repository, storage }: PipelineDep
           console.error(JSON.stringify({
             event: "guide_work_parent_cleanup_failed",
             guideId: id,
-            message: error instanceof Error ? error.message : String(error),
+            message: privateLogError(error),
           }));
         }
       }

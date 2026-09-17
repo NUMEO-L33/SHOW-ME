@@ -619,7 +619,10 @@ test("frame and thumbnail assets require the matching guide edit token", async (
     .set("Authorization", `Bearer ${owner.editToken}`)
     .expect(200)
     .expect("Content-Type", /image\/jpeg/)
-    .expect("Cache-Control", "private, max-age=300");
+    .expect("Cache-Control", "no-store")
+    .expect("Referrer-Policy", "no-referrer")
+    .expect("X-Content-Type-Options", "nosniff")
+    .expect("Cross-Origin-Resource-Policy", "same-origin");
   assert.deepEqual(frameResponse.body, frameBytes);
 
   const thumbnailResponse = await request(app)

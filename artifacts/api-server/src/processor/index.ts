@@ -1,3 +1,4 @@
+import { privateLogError } from "./private-log.js";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Server } from "node:http";
@@ -109,7 +110,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
       }).catch((error: unknown) => {
         console.error(JSON.stringify({
           event: "private_asset_lifecycle_sweep_failed",
-          message: error instanceof Error ? error.message : String(error),
+          message: privateLogError(error),
         }));
       }).finally(() => {
         if (lifecycleSweepPromise === sweep) lifecycleSweepPromise = undefined;
@@ -255,7 +256,7 @@ export async function cleanupPrivateAssetLifecycle(
       console.error(JSON.stringify({
         event: "private_guide_deletion_failed",
         guideId: guide.id,
-        message: error instanceof Error ? error.message : String(error),
+        message: privateLogError(error),
       }));
       try {
         // Move a repeatedly failing row to the tail of its lifecycle class.
@@ -418,14 +419,14 @@ if (process.env.NODE_ENV !== "test") {
       if (closing) return;
       closing = true;
       void close().then(() => process.exit(0)).catch((error: unknown) => {
-        console.error(JSON.stringify({ event: "processor_shutdown_failed", message: error instanceof Error ? error.message : String(error) }));
+        console.error(JSON.stringify({ event: "processor_shutdown_failed", message: privateLogError(error) }));
         process.exit(1);
       });
     };
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   }).catch((error: unknown) => {
-    console.error(JSON.stringify({ event: "processor_start_failed", message: error instanceof Error ? error.message : String(error) }));
+    console.error(JSON.stringify({ event: "processor_start_failed", message: privateLogError(error) }));
     process.exitCode = 1;
   });
 }

@@ -9,6 +9,11 @@ export type JobIssue = {
 
 export function jobIssueFor(error: unknown, startedAt: number, now = Date.now()): JobIssue {
   if (error instanceof ProcessorClientError) {
+    if (error.code === "PRIVATE_DESTINATION_BLOCKED") return {
+      title: "다른 주소로의 전송을 차단했어요",
+      message: "영상과 접근 키는 현재 앱과 같은 주소로만 보냅니다. 기존 복구 기록은 유지했어요. 서버 연결 설정을 확인해 주세요.",
+      autoRetry: false,
+    };
     if (error.status === 404) return {
       title: "작업을 찾을 수 없어요",
       message: "업로드가 접수되지 않았거나 이 작업의 접근 권한을 확인할 수 없어요. 작업이 삭제됐다는 뜻은 아닙니다. 복구 기록은 유지하며, 새 영상을 자동으로 올리지 않습니다.",
