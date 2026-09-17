@@ -51,6 +51,14 @@ Gemini 시험 화면 두 장은 보존된 코드의 픽셀/글꼴 알고리즘�
 
 테스트 실행을 관리하는 부모 프로세스의 `decoderCount: 0` 기록도 나올 수 있다. 실패 정보와 0이 아닌 해독 기록을 함께 확인한다. 손상 JPEG와 없는 실행 파일을 거부하는 음성 검사도 있으므로 모든 비정상 해독 종료가 제품 결함이라는 뜻은 아니다. 관찰 자체의 타이밍 영향을 완전히 배제하는 수단은 아니며, 이 명령의 통과를 기본 검사 또는 원인 해결의 증거로 대체하지 않는다. 프로세스 상태의 의미는 [Node 24 진단 채널](https://nodejs.org/download/release/v24.13.0/docs/api/diagnostics_channel.html#event-child_process)과 [수신 바이트 카운터](https://nodejs.org/download/release/v24.13.0/docs/api/net.html#socketbytesread)를 따른다.
 
+### Linux 정체 시점의 운영체제 상태
+
+진단 실행에서 3.5초 정체가 발생하면 추가로 `IMAGE_PROCESS_OS_STATE`를 기록한다. Linux에서 해당 실행이 만든 살아 있는 해독 자식의 `/proc/<pid>/stat`, `status`, `wchan`만 최대 4 KiB씩 비동기로 읽는다. PID·부모 PID·시작 시각을 앞뒤로 확인하고 종료/신원 변경 시 표본을 폐기한다. 명령 이름·PID·경로·환경·메모리 내용은 출력하지 않는다. 다른 프로세스를 열거하지 않으며 `/proc`에 쓰지 않는다.
+
+기록은 상태 문자, CPU 누적 tick, 페이지 폴트 수, 스레드 수, RSS, 문맥 교환 수, 공개된 커널 대기 함수 이름에 한정한다. 누락/접근 제한은 `null` 또는 `available: false`이며 0으로 바꾸지 않는다. tick을 밀리초로 가정하지 않는다. `wchan`의 0도 정상 실행으로 해석하지 않는다. `sampleMs`는 비동기 표본 수집 시간이고 파일 간 값은 원자적 스냅샷이 아니다. CPU 누적값·대기 함수 한 번만으로 원인을 확정할 수 없다. 형식은 [Linux proc 문서](https://docs.kernel.org/filesystems/proc.html)를 따른다.
+
+입력 `inputFinished: true`는 부모 쪽 스트림 쓰기 완료이며 FFmpeg가 실제로 입력을 읽었다는 증거는 아니다. 이 진단은 FFmpeg 사전 실행, 시간 제한 연장, 실패 무시를 하지 않는다. Windows에서는 Linux 표본을 수집하지 않고 명시적으로 `not-linux`를 출력한다.
+
 ## 별도 검증
 
 PostgreSQL 통합 검사는 `artifacts/api-server/scripts/verify-postgres.mjs`로 분리했다. 기본 검사에는 포함되지 않는다. 명시적인 로컬 Docker 호스트, 기존 이미지, 임의 이름·암호·tmpfs·루프백 주소인 일회용 DB만 허용하며 실제 `DATABASE_URL`을 사용하지 않는다. 실행 후 해당 시험의 소유권을 확인해 컨테이너만 정리한다.

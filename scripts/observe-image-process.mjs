@@ -2,6 +2,7 @@
 // https://nodejs.org/download/release/v24.13.0/docs/api/diagnostics_channel.html#event-child_process
 import { subscribe } from "node:diagnostics_channel";
 import { writeSync } from "node:fs";
+import { captureLinuxChildState } from "./image-process-linux.mjs";
 
 const records = [];
 const isDecoder = (child) => Array.isArray(child.spawnargs) &&
@@ -30,7 +31,17 @@ subscribe("child_process", ({ process: child }) => {
   records.push(record);
   const timer = setTimeout(() => {
     if (!isDecoder(child) || child.exitCode !== null || child.signalCode !== null || child.killed) return;
-    emit("IMAGE_PROCESS_WAIT", snapshot(record, records.filter(({ child: item }) => isDecoder(item)).indexOf(record)));
+    const index = records.filter(({ child: item }) => isDecoder(item)).indexOf(record);
+    emit("IMAGE_PROCESS_WAIT", snapshot(record, index));
+    // Async, bounded /proc metadata reads only after a stall. No warm-up, pipe
+    // consumption, child listeners or changes to the existing 4.5s deadline.
+    const sampleStarted = performance.now();
+    void captureLinuxChildState(child).then((os) => {
+      emit("IMAGE_PROCESS_OS_STATE", {
+        index, elapsedMs: Math.round(performance.now() - record.started),
+        sampleMs: Math.round(performance.now() - sampleStarted), os,
+      });
+    }, () => emit("IMAGE_PROCESS_OS_STATE", { index, os: { available: false, reason: "sample-failed" } }));
   }, 3500);
   timer.unref();
 });
