@@ -87,6 +87,17 @@ async function fixture(t: TestContext, migrate = true) {
   return { pool, repository, seed, fund, begin, rows, connection: connection.toString() };
 }
 
+async function waitForFixtureLocks(pool: Pool, count: number) {
+  for (let i = 0; i < 250; i++) {
+    const row = (await pool.query(`SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock'`,
+    [`showme-b5-${run}`])).rows[0];
+    if (row.n >= count) return;
+    await delay(10);
+  }
+  assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
+}
+
 test("real PostgreSQL: saved drafts fence expiry, legacy drafts filter before LIMIT, and retention updates roll back", async t => {
   const h = await fixture(t);
   const { guide } = await h.seed();
@@ -99,6 +110,9 @@ test("real PostgreSQL: saved drafts fence expiry, legacy drafts filter before LI
   assert.equal(saved?.draft?.revision, 1);
   const parent = (await h.repository.getGuideById("guide"))!;
   assert.equal(parent.updatedAt, saved!.draft!.updatedAt);
+  const savedAt = saved!.draft!.updatedAt;
+  assert.deepEqual(await h.repository.listExpiredDrafts(new Date(Date.parse(savedAt) - 1).toISOString(), ["DELETION_PENDING"]), []);
+  assert.deepEqual((await h.repository.listExpiredDrafts(savedAt, ["DELETION_PENDING"])).map(g => g.id), ["guide"]);
   assert.equal(await h.repository.updateStatus("guide", "failed", {
     expectedStatuses: ["ready"], expectedUpdatedAt: stale.updatedAt, errorCode: "DELETION_PENDING",
   }), null);
@@ -122,6 +136,90 @@ test("real PostgreSQL: saved drafts fence expiry, legacy drafts filter before LI
   await h.repository.updateStatus("expired", "failed", { errorCode: "DELETION_PENDING" });
   await h.pool.query("UPDATE guides SET updated_at = now() - interval '8 days' WHERE id = 'expired'");
   assert.deepEqual(await h.repository.listExpiredDrafts(cutoff, ["DELETION_PENDING"], 1), []);
+});
+
+for (const first of ["save", "expiry"] as const) {
+  test(`real PostgreSQL: ${first} first on the actual parent lock fences the competing retention operation`, async t => {
+    const h = await fixture(t);
+    const { guide } = await h.seed();
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60_000).toISOString();
+    await h.pool.query("UPDATE guides SET updated_at=$1::timestamptz WHERE id='guide'", [oldAt]);
+    const manifest = analysisManifest(guide);
+    const command = { type: "save-editor-draft" as const, expectedRevision: 0,
+      expectedInputFingerprint: manifest.fingerprint, document: initialDraft(manifest) };
+    const save = () => h.repository.executeAnalysisCommand("guide", command);
+    const expire = () => h.repository.updateStatus("guide", "failed", {
+      expectedStatuses: ["ready"], expectedUpdatedAt: oldAt, errorCode: "DELETION_PENDING",
+    });
+    const blocker = await h.pool.connect();
+    const pending: Promise<unknown>[] = [];
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM guides WHERE id='guide' FOR UPDATE");
+      let saving: ReturnType<typeof save>;
+      let expiring: ReturnType<typeof expire>;
+      if (first === "save") {
+        saving = save(); pending.push(saving); void saving.catch(() => undefined);
+        await waitForFixtureLocks(h.pool, 1);
+        expiring = expire(); pending.push(expiring); void expiring.catch(() => undefined);
+      } else {
+        expiring = expire(); pending.push(expiring); void expiring.catch(() => undefined);
+        await waitForFixtureLocks(h.pool, 1);
+        saving = save(); pending.push(saving); void saving.catch(() => undefined);
+      }
+      await waitForFixtureLocks(h.pool, 2);
+      await blocker.query("COMMIT");
+      const [saved, expired] = await Promise.all([saving, expiring]);
+      const parent = (await h.repository.getGuideById("guide"))!;
+      if (first === "save") {
+        assert.equal(saved?.draft?.revision, 1);
+        assert.equal(expired, null);
+        assert.equal(parent.status, "ready");
+        assert.equal(parent.updatedAt, saved!.draft!.updatedAt);
+        assert.deepEqual((await h.repository.getAnalysisState("guide"))?.draft, saved?.draft);
+      } else {
+        assert.equal(saved, null);
+        assert.equal(expired?.errorCode, "DELETION_PENDING");
+        assert.equal(parent.status, "failed");
+        assert.equal(parent.updatedAt, expired!.updatedAt);
+        assert.equal((await h.repository.getAnalysisState("guide"))?.draft, null);
+      }
+    } finally {
+      try { await blocker.query("ROLLBACK"); } finally { blocker.release(); }
+      await Promise.allSettled(pending);
+    }
+  });
+}
+
+test("real PostgreSQL: twenty simultaneous editor saves commit one revision and one matching retention timestamp", async t => {
+  const h = await fixture(t);
+  const { guide } = await h.seed();
+  const manifest = analysisManifest(guide);
+  const blocker = await h.pool.connect();
+  const pending: ReturnType<typeof h.repository.executeAnalysisCommand>[] = [];
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query("SELECT id FROM guides WHERE id='guide' FOR UPDATE");
+    for (let i = 0; i < 20; i++) {
+      const save = h.repository.executeAnalysisCommand("guide", { type: "save-editor-draft", expectedRevision: 0,
+        expectedInputFingerprint: manifest.fingerprint, document: { ...initialDraft(manifest), title: `synthetic edit ${i}` } });
+      pending.push(save); void save.catch(() => undefined);
+    }
+    await waitForFixtureLocks(h.pool, 20);
+    await blocker.query("COMMIT");
+    const results = await Promise.all(pending);
+    const winners = results.filter(result => result !== null);
+    assert.equal(winners.length, 1);
+    assert.equal(results.filter(result => result === null).length, 19);
+    const draft = winners[0]!.draft!;
+    assert.equal(draft.revision, 1);
+    assert.deepEqual((await h.repository.getAnalysisState("guide"))?.draft, draft);
+    assert.equal((await h.repository.getGuideById("guide"))?.updatedAt, draft.updatedAt);
+    assert.ok(h.pool.totalCount > 1);
+  } finally {
+    try { await blocker.query("ROLLBACK"); } finally { blocker.release(); }
+    await Promise.allSettled(pending);
+  }
 });
 
 test("real PostgreSQL: all eleven migrations apply and replay without resetting the halt or accounting", async (t) => {

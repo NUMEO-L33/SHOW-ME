@@ -63,4 +63,8 @@ Gemini 시험 화면 두 장은 보존된 코드의 픽셀/글꼴 알고리즘�
 
 PostgreSQL 통합 검사는 `artifacts/api-server/scripts/verify-postgres.mjs`로 분리했다. 기본 검사에는 포함되지 않는다. 명시적인 로컬 Docker 호스트, 기존 이미지, 임의 이름·암호·tmpfs·루프백 주소인 일회용 DB만 허용하며 실제 `DATABASE_URL`을 사용하지 않는다. 실행 후 해당 시험의 소유권을 확인해 컨테이너만 정리한다.
 
+2026-09-18: 기존 로컬 이미지의 **PostgreSQL 16.15에서 47개 통과, 실패·생략 0** 및 시험 컨테이너 정리까지 확인했다. 편집/만료의 양방향 실제 부모 잠금 경합, 동시 편집 20건의 단일 버전 커밋, 초안·부모 시각 일치, 정확한 만료 시각 경계, 실패 롤백과 기존 초안 보호를 포함한다. 제품 코드와 운영 DB는 바꾸지 않았다. 상세 증거와 제한은 [비공개 전송 검증](REPLIT_RECORDING_PRIVACY.md)의 최신 실행 절을 따른다.
+
+Windows에서 `docker`가 PATH에 없다는 이유만으로 미설치로 판단하지 않는다. 이번 환경에서는 사용자별 `%LOCALAPPDATA%/Programs/DockerDesktop/resources/bin/docker.exe`에 있었다. 실제로 확인한 CLI 절대 경로를 기존 `SHOWME_TEST_DOCKER_BIN`에, 로컬 Linux 엔진 주소 `npipe:////./pipe/dockerDesktopLinuxEngine`를 `SHOWME_TEST_DOCKER_HOST`에 지정해 `pnpm --filter @workspace/api-server test:postgres`를 실행할 수 있다. Linux에서 허용되는 주소는 `unix:///var/run/docker.sock`이다. 기존 엔진과 `postgres:16` 이미지가 준비된 경우에만 실행하며 원격 엔진, 운영 연결값, 임의 호스트 마운트로 대체하지 않는다. 실행기는 이미지를 자동 다운로드하지 않는다.
+
 Replit 실제 DB/Storage 연동, 브라우저 녹화·업로드 흐름, AI 준비 검증기, 편집·가림·게시 및 운영 배포는 별도의 완료 조건이다. 빌드 성공은 이 항목들의 완료를 뜻하지 않는다.
