@@ -20,6 +20,8 @@ let fixtureDir = "";
 let landscapePath = "";
 let movPath = "";
 let webmPath = "";
+let hevcPath = "";
+let av1Path = "";
 let portraitPath = "";
 let rotatedPath = "";
 let hardCutsPath = "";
@@ -57,6 +59,8 @@ before(async () => {
   landscapePath = join(fixtureDir, "landscape with audio.mp4");
   movPath = join(fixtureDir, "quicktime-screen.mov");
   webmPath = join(fixtureDir, "browser-screen.webm");
+  hevcPath = join(fixtureDir, "hevc-screen.mp4");
+  av1Path = join(fixtureDir, "av1-screen.mp4");
   portraitPath = join(fixtureDir, "세로 화면.mp4");
   rotatedPath = join(fixtureDir, "회전 90 & metadata.mp4");
   hardCutsPath = join(fixtureDir, "hard-cuts.mp4");
@@ -103,6 +107,20 @@ before(async () => {
     "-pix_fmt", "yuv420p",
     "-y",
     portraitPath,
+  ));
+
+  // Retain modern screen-video decoding when slimming Replit's dependency set.
+  // Tiny local fixtures only; bound encoder pools rather than using host CPU count.
+  await runFixtureCommand(fixtureArgs(
+    "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=8:duration=0.25",
+    "-an", "-c:v", "libx265", "-preset", "ultrafast",
+    "-x265-params", "pools=1:frame-threads=1:log-level=error",
+    "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-y", hevcPath,
+  ));
+  await runFixtureCommand(fixtureArgs(
+    "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=8:duration=0.25",
+    "-an", "-c:v", "libaom-av1", "-cpu-used", "8", "-threads", "1",
+    "-crf", "40", "-b:v", "0", "-pix_fmt", "yuv420p", "-y", av1Path,
   ));
 
   await runFixtureCommand(fixtureArgs(
@@ -168,6 +186,22 @@ test("probeVideo accepts the allow-listed MOV and WebM container families", asyn
   assert.equal(frames.length, 1);
   await access(frames[0].framePath);
 });
+
+for (const codec of ["hevc", "av1"] as const) {
+  test(`${codec} screen video retains metadata and real JPEG extraction`, async () => {
+    const input = codec === "hevc" ? hevcPath : av1Path;
+    const metadata = await probeVideo(input, { ffprobePath });
+    assert.equal(metadata.codecName, codec);
+    assert.equal(metadata.codedWidth, 320);
+    assert.equal(metadata.codedHeight, 180);
+    const frames = await extractRepresentativeFrames(input, join(fixtureDir, `${codec}-frames`), metadata, [], {
+      ffmpegPath, ffprobePath, frameWidth: 320, thumbnailWidth: 160,
+    });
+    assert.equal(frames.length, 1);
+    await access(frames[0].framePath);
+    await access(frames[0].thumbnailPath);
+  });
+}
 
 test("probeVideo recognizes a physically portrait stream without rotation metadata", async () => {
   const metadata = await probeVideo(portraitPath, { ffprobePath });
