@@ -63,4 +63,21 @@ node scripts/check-private-access.mjs --cleanup-only
 - 진단 단위/실제 loopback HTTP/CLI 검사 26개 통과: 목적지 제한, 동의 인수, 잘못된 접근 허용 탐지, 존재하지 않는 가이드의 거짓 통과 방지, 본문 정체/크기 제한, 업로드 307 추적 금지, 응답 유실, 정리 실패/복구, 민감한 응답·키 비출력을 검사했다.
 - 실제 HTTP + FFmpeg + LocalStorage/JSON 통합 검사 2개 통과: 내장 영상을 실제 처리하고 원본·프레임·썸네일이 저장됐다가 삭제되는 것을 확인했다. 권한을 일부러 잘못 허용한 경우 실패하면서도 시험 자료를 삭제했다. 분석 API 요청은 0이었다.
 - 새 테스트 TypeScript 검사 및 진단 스크립트 구문 검사 통과. `node scripts/run-tests.mjs`의 일반 전체 회귀(migration → server → client)도 종료 코드 0으로 통과했다. 로컬 Windows의 기존 FFmpeg/FFprobe 경로만 테스트 환경에 지정했으며 Replit의 바이너리/설정은 바꾸지 않았다.
-- 실제 Replit에는 아직 이 자동검사를 실행하지 않았다. 이 파일을 추가하는 것만으로 배포/기동/클라우드 전송이 실행되지 않는다.
+- 준비 시점에는 실제 Replit에서 실행하지 않았다. 이 파일을 추가하는 것만으로 배포/기동/클라우드 전송이 실행되지 않는다. 후속 사용자 실행 결과는 아래와 같다.
+
+## Replit 사용자 실행 결과 — 2026-09-18
+
+사용자가 Shell 실행 후 다음 진단 결과를 제공했다.
+
+```text
+PRIVATE_ACCESS_CHECK TARGET_LOOPBACK_API
+PRIVATE_ACCESS_CHECK SERVER_READY
+PRIVATE_ACCESS_CHECK SYNTHETIC_UPLOAD_ACCEPTED
+PRIVATE_ACCESS_CHECK OWNER_GUIDE_AND_DRAFT_OK
+PRIVATE_ACCESS_CHECK SIGNED_IMAGES_OK
+PRIVATE_ACCESS_CHECK NO_KEY_AND_WRONG_KEY_DENIED
+PRIVATE_ACCESS_CHECK TEST_GUIDE_DELETED
+PRIVATE_ACCESS_CHECK PASS
+```
+
+이 실행의 **Replit 내부 API 합성 접근 검사와 시험 가이드 삭제 확인은 완료**다. 진단 코드상 PASS는 정상 조회 전후 비교, 무키/잘못된 키 거부, 삭제 API 확인 및 전용 복구 파일 제거 이후에만 출력한다. 실제 Storage 객체/백업/IAM을 별도 조회한 증거는 아니며 브라우저 녹화 중 무전송·브라우저의 업로드 목적지·HTTPS 프록시 검증도 아니다. 기존 사용자 가이드나 개인 녹화물 삭제를 뜻하지 않는다. 같은 검사 재실행이나 복구 명령은 지금 필요하지 않다.

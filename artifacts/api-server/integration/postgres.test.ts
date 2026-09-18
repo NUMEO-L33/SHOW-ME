@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
-import { ANALYSIS_CONSENT_VERSION, analysisBatches, analysisManifest } from "../src/processor/analysis-contract.js";
+import { ANALYSIS_CONSENT_VERSION, analysisBatches, analysisManifest, initialDraft } from "../src/processor/analysis-contract.js";
 import { type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
 import { runDatabaseMigrations } from "../src/processor/database-migrations.js";
 import { PostgresGuideRepository } from "../src/processor/repository.js";
@@ -86,6 +86,43 @@ async function fixture(t: TestContext, migrate = true) {
   };
   return { pool, repository, seed, fund, begin, rows, connection: connection.toString() };
 }
+
+test("real PostgreSQL: saved drafts fence expiry, legacy drafts filter before LIMIT, and retention updates roll back", async t => {
+  const h = await fixture(t);
+  const { guide } = await h.seed();
+  await h.pool.query("UPDATE guides SET updated_at = now() - interval '8 days' WHERE id = 'guide'");
+  const stale = (await h.repository.getGuideById("guide"))!;
+  const manifest = analysisManifest(guide);
+  const command = { type: "save-editor-draft" as const, expectedRevision: 0,
+    expectedInputFingerprint: manifest.fingerprint, document: initialDraft(manifest) };
+  const saved = await h.repository.executeAnalysisCommand("guide", command);
+  assert.equal(saved?.draft?.revision, 1);
+  const parent = (await h.repository.getGuideById("guide"))!;
+  assert.equal(parent.updatedAt, saved!.draft!.updatedAt);
+  assert.equal(await h.repository.updateStatus("guide", "failed", {
+    expectedStatuses: ["ready"], expectedUpdatedAt: stale.updatedAt, errorCode: "DELETION_PENDING",
+  }), null);
+  await h.repository.executeAnalysisCommand("guide", command);
+  assert.equal((await h.repository.getGuideById("guide"))?.updatedAt, parent.updatedAt);
+  await h.pool.query("CREATE FUNCTION reject_retention() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic failure'; END $$");
+  await h.pool.query("CREATE TRIGGER reject_retention BEFORE UPDATE ON guides FOR EACH ROW EXECUTE FUNCTION reject_retention()");
+  await assert.rejects(h.repository.executeAnalysisCommand("guide", {
+    ...command, expectedRevision: 1, document: { ...command.document, title: "must roll back" },
+  }));
+  assert.deepEqual((await h.repository.getAnalysisState("guide"))?.draft, saved?.draft);
+  assert.equal((await h.repository.getGuideById("guide"))?.updatedAt, parent.updatedAt);
+  await h.pool.query("DROP TRIGGER reject_retention ON guides");
+
+  // Previous-release shape: parent is old but the successful editor draft is recent.
+  await h.pool.query("UPDATE guides SET updated_at = now() - interval '10 days' WHERE id = 'guide'");
+  await h.seed("expired");
+  await h.pool.query("UPDATE guides SET updated_at = now() - interval '8 days' WHERE id = 'expired'");
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  assert.deepEqual((await h.repository.listExpiredDrafts(cutoff, ["DELETION_PENDING"], 1)).map(g => g.id), ["expired"]);
+  await h.repository.updateStatus("expired", "failed", { errorCode: "DELETION_PENDING" });
+  await h.pool.query("UPDATE guides SET updated_at = now() - interval '8 days' WHERE id = 'expired'");
+  assert.deepEqual(await h.repository.listExpiredDrafts(cutoff, ["DELETION_PENDING"], 1), []);
+});
 
 test("real PostgreSQL: all eleven migrations apply and replay without resetting the halt or accounting", async (t) => {
   const h = await fixture(t);

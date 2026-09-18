@@ -282,6 +282,8 @@ export interface GuideRepository extends AnalysisFundingRepository, AnalysisAcco
   listFailedByErrorCodes(errorCodes: readonly string[], limit?: number): Promise<Guide[]>;
   /** Lists ordinary failed rows while excluding lifecycle-control error codes. */
   listFailedExcludingErrorCodes(errorCodes: readonly string[], limit?: number): Promise<Guide[]>;
+  /** Filters both guide and saved-draft age before limiting; returns the guide's CAS snapshot. */
+  listExpiredDrafts(updatedBefore: string, excludedErrorCodes: readonly string[], limit?: number): Promise<Guide[]>;
   listRecoverable(limit?: number): Promise<Guide[]>;
   listSteps(guideId: string): Promise<GuideStep[]>;
   replaceSteps(guideId: string, steps: readonly CreateGuideStepInput[]): Promise<GuideStep[]>;

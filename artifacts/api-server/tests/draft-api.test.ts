@@ -62,7 +62,7 @@ test("human title, intent, text, tap and merged/deleted steps persist atomically
   const reopened = new JsonGuideRepository(h.repository.filePath);
   assert.deepEqual((await reopened.getAnalysisState(h.guideId))?.draft?.document, document);
   assert.deepEqual((await reopened.getAnalysisState(h.guideId))?.runs, []);
-  assert.deepEqual(await reopened.getGuideById(h.guideId), h.guide);
+  assert.deepEqual(await reopened.getGuideById(h.guideId), { ...h.guide, updatedAt: response.body.draft.updatedAt });
   assert.deepEqual((await request(h.app).get(h.url).set("Authorization", h.auth).expect(200)).body.draft, response.body.draft);
 });
 
@@ -138,6 +138,7 @@ test("repository failures and missing schema do not pretend to save or leak inne
   assert.equal(response.body.code, "DRAFT_UNAVAILABLE");
   assert.ok(!response.text.includes("private"));
   assert.equal((await h.repository.getAnalysisState(h.guideId))?.draft, null);
+  assert.equal((await h.repository.getGuideById(h.guideId))?.updatedAt, h.guide.updatedAt);
 });
 
 test("Postgres editor path holds the parent lock and rolls back failed draft writes (transaction double)", async t => {
@@ -147,8 +148,19 @@ test("Postgres editor path holds the parent lock and rolls back failed draft wri
   const result = await fixture.repository.executeAnalysisCommand(h.guideId, command);
   assert.equal(result?.draft?.revision, 1);
   assert.ok(fixture.locks.some(lock => lock.table === guides && lock.mode === "update"));
-  assert.deepEqual(fixture.writes, [guideDrafts]);
+  assert.deepEqual(fixture.writes, [guideDrafts, guides]);
+  const savedParentTime = fixture.rows(guides)[0].updatedAt;
+  assert.deepEqual(savedParentTime, new Date(result!.draft!.updatedAt));
+  const writesBeforeReplay = fixture.writes.length;
+  await fixture.repository.executeAnalysisCommand(h.guideId, command);
+  await fixture.repository.getAnalysisState(h.guideId);
+  assert.equal(fixture.writes.length, writesBeforeReplay);
   fixture.failWrite(guideDrafts);
   await assert.rejects(fixture.repository.executeAnalysisCommand(h.guideId, { ...command, expectedRevision: 1, document: { ...h.body.document, title: "실패할 편집" } }));
   assert.deepEqual((await fixture.repository.getAnalysisState(h.guideId))?.draft, result?.draft);
+  assert.deepEqual(fixture.rows(guides)[0].updatedAt, savedParentTime);
+  fixture.failWrite(guides);
+  await assert.rejects(fixture.repository.executeAnalysisCommand(h.guideId, { ...command, expectedRevision: 1, document: { ...h.body.document, title: "부모 저장 실패" } }));
+  assert.deepEqual((await fixture.repository.getAnalysisState(h.guideId))?.draft, result?.draft);
+  assert.deepEqual(fixture.rows(guides)[0].updatedAt, savedParentTime);
 });

@@ -207,11 +207,10 @@ export async function cleanupPrivateAssetLifecycle(
       DELETION_PENDING_ACTIVE,
       UPLOAD_CANCELLATION_TOMBSTONE,
     ];
-    const staleReady = (await repository.listByStatuses(["ready"], batchLimit))
-      .filter((guide) => Date.parse(guide.updatedAt) <= abandonedBefore);
-    const staleFailures = (await repository.listFailedExcludingErrorCodes(lifecycleErrorCodes, batchLimit))
-      .filter((guide) => Date.parse(guide.updatedAt) <= abandonedBefore);
-    for (const guide of [...staleReady, ...staleFailures]) {
+    const expiredDrafts = await repository.listExpiredDrafts(
+      new Date(abandonedBefore).toISOString(), lifecycleErrorCodes, batchLimit,
+    );
+    for (const guide of expiredDrafts) {
       try {
         await repository.updateStatus(guide.id, "failed", {
           expectedStatuses: [guide.status],

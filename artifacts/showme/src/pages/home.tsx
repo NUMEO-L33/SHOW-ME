@@ -561,7 +561,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           <div className="mx-4 my-4 hidden rounded-[15px] bg-[#f5f7fa] p-3 lg:block">
             <p className="flex items-center gap-1.5 text-xs font-extrabold text-[#5e6980]"><Sparkles className="size-3.5 text-[#4f6df5]" />{isLiveDraft ? "영상에서 화면을 추출했어요" : "예시 가이드 초안"}</p>
             <p className="mt-1.5 text-xs font-semibold leading-5 text-[#8992a4]">{isLiveDraft ? "설명과 누를 위치를 직접 편집해 저장할 수 있어요. AI 분석은 아직 적용되지 않았어요." : "예시로 검토 흐름을 체험해 보세요."}</p>
-            {isLiveDraft && <p className="mt-2 text-[11px] font-semibold leading-4 text-[#8a6a63]">미공개 초안과 원본은 7일 뒤 자동 삭제돼요.</p>}
+            {isLiveDraft && <p className="mt-2 text-[11px] font-semibold leading-4 text-[#8a6a63]">미공개 초안과 원본은 마지막 편집 저장 후 7일이 지나면 자동 삭제돼요. 저장 전에는 장면 추출 완료 시점이 기준이에요. 서버 중단·삭제 오류 시 정리가 늦어질 수 있어요.</p>}
           </div>
         </aside>
 

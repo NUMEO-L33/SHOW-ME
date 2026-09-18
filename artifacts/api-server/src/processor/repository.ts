@@ -604,6 +604,11 @@ export class JsonGuideRepository implements GuideRepository {
       if (!next) return null;
       const validated = parseAnalysisState(next);
       state.analysis = [...state.analysis.filter((entry) => entry.guideId !== guideId), { guideId, state: validated }];
+      // Commit the retention fence with the draft, never on reads/conflicts/replays.
+      if (command.type === "save-editor-draft" && validated.draft &&
+          validated.draft.revision !== previous.draft?.revision) {
+        guide.updatedAt = validated.draft.updatedAt;
+      }
       await this.writeState(state);
       return clone(validated);
     });
@@ -1113,6 +1118,22 @@ export class JsonGuideRepository implements GuideRepository {
     });
   }
 
+  async listExpiredDrafts(updatedBefore: string, excludedErrorCodes: readonly string[], limit?: number): Promise<Guide[]> {
+    const cutoff = normalizeIsoDate(updatedBefore, "updatedBefore");
+    const safeLimit = normalizedLimit(limit);
+    const excluded = new Set(excludedErrorCodes.map((code) => requireNonEmpty(code, "errorCode")));
+    return this.serialize(async () => {
+      const state = await this.readState();
+      const draftTimes = new Map(state.analysis.map((entry) => [entry.guideId, entry.state.draft?.updatedAt]));
+      return clone(state.guides
+        .filter((guide) => (guide.status === "ready" || guide.status === "failed") &&
+          (guide.errorCode === null || !excluded.has(guide.errorCode)) && guide.updatedAt <= cutoff &&
+          (draftTimes.get(guide.id) ?? guide.updatedAt) <= cutoff)
+        .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+        .slice(0, safeLimit));
+    });
+  }
+
   listRecoverable(limit?: number): Promise<Guide[]> {
     return this.listByStatuses(RECOVERABLE_GUIDE_STATUSES, limit);
   }
@@ -1315,6 +1336,13 @@ export class PostgresGuideRepository implements GuideRepository {
       if (!next) return null;
       const validated = parseAnalysisState(next);
       await persistAnalysisRows(transaction, guideId, previous, validated);
+      // Same parent lock and transaction as the draft: expiry cannot claim an old
+      // snapshot after a new save, and a failed write cannot extend retention.
+      if (command.type === "save-editor-draft" && validated.draft &&
+          validated.draft.revision !== previous.draft?.revision) {
+        await transaction.update(guides).set({ updatedAt: new Date(validated.draft.updatedAt) })
+          .where(eq(guides.id, guideId));
+      }
       return validated;
     });
   }
@@ -2198,6 +2226,22 @@ export class PostgresGuideRepository implements GuideRepository {
       ))
       .orderBy(asc(guides.updatedAt))
       .limit(safeLimit);
+    return rows.map(guideFromRow);
+  }
+
+  async listExpiredDrafts(updatedBefore: string, excludedErrorCodes: readonly string[], limit?: number): Promise<Guide[]> {
+    const cutoff = normalizeIsoDate(updatedBefore, "updatedBefore");
+    const safeLimit = normalizedLimit(limit);
+    const excluded = excludedErrorCodes.map((code) => requireNonEmpty(code, "errorCode"));
+    const rows = await this.database.select().from(guides).where(and(
+      inArray(guides.status, ["ready", "failed"]),
+      excluded.length ? or(isNull(guides.errorCode), notInArray(guides.errorCode, excluded)) : undefined,
+      lte(guides.updatedAt, new Date(cutoff)),
+      // Older deployments saved drafts without touching the parent timestamp.
+      // Filter these here, before LIMIT, so recent legacy drafts cannot starve expiry.
+      sql`not exists (select 1 from ${guideDrafts} where ${guideDrafts.guideId} = ${guides.id}
+        and ${guideDrafts.updatedAt} > ${cutoff}::timestamptz)`,
+    )).orderBy(asc(guides.updatedAt)).limit(safeLimit);
     return rows.map(guideFromRow);
   }
 
