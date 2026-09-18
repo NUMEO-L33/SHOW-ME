@@ -70,6 +70,66 @@ test("analysis startup is disabled without durable admission and creates no draf
   assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
 });
 
+test("latest analysis lookup is owner-only, draft-bound and has no initialization or admission side effects", async context => {
+  const h = await harness(context);
+  const query = { inputFingerprint: analysisManifest(h.guide).fingerprint };
+  const before = await h.repository.getAnalysisState(h.guideId);
+  for (const authorization of [undefined, "Bearer wrong-key"]) {
+    const lookup = request(h.appWith()).get(h.url).set("X-ShowMe-Input-Fingerprint", query.inputFingerprint);
+    if (authorization) lookup.set("Authorization", authorization);
+    await lookup.expect(404);
+  }
+  const response = await request(h.appWith()).get(h.url).set("X-ShowMe-Input-Fingerprint", query.inputFingerprint).set("Authorization", h.authorization).expect(200);
+  assert.deepEqual(response.body, { ...query, frameIds: ["step-0", "step-1"], run: null });
+  assert.equal(response.headers["cache-control"], "no-store");
+  assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+  assert.equal(h.submissions.length, 0);
+});
+
+test("latest lookup rejects unknown queries and a stale media fingerprint", async context => {
+  const h = await harness(context);
+  const query = { inputFingerprint: analysisManifest(h.guide).fingerprint };
+  for (const invalid of ["", "invalid"]) {
+    await request(h.app).get(h.url).set("X-ShowMe-Input-Fingerprint", invalid).set("Authorization", h.authorization).expect(400);
+  }
+  await request(h.app).get(h.url).query({ image: "private" }).set("X-ShowMe-Input-Fingerprint", query.inputFingerprint).set("Authorization", h.authorization).expect(400);
+  await request(h.app).get(h.url).set("X-ShowMe-Input-Fingerprint", "0".repeat(64)).set("Authorization", h.authorization).expect(409);
+  assert.deepEqual(await h.repository.getAnalysisState(h.guideId), { draft: null, runs: [] });
+});
+
+test("latest lookup returns the newest current-media run without reviving cancelled work", async context => {
+  const h = await harness(context);
+  const query = { inputFingerprint: analysisManifest(h.guide).fingerprint };
+  const first = body();
+  await request(h.app).post(h.url).set("Authorization", h.authorization).send(first).expect(202);
+  await h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: first.runId });
+  const second = body();
+  await request(h.app).post(h.url).set("Authorization", h.authorization).send(second).expect(202);
+  await h.repository.executeAnalysisCommand(h.guideId, { type: "cancel", runId: second.runId });
+  const before = await h.repository.getAnalysisState(h.guideId);
+  const response = await request(h.appWith()).get(h.url).set("X-ShowMe-Input-Fingerprint", query.inputFingerprint).set("Authorization", h.authorization).expect(200);
+  assert.equal(response.body.run.runId, second.runId);
+  assert.equal(response.body.run.status, "cancelled");
+  for (const forbidden of [h.token, h.guide.editTokenHash, "private-frame", "private-source", "attemptId", "manifest"]) assert.ok(!response.text.includes(forbidden));
+  assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+  assert.equal(h.submissions.length, 2);
+});
+
+test("late deletion or media replacement prevents even an empty latest result from reaching the editor", async context => {
+  for (const deleted of [false, true]) {
+    const h = await harness(context);
+    const query = { inputFingerprint: analysisManifest(h.guide).fingerprint };
+    const read = h.repository.getAnalysisState.bind(h.repository);
+    context.mock.method(h.repository, "getAnalysisState", async (id: string) => {
+      const state = await read(id);
+      if (deleted) await h.repository.deleteGuide(id);
+      else await h.repository.replaceSteps(id, h.guide.steps.map(step => ({ ...step, representativeFrameKey: "replacement.jpg" })));
+      return state;
+    });
+    await request(h.app).get(h.url).set("X-ShowMe-Input-Fingerprint", query.inputFingerprint).set("Authorization", h.authorization).expect(deleted ? 404 : 409);
+  }
+});
+
 test("analysis routes require the owning guide bearer key; query tokens and another key cannot substitute", async (context) => {
   const h = await harness(context);
   const sent = body();

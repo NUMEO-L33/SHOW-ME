@@ -160,6 +160,25 @@ export function createAnalysisRouter(options: {
     } catch (error) { next(error); }
   });
 
+  // Recovery/review only. Reading an existing run never admits work, reads
+  // image bytes or contacts a provider. Bind the response to the open draft.
+  router.get("/", limiter(60, 60_000), auth, async (request, response, next) => {
+    try {
+      const fingerprint = z.string().regex(/^[a-f0-9]{64}$/).safeParse(request.header("X-ShowMe-Input-Fingerprint"));
+      if (!fingerprint.success || Object.keys(request.query).length) throw new AnalysisApiError("ANALYSIS_INVALID_REQUEST");
+      const before = guides.get(request)!;
+      const manifest = manifestFor(before);
+      if (fingerprint.data !== manifest.fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
+      const stored = await repository.getAnalysisState(before.id);
+      if (!stored) throw new AnalysisApiError("GUIDE_NOT_FOUND");
+      const current = await authenticate(request);
+      if (manifestFor(current).fingerprint !== manifest.fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
+      const run = parseAnalysisState(stored).runs.filter(candidate => candidate.manifest.fingerprint === manifest.fingerprint).at(-1);
+      response.json({ inputFingerprint: manifest.fingerprint,
+        frameIds: manifest.frames.map(frame => frame.stepId), run: run ? serializeRun(run) : null });
+    } catch (error) { next(error); }
+  });
+
   router.get("/:runId", limiter(60, 60_000), auth, async (request, response, next) => {
     try {
       const id = runIdSchema.safeParse(request.params.runId);

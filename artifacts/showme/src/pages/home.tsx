@@ -39,6 +39,8 @@ import { jobIssueFor, type JobIssue } from "@/lib/job-feedback";
 import { parsePersistedActiveJob, type ActiveJob, type PersistedActiveJob } from "@/lib/job-recovery";
 import { draftDocument, draftSteps, draftFailure, getDraft, putDraft, type DraftSnapshot } from "@/lib/draft-client";
 import { DraftAutosave } from "@/lib/draft-autosave";
+import { applyAnalysisPreview, type AnalysisPreview } from "@/lib/analysis-review";
+import { AnalysisReviewDialog } from "@/components/analysis-review-dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -339,9 +341,10 @@ type ReviewScreenProps = {
   draftLoading: boolean;
   draftError: string | null;
   onCompositionChange: (composing: boolean) => void;
+  analysisReview?: React.ReactNode;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -521,6 +524,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
         </p>
         <Button variant="ghost" disabled={draftSaving || draftLoading} onClick={() => setReloadOpen(true)}>최신 저장본 불러오기</Button>
       </section>}
+      {isLiveDraft && analysisReview}
       <Dialog open={reloadOpen} onOpenChange={setReloadOpen}><DialogContent>
         <DialogHeader><DialogTitle>서버 저장본으로 다시 열까요?</DialogTitle><DialogDescription>현재 화면에서 저장하지 않은 편집은 버려집니다. 필요한 내용은 먼저 복사해 두세요. 불러오기에 실패하면 현재 입력은 유지됩니다.</DialogDescription></DialogHeader>
         <DialogFooter><Button variant="outline" onClick={() => setReloadOpen(false)}>취소</Button><Button onClick={() => { setReloadOpen(false); void onReload(); }}>입력을 버리고 불러오기</Button></DialogFooter>
@@ -538,7 +542,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           }}>적용</Button></DialogFooter>
         </DialogContent>
       </Dialog>
-      <div className="mx-auto grid min-h-[calc(100vh-68px)] max-w-[1540px] lg:grid-cols-[210px_minmax(0,1fr)_300px] xl:grid-cols-[238px_minmax(0,1fr)_330px]">
+      <div className="mx-auto grid min-h-[calc(100vh-68px)] max-w-[1540px] grid-cols-1 lg:grid-cols-[210px_minmax(0,1fr)_300px] xl:grid-cols-[238px_minmax(0,1fr)_330px]">
         <aside className="border-b border-[#dfe3eb] bg-white lg:border-b-0 lg:border-r" aria-label="가이드 단계">
           <div className="hidden items-center justify-between px-4 pb-3 pt-5 lg:flex"><h2 className="text-sm font-black">단계 <span className="text-[#728097]">{steps.length}</span></h2><Button size="icon" variant="ghost" aria-label="단계 추가" onClick={() => toast.info("새 단계는 영상에서 다시 만들 수 있어요.")}><Plus className="size-4" /></Button></div>
           <div className="scrollbar-none flex gap-2 overflow-x-auto px-3 py-3 lg:block lg:space-y-2 lg:overflow-visible lg:px-3 lg:py-0">
@@ -560,7 +564,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           </div>
           <div className="mx-4 my-4 hidden rounded-[15px] bg-[#f5f7fa] p-3 lg:block">
             <p className="flex items-center gap-1.5 text-xs font-extrabold text-[#5e6980]"><Sparkles className="size-3.5 text-[#4f6df5]" />{isLiveDraft ? "영상에서 화면을 추출했어요" : "예시 가이드 초안"}</p>
-            <p className="mt-1.5 text-xs font-semibold leading-5 text-[#8992a4]">{isLiveDraft ? "설명과 누를 위치를 직접 편집해 저장할 수 있어요. AI 분석은 아직 적용되지 않았어요." : "예시로 검토 흐름을 체험해 보세요."}</p>
+            <p className="mt-1.5 text-xs font-semibold leading-5 text-[#8992a4]">{isLiveDraft ? "설명과 누를 위치를 직접 편집해 저장할 수 있어요. 저장된 AI 제안도 직접 검토한 뒤 선택해 반영해 주세요." : "예시로 검토 흐름을 체험해 보세요."}</p>
             {isLiveDraft && <p className="mt-2 text-[11px] font-semibold leading-4 text-[#8a6a63]">미공개 초안과 원본은 마지막 편집 저장 후 7일이 지나면 자동 삭제돼요. 저장 전에는 장면 추출 완료 시점이 기준이에요. 서버 중단·삭제 오류 시 정리가 늦어질 수 있어요.</p>}
           </div>
         </aside>
@@ -569,7 +573,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           <div className="mx-auto flex h-full max-w-[800px] flex-col">
             {isLiveDraft && (
               <p role="note" className="mb-3 rounded-xl border border-[#e3d6ad] bg-[#fffbeb] p-3 text-sm font-semibold leading-6 text-[#786238]">
-                설명과 누를 위치를 편집하면 약 1초 뒤 자동 저장됩니다. ‘자동 저장됨’을 확인한 뒤 창을 닫아 주세요. AI 분석·개인정보 가림·공개 공유는 아직 실행하지 않습니다.
+                설명과 누를 위치를 편집하면 약 1초 뒤 자동 저장됩니다. ‘자동 저장됨’을 확인한 뒤 창을 닫아 주세요. 새 AI 분석·개인정보 가림·공개 공유는 아직 시작할 수 없습니다.
               </p>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -1396,6 +1400,21 @@ export default function Home() {
     finally { if (draftRequestRef.current === abort) draftRequestRef.current = null; setDraftLoading(false); }
   };
 
+  const applyStoredAnalysis = (preview: AnalysisPreview, selectedIds: string[]) => {
+    if (!activeJob || activeJob.phase === "deleting" || !draftSnapshot || draftDirty || draftSaving || draftLoading || draftError || draftComposing ||
+        draftRequestRef.current || draftAutosaveRef.current?.saving || !draftAutosaveRef.current) {
+      throw new ProcessorClientError("편집 상태가 바뀌었어요.", 409, "ANALYSIS_STATE_CHANGED");
+    }
+    const next = applyAnalysisPreview(preview, draftSnapshot, draftDocument(title, steps, activeJob.intent), selectedIds);
+    setSteps(steps.map(step => {
+      const draft = next.steps.find(candidate => candidate.id === String(step.id))!;
+      const tap = draft.elements.find(element => element.type === "tap");
+      return { ...step, shortLabel: draft.shortLabel, instruction: draft.instruction, draft,
+        target: tap?.center ?? { x: 50, y: 50 }, targetVisible: tap?.visible ?? false };
+    }));
+    toast.info("선택한 AI 제안을 반영했어요. ‘자동 저장됨’을 확인해 주세요. 개인정보 가림은 실행하지 않았습니다.");
+  };
+
   if (mode === "viewer") {
     return <PublicGuide title={previewTitle} steps={steps} onExit={() => setMode(previousMode.current)} />;
   }
@@ -1440,6 +1459,10 @@ export default function Home() {
           draftLoading={draftLoading}
           draftError={draftError}
           onCompositionChange={onDraftCompositionChange}
+          analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisReviewDialog
+            key={activeJob.guideId} identity={activeJob} base={draftSnapshot}
+            disabled={draftDirty || draftSaving || draftLoading || Boolean(draftError) || draftComposing}
+            onApply={applyStoredAnalysis} /> : undefined}
         />
       )}
       {mode === "published" && (
