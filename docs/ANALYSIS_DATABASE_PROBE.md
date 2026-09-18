@@ -24,7 +24,7 @@
 
 실행 환경 근거를 발급하려면 저장소·실행기·프로젝트/키·한도·호스팅 근거와 연결하고 변경 시 철회하는 과정이 여전히 필요하다. 이 관측 결과를 HTTP/env JSON으로 복사해 이전 readiness 연결부에 넣거나 `isCurrent:()=>true`로 감싸지 않는다.
 
-## 명시적 실행 명령 — Replit 개발 DB는 접속 전 거절
+## 명시적 실행 명령
 
 `analysis-database-check.ts`는 현재 프로세스의 `DATABASE_URL`로 별도 연결 하나를 만들고 위 검사를 호출한다. **실행 중인 API 서버의 pool을 검사하는 것이 아니므로, 같은 설정·배포를 쓰는지 별도로 확인해야 한다.** 로컬 셸의 성공을 Replit 결과로 옮겨 적지 않는다.
 
@@ -35,21 +35,37 @@ pnpm --filter @workspace/api-server check:analysis-db --help
 pnpm --filter @workspace/api-server check:analysis-db --configured-database --read-only
 ```
 
-### 2026-09-18 Replit 실행 결과
+### 승인된 Replit 내부 개발 DB 연결 — 2026-09-18 후속
+
+사용자가 내부 격리 방식과 읽기 전용 범위를 확인한 뒤 `ㄱㄱ`로 승인했다. 기본 명령의 원격 TLS 필수 조건은 유지하고 **명시적인 프로젝트 지정 선택지**만 추가했다.
+
+```sh
+pnpm --filter @workspace/api-server check:analysis-db --configured-database --read-only --replit-development=CONFIRMED_PROJECT_UUID
+```
+
+`CONFIRMED_PROJECT_UUID`는 실행할 프로젝트 화면에서 별도로 확인한 UUID로 바꾼다. URL·비밀번호를 인수에 넣지 않으며, 대상 확인을 생략하기 위해 `$REPL_ID`를 자동 대입하지 않는다. 이 작업의 승인 대상은 SHOW-ME 개발 프로젝트 하나다.
+
+- 인수의 UUID와 실행 환경 `REPL_ID`가 정확히 일치해야 한다. `NODE_ENV`는 미설정/빈 값/`development`, `REPLIT_DEPLOYMENT`는 미설정/빈 값/`0`/`false`만 허용한다. 운영·테스트·알 수 없는 환경은 거절한다.
+- 기존 `DATABASE_URL`의 호스트가 정확히 `helium`, 포트가 5432, 옵션이 정확히 `sslmode=disable`일 때만 허용한다. 다른 호스트·직접 IP·포트·추가 옵션이나 TLS 프로필로 자동 전환하지 않는다.
+- DNS는 1.5초 안에 한 번 조회한다. 결과가 1–8개의 RFC1918 IPv4 사설 주소로만 이루어져야 한다. 공개 주소·혼합 결과·loopback·link-local·IPv6는 거절한다. 확인한 IP를 연결에 직접 고정해 두 번째 DNS 조회를 하지 않는다. 취소/시간 초과 뒤 늦은 응답은 접속을 만들지 못한다.
+- 이 경로는 전송 암호화를 제공하지 않으며 **Replit 내부 네트워크 격리에 의존**한다. 환경변수/사설 IP 검사는 운영자의 대상 확인을 돕는 방어 장치이지, 플랫폼 격리나 실행 환경의 신원을 암호학적으로 증명하지 않는다. 기존 Secrets·서비스·DB 설정은 변경하지 않는다.
+- 새 회귀 검사 **8개**, 일반 전체 **727개(이관 91 + 서버 579 + 클라이언트 57)** 및 실제 로컬 PostgreSQL **70개**가 실패·생략 0, 종료 코드 0으로 통과했다. API 제품/테스트 타입 검사도 통과했고 임시 DB/컨테이너 정리를 확인했다. Replit 실제 대상의 새 경로 실행 결과는 반영 후 별도로 기록한다. 이번 변경은 독립 CLI와 검사·문서뿐이며 제품 빌드/서버 재시작은 필요하지 않다.
+
+### 이전 2026-09-18 Replit 실행 결과 — 기본 TLS 경로
 
 - 격리 환경의 B5 단위 검사 **55개 모두 통과, 실패·생략 0, 종료 코드 0**. API 제품/테스트 타입 검사도 종료 코드 0이다. 이 실행에서 일반 719개나 제품 빌드를 다시 실행한 것은 아니다.
 - 실제 설정 대상 명령은 **`status:target-invalid`, 종료 코드 1**로 Pool 생성 전에 끝났다. DB 인증·SQL 조회를 하지 않았으므로 실제 Replit DB 검증 통과로 기록하지 않는다.
 - 비밀값을 출력하지 않는 분류로 대상이 공식 개발 DB 호스트 `helium`과 일치하고, DNS 결과 한 개가 사설 주소이며 `sslmode=disable`인 점을 확인했다. 별도 단일 연결에서 PostgreSQL SSLRequest만 보내 `tls-not-supported`를 확인했다. 이 진단은 비밀번호·StartupMessage·SQL을 전송하지 않고 연결을 닫았다.
 - [Replit 공식 문서](https://docs.replit.com/features/data-and-storage/development-and-production#ssl-connection-errors-after-the-upgrade)는 Helium 개발 DB가 앱 옆에서 실행되고 SSL을 사용하지 않는다고 설명한다. 현재 점검기의 **loopback 이외 TLS 필수 조건과 Replit 개발 DB 연결 방식이 맞지 않는다**. 이 결과만으로 DB 고장이나 유출을 뜻하지 않으며 플랫폼 격리 전체를 검증한 것도 아니다.
 - Secrets·암호화 설정·점검 허용 조건을 변경하거나 URL을 덮어써 우회하지 않았다. DB 행·schema·Storage·사용자 영상에는 접근하지 않았고 외부 AI는 꺼진 상태다.
-- 다음 단계는 사용자 확인을 받고 **이 앱의 Replit 내부 개발 DB에 한정한 명시적 연결 방식**을 추가·시험하는 것이다. 해당 경로는 TLS 대신 Replit 내부 격리에 의존함을 분명히 하고, 원격 DB의 TLS/인증서 검증은 유지해야 한다. 임의 사설 주소 허용, 모든 개발 환경에서 SSL 해제, 공개·운영 DB로 자동 확대는 하지 않는다.
+- 당시 다음 단계는 사용자 확인 후 내부 개발 DB 전용 경로를 추가하는 것이었다. 승인 뒤 구현한 범위는 위 후속 절을 따른다. 임의 사설 주소 허용, 모든 개발 환경에서 SSL 해제, 공개·운영 DB로 자동 확대는 하지 않는다.
 
 ### 명령의 경계와 로컬 검증
 
 - 두 실행 인수가 모두 있어야 접속한다. 인수 없음·오타·중복·추가 URL/쓰기/AI 옵션은 종료 코드 2로 거절한다. `--help`는 접속하지 않는다.
 - `.env`를 읽거나 설정을 바꾸지 않으며, URL·암호를 명령 인수로 받지 않는다. 연결 대상은 기존 `DATABASE_URL` 하나다. DB 이름·주소·계정·연결 문자열·원문 오류는 출력하지 않는다.
 - 대상 URL의 프로토콜·호스트·포트·계정·암호·DB 이름을 확인한다. PG 환경변수가 대상·역할·options를 바꾸지 않도록 연결 필드를 명시한다. URL의 host/options 재지정, 사용자 인증서 파일 경로, 추가/중복 옵션은 거절한다.
-- 원격 대상은 `sslmode=require` 또는 `verify-full`만 허용하고 인증서 검증을 명시적으로 유지한다. 비암호화는 정확한 loopback 주소만 허용한다. 사용자 인증서·고급 연결 설정·`channel_binding` 등은 자동으로 무시하거나 완화하지 않고 거절한다. 지원하지 않는 설정을 통과시키려고 기존 Secrets를 임의로 변경하지 않는다. 원격 TLS 접속 자체는 이번에 시험하지 않았다.
+- 기본 경로의 원격 대상은 `sslmode=require` 또는 `verify-full`만 허용하고 인증서 검증을 명시적으로 유지한다. 기본 경로의 비암호화는 정확한 loopback 주소만 허용한다. 승인된 내부 개발 DB는 위 별도 프로젝트 지정 경로만 사용한다. 사용자 인증서·고급 연결 설정·`channel_binding` 등은 자동으로 무시하거나 완화하지 않고 거절한다. 지원하지 않는 설정을 통과시키려고 기존 Secrets를 임의로 변경하지 않는다. 원격 TLS 접속 자체는 이번에 시험하지 않았다.
 - 연결 3초, statement 2초, lock 1초, 검사 4초 제한을 두고 명령 자체는 10초 최종 제한을 둔다. 공유 서버가 아닌 이 명령의 연결만 닫는다. DB schema/행을 쓰거나 migration/중단 해제/복구/Storage/AI/서버 시작을 실행하지 않는다. 연결 세션 설정과 통계는 생길 수 있다.
 - 종료 코드 0은 **DB 부분 점검 통과**다. 출력의 `ready:false`, `authorizesAnalysis:false`는 의도된 결과다. 종료 코드 1은 대상 설정 또는 점검 실패이며, 거절 원문을 공개하거나 자동 복구하지 않는다.
 - 정상/미적용 스키마/중단 상태/잘못된 암호의 실제 CLI 자식 프로세스 4개를 포함해 PostgreSQL **70개 모두 통과, 실패·생략 0, 종료 코드 0(33.11초)**. 환경 변수로 다른 PG 대상/options를 주어도 기존 URL 대상만 검사했고, 가이드·초안·중단 행 불변, 미적용 schema의 미생성, 연결 종료, 민감값 비출력과 AI 비활성 결과를 확인했다. 일회용 컨테이너 정리도 확인했다.

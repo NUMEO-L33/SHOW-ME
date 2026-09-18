@@ -1,3 +1,4 @@
+import dns from "node:dns/promises";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -7,19 +8,32 @@ import { PostgresAnalysisDatabaseProbe } from "./analysis-database-probe.js";
 import { PostgresGuideRepository } from "./repository.js";
 
 const flags = ["--configured-database", "--read-only"];
+const replitFlag = "--replit-development=";
+const replIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const help = "ShowMe DB 조건 점검\n사용: pnpm --filter @workspace/api-server check:analysis-db --configured-database --read-only\n"
   + "현재 프로세스의 DATABASE_URL에 읽기 전용으로 접속합니다. .env 로딩·migration·복구·서버 시작·AI 전송은 하지 않습니다.\n"
   + "먼저 올바른 프로젝트/개발·운영 환경인지 확인하세요. URL이나 비밀번호를 명령 인수에 넣지 마세요.\n"
+  + "승인된 Replit 내부 개발 DB만: 위 명령에 --replit-development=<확인한 프로젝트 UUID> 추가.\n"
+  + "이 선택은 해당 프로젝트의 helium:5432에 한해 TLS 대신 Replit 내부 격리에 의존합니다. 운영 배포에서는 거절합니다.\n"
   + "종료 코드: 0=DB 부분 점검 통과(AI 준비 완료 아님), 1=점검 실패, 2=명시적 실행 인수 필요.\n";
 const migrationsFolder = fileURLToPath(new URL("../../drizzle/", import.meta.url));
 
-export function databaseCheckMode(args: readonly string[]): "help" | "inspect" | "invalid" {
+export function databaseCheckMode(args: readonly string[]): "help" | "inspect" | "inspect-replit-development" | "invalid" {
   if (args.length === 1 && args[0] === "--help") return "help";
-  return args.length === flags.length && flags.every((flag) => args.includes(flag)) ? "inspect" : "invalid";
+  if (!flags.every((flag) => args.includes(flag))) return "invalid";
+  if (args.length === flags.length) return "inspect";
+  const extra = args.filter((arg) => !flags.includes(arg));
+  return args.length === 3 && extra.length === 1 && extra[0].startsWith(replitFlag)
+    && replIdPattern.test(extra[0].slice(replitFlag.length)) ? "inspect-replit-development" : "invalid";
 }
 
 /** No libpq/environment fallbacks, URL option redirects or TLS downgrades. Never print the returned config. */
 export function databaseCheckPoolOptions(value: string | undefined): PoolConfig & { replication: "false" } {
+  return parsePoolOptions(value, false);
+}
+
+// The internal branch is only used by the explicit project-bound resolver below.
+function parsePoolOptions(value: string | undefined, replitDevelopment: boolean): PoolConfig & { replication: "false" } {
   const invalid = (): never => { throw new Error("ANALYSIS_DATABASE_TARGET_INVALID"); };
   if (!value || value.length > 8192 || /[\u0000-\u0020\u007f]/.test(value)) invalid();
   try {
@@ -37,7 +51,9 @@ export function databaseCheckPoolOptions(value: string | undefined): PoolConfig 
     if (entries.length > 1 || entries.some(([key]) => key !== "sslmode")) invalid();
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(host.toLowerCase());
     const mode = url.searchParams.get("sslmode");
-    if (mode !== "require" && mode !== "verify-full" && !(loopback && (mode === null || mode === "disable"))) invalid();
+    if (replitDevelopment) {
+      if (host !== "helium" || port !== 5432 || mode !== "disable") invalid();
+    } else if (mode !== "require" && mode !== "verify-full" && !(loopback && (mode === null || mode === "disable"))) invalid();
     return {
       host, port, user, password, database,
       ssl: mode === "require" || mode === "verify-full" ? { rejectUnauthorized: true } : false,
@@ -48,6 +64,40 @@ export function databaseCheckPoolOptions(value: string | undefined): PoolConfig 
       statement_timeout: 2000, lock_timeout: 1000, idle_in_transaction_session_timeout: 3000,
     };
   } catch { return invalid(); }
+}
+
+/** Explicit operator approval, not proof of platform isolation. Resolve once and pin the checked IP. */
+export async function replitDevelopmentPoolOptions(value: string | undefined, options: {
+  expectedReplId: string; env: Readonly<Record<string, string | undefined>>; signal: AbortSignal;
+}): Promise<PoolConfig & { replication: "false" }> {
+  const invalid = () => new Error("ANALYSIS_DATABASE_TARGET_INVALID");
+  const { env, signal, expectedReplId } = options;
+  if (signal.aborted || !replIdPattern.test(expectedReplId) || env.REPL_ID !== expectedReplId
+    || ![undefined, "", "development"].includes(env.NODE_ENV)
+    || ![undefined, "", "0", "false"].includes(env.REPLIT_DEPLOYMENT)) throw invalid();
+  const config = parsePoolOptions(value, true);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const stopped = new Promise<never>((_, reject) => {
+      onAbort = () => reject(invalid());
+      signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(onAbort, 1500);
+      if (signal.aborted) onAbort();
+    });
+    const addresses = await Promise.race([dns.lookup("helium", { all: true }), stopped]);
+    if (signal.aborted || addresses.length < 1 || addresses.length > 8 || !addresses.every(({ address, family }) => {
+      if (family !== 4 || isIP(address) !== 4) return false;
+      const [first, second] = address.split(".").map(Number);
+      return first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168);
+    })) throw invalid();
+    // No second hostname lookup by pg; mixed/public/link-local/IPv6 answers never reach a connection.
+    return { ...config, host: addresses[0].address };
+  } catch { throw invalid(); }
+  finally {
+    clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function report(status: "passed" | "failed" | "arguments-required" | "target-invalid") {
@@ -61,9 +111,16 @@ export async function runAnalysisDatabaseCheck(options: {
 }) {
   const mode = databaseCheckMode(options.args);
   if (mode === "help") return { exitCode: 0, output: help };
-  if (mode !== "inspect") return { exitCode: 2, output: JSON.stringify(report("arguments-required")) };
+  if (mode === "invalid") return { exitCode: 2, output: JSON.stringify(report("arguments-required")) };
+  if (options.signal.aborted) return { exitCode: 1, output: JSON.stringify(report("failed")) };
   let config: PoolConfig;
-  try { config = databaseCheckPoolOptions(options.env.DATABASE_URL?.trim()); }
+  try {
+    const value = options.env.DATABASE_URL?.trim();
+    config = mode === "inspect-replit-development"
+      ? await replitDevelopmentPoolOptions(value, { expectedReplId: options.args.find((arg) => arg.startsWith(replitFlag))!.slice(replitFlag.length),
+        env: options.env, signal: options.signal })
+      : databaseCheckPoolOptions(value);
+  }
   catch { return { exitCode: 1, output: JSON.stringify(report("target-invalid")) }; }
   if (options.signal.aborted) return { exitCode: 1, output: JSON.stringify(report("failed")) };
   let pool: Pool | undefined; let output = JSON.stringify(report("failed")); let exitCode = 1;
