@@ -89,12 +89,26 @@ test("Replit media checks remain mandatory and do not silently fall back", () =>
 
 function assertHeadlessMediaDependency(source) {
   assert.match(source, /https:\/\/github\.com\/NixOS\/nixpkgs\/archive\/1559d3daa3ecc813a650b79375ea61b6741b8746\.tar\.gz/);
-  assert.match(source, /assert showmePkgs\.ffmpeg_8-headless\.version == "8\.1\.2";/);
-  assert.match(source, /deps = \[ showmePkgs\.ffmpeg_8-headless \];/);
-  assert.doesNotMatch(source, /ffmpeg_8-full|\.override(?:Attrs)?\b/);
+  assert.match(source, /assert showmeMedia\.version == "8\.1\.2";/);
+  assert.match(source, /deps = \[ showmeMedia \];/);
+  assert.doesNotMatch(source, /ffmpeg_8-full|\.overrideAttrs\b/);
+  const options = source.match(/showmeMedia = showmePkgs\.ffmpeg_8-headless\.override \{([^]*?)\n  \};/)?.[1];
+  assert.ok(options, "explicit reviewed media profile is required");
+  const uncommented = options.replace(/#[^\n]*/g, "");
+  const entries = [...uncommented.matchAll(/\b(\w+)\s*=\s*(true|false);/g)];
+  assert.equal(uncommented.replace(/\b\w+\s*=\s*(?:true|false);/g, "").trim(), "");
+  assert.equal(new Set(entries.map(entry => entry[1])).size, entries.length);
+  assert.deepEqual(Object.fromEntries(entries.map(([, key, value]) => [key, value === "true"])), {
+    withHeadlessDeps: false, withSmallDeps: false, withFullDeps: false,
+    buildFfmpeg: true, buildFfprobe: true, buildAvcodec: true, buildAvdevice: true,
+    buildAvfilter: true, buildAvformat: true, buildAvutil: true, buildSwresample: true, buildSwscale: true,
+    withSafeBitstreamReader: true, withHardcodedTables: true, withPixelutils: true,
+    withRuntimeCPUDetection: true, withNetwork: false,
+    withX264: true, withX265: true, withVpx: true, withAom: true, withDav1d: true, withOpus: true, withZlib: true,
+  });
 }
 
-test("Replit uses the pinned headless FFmpeg without changing the reviewed version", () => {
+test("Replit scopes FFmpeg dependencies without changing the reviewed source, codecs or image budgets", () => {
   assertHeadlessMediaDependency(read("replit.nix"));
   const loader = read("artifacts/api-server/src/processor/analysis-images.ts");
   const budgets = read("artifacts/api-server/src/processor/analysis-image-policy.ts");
@@ -114,7 +128,14 @@ test("the media dependency guard rejects full fallback, unpinned source and vers
     source.replaceAll("ffmpeg_8-headless", "ffmpeg_8-full"),
     source.replace("1559d3daa3ecc813a650b79375ea61b6741b8746", "master"),
     source.replace('== "8.1.2"', '== "8.1.0"'),
-    source.replace("deps = [ showmePkgs.ffmpeg_8-headless ];", "deps = [ showmePkgs.ffmpeg_8-full ];"),
+    source.replace("deps = [ showmeMedia ];", "deps = [ showmePkgs.ffmpeg_8-full ];"),
+    source.replace("withSafeBitstreamReader = true;", "withSafeBitstreamReader = false;"),
+    source.replace("withNetwork = false;", "withNetwork = true;"),
+    source.replace("withHeadlessDeps = false;", "withHeadlessDeps = true;"),
+    source.replace("withVpx = true;", "withVpx = false;"),
+    source.replace("withX265 = true;", "withX265 = false;"),
+    source.replace("withAom = true;", "withAom = false;"),
+    source.replace("withDav1d = true;", "withDav1d = false;"),
   ]) assert.throws(() => assertHeadlessMediaDependency(changed));
 });
 
