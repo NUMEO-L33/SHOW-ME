@@ -63,6 +63,8 @@ Gemini 시험 화면 두 장은 보존된 코드의 픽셀/글꼴 알고리즘�
 
 2026-09-18 최신 로컬 회귀: 사용자 승인으로 프로젝트 지정 Replit 내부 개발 DB 연결 선택지를 추가했다. 명시적 인수·프로젝트 일치·개발 환경·정확한 Helium 대상·사설 DNS 결과·IP 고정·취소/시간 초과·기본 경로 비완화의 신규 검사 8개를 포함해 **일반 727개(91+579+57), 실제 로컬 PostgreSQL 70개, 실패·생략 0, 종료 코드 0** 및 API 제품/테스트 타입 검사를 통과했다. PostgreSQL 실행 뒤 임시 컨테이너 정리를 확인했다. 제품 빌드·Replit 서버 재시작은 하지 않았다. 실제 Replit DB 재검증 결과와 연결 경계는 [DB 검사 문서](ANALYSIS_DATABASE_PROBE.md)를 따른다.
 
+같은 날 코드 `63d59e8`의 Replit 후속: **B5 단위 63개·API 제품/테스트 타입·실제 내부 개발 DB 읽기 전용 점검 모두 통과**했다. 실제 관측 시각은 `2026-09-18T10:25:24.441Z`, `status:passed`, 종료 코드 0이다. DB 구조/권한/중단 상태를 조회했으며 `ready:false`, `authorizesAnalysis:false`, `changesApplied:false`를 유지했다. 운영/게시 DB나 AI 준비 전체의 완료가 아니며, 아래 `target-invalid`는 기본 연결 경로의 이전 결과다.
+
 AI 실행 조건 연결부의 기본 검사는 `artifacts/api-server/tests/analysis-readiness.test.ts`에 있다. 세 모의 근거의 결합·만료·철회·취소·저장 직전 재검증을 다루며 기본 서버 검사에 자동 포함된다. 실제 계정/운영 준비 완료나 외부 전송 허가가 아니다. [구현 범위와 남은 조건](ANALYSIS_READINESS.md)을 따른다.
 
 후속 DB 조건 조회의 모의 검사는 `analysis-database-probe.test.ts`이며, 실제 엔진용 19개는 아래 분리된 PostgreSQL 검사에 추가했다(총 66개). 2026-09-18 재부팅 후 실제 PostgreSQL 16.15에서 **66개 모두 통과, 실패·생략 0, 종료 코드 0** 및 임시 컨테이너 정리를 확인했다. 첫 실행에서 발견한 raw timestamp 형식과 배열 SQL 바인딩 오류를 수정하고 재발 방지 검사 2개를 추가했다. [조회 범위와 한계](ANALYSIS_DATABASE_PROBE.md)를 따른다.

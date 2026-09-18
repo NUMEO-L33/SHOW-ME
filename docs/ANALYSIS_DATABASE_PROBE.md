@@ -49,7 +49,16 @@ pnpm --filter @workspace/api-server check:analysis-db --configured-database --re
 - 기존 `DATABASE_URL`의 호스트가 정확히 `helium`, 포트가 5432, 옵션이 정확히 `sslmode=disable`일 때만 허용한다. 다른 호스트·직접 IP·포트·추가 옵션이나 TLS 프로필로 자동 전환하지 않는다.
 - DNS는 1.5초 안에 한 번 조회한다. 결과가 1–8개의 RFC1918 IPv4 사설 주소로만 이루어져야 한다. 공개 주소·혼합 결과·loopback·link-local·IPv6는 거절한다. 확인한 IP를 연결에 직접 고정해 두 번째 DNS 조회를 하지 않는다. 취소/시간 초과 뒤 늦은 응답은 접속을 만들지 못한다.
 - 이 경로는 전송 암호화를 제공하지 않으며 **Replit 내부 네트워크 격리에 의존**한다. 환경변수/사설 IP 검사는 운영자의 대상 확인을 돕는 방어 장치이지, 플랫폼 격리나 실행 환경의 신원을 암호학적으로 증명하지 않는다. 기존 Secrets·서비스·DB 설정은 변경하지 않는다.
-- 새 회귀 검사 **8개**, 일반 전체 **727개(이관 91 + 서버 579 + 클라이언트 57)** 및 실제 로컬 PostgreSQL **70개**가 실패·생략 0, 종료 코드 0으로 통과했다. API 제품/테스트 타입 검사도 통과했고 임시 DB/컨테이너 정리를 확인했다. Replit 실제 대상의 새 경로 실행 결과는 반영 후 별도로 기록한다. 이번 변경은 독립 CLI와 검사·문서뿐이며 제품 빌드/서버 재시작은 필요하지 않다.
+- 새 회귀 검사 **8개**, 일반 전체 **727개(이관 91 + 서버 579 + 클라이언트 57)** 및 실제 로컬 PostgreSQL **70개**가 실패·생략 0, 종료 코드 0으로 통과했다. API 제품/테스트 타입 검사도 통과했고 임시 DB/컨테이너 정리를 확인했다. 이번 변경은 독립 CLI와 검사·문서뿐이며 제품 빌드/서버 재시작은 하지 않았다.
+
+### 실제 Replit 개발 DB 재검증 — 통과
+
+- 구현을 `63d59e8d3ed1f30516b5d25d4de210ef31c19db7`로 커밋·푸시하고, 승인된 SHOW-ME Replit 작업본만 fast-forward 반영했다. 실행 중인 API의 빌드/재시작, 의존성 설치, Secrets 변경은 하지 않았다.
+- 프로젝트 화면에서 확인한 UUID와 `REPL_ID` 일치, Helium 대상/기본 포트/SSL 비활성 설정 및 개발 환경을 비밀값 없는 boolean/분류로 확인했다. 이 프로젝트 UUID를 명령 인수로 직접 지정했다.
+- Replit B5 검사 **63개 모두 통과, 실패·생략 0, 종료 코드 0(8.38초)** 및 API 제품/테스트 타입 검사를 통과했다. `&&`로 앞 단계 성공 시에만 실제 점검을 시작했다.
+- 관측 시각 **2026-09-18T10:25:24.441Z**: 실제 명령의 `status:passed`, `REPLIT_DB_VERIFY_EXIT 0`을 확인했다. `migrationHistory:matches-local-files`, `columnsAndUniqueKeys:matched`, `checkConstraints:present-and-validated`, `countLaunchStatus:supported`, `tablePrivileges:select-insert-update-delete`, `accountingControl:open`이다. 권한 존재를 조회했을 뿐 INSERT/UPDATE/DELETE를 실행하지 않았다.
+- 결과는 계속 **`ready:false`, `authorizesAnalysis:false`, `changesApplied:false`**다. 읽기 전용 점검 transaction을 마치고 전용 pool을 닫았다. 사용자 영상·추출 화면·초안·편집 키 조회/전송, migration/복구, 외부 AI 활성화, 공개 공유는 하지 않았다.
+- **이 개발 DB의 시점별 부분 점검은 완료**했다. 운영/게시 DB 검증, 실행 중인 API pool과의 동일성, 전체 인프라 보안·로그·백업 및 실환경 근거 발급/갱신/철회 완료를 뜻하지 않는다. 이전 기본 경로의 `target-invalid` 기록은 당시 결과로 보존한다.
 
 ### 이전 2026-09-18 Replit 실행 결과 — 기본 TLS 경로
 
