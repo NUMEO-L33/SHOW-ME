@@ -61,6 +61,7 @@ for (const path of [
   ".sites-runtime/profile.json", ".agents/local.md", ".codex/local.json",
   ".wrangler/state/db.sqlite", "work/synthetic-upload.mp4", "outputs/synthetic-frame.jpg",
   "screenshots/private-screen.png",
+  ".private-access-check/run.json",
 ]) {
   test(`private/generated path is excluded: ${path}`, () => assert.equal(isIgnored(path), true));
 }

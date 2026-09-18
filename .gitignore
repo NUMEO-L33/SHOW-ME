@@ -63,6 +63,9 @@ coverage/
 /work/
 /screenshots/
 
+# Private recovery key for the opt-in synthetic access check (never commit).
+/.private-access-check/
+
 # Checkout-local tooling and previous hosting runtime state.
 .sites-runtime/
 .agents/
