@@ -35,13 +35,16 @@ const snapshotSchema = z.object({
   ]),
 }).strict();
 export type AnalysisAdmissionSnapshot = z.infer<typeof snapshotSchema>;
-export type AnalysisAdmissionInput = Pick<AnalysisAdmissionSnapshot, "guideId" | "inputFingerprint" | "frameCount" | "model" | "promptVersion">;
+export const analysisAdmissionInputSchema = snapshotSchema.pick({ guideId: true, inputFingerprint: true,
+  frameCount: true, model: true, promptVersion: true });
+export type AnalysisAdmissionInput = z.infer<typeof analysisAdmissionInputSchema>;
 
 /**
- * Future trusted B4/B5 adapter. Must verify the configured DB/worker, approved
+ * Trusted B4/B5 adapter. Must verify the configured DB/worker, approved
  * synthetic input, full token bound, provider project/free quota or spending
  * approval. Never source this object from HTTP or smoke-test env booleans.
- * This turn supplies NO live implementation. inspect must not transmit images.
+ * The evidence coordinator is not a live source of these facts. Startup supplies
+ * neither one; inspect must not transmit images (including via countTokens).
  */
 export interface AnalysisAdmissionReadiness {
   inspect(input: AnalysisAdmissionInput, signal: AbortSignal): Promise<unknown>;

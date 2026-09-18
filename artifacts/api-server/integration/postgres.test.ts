@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
+import { drizzle } from "drizzle-orm/node-postgres";
+import * as processorSchema from "../src/processor/db/schema.js";
 import { ANALYSIS_CONSENT_VERSION, analysisBatches, analysisManifest, initialDraft } from "../src/processor/analysis-contract.js";
 import { type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
 import { runDatabaseMigrations } from "../src/processor/database-migrations.js";
@@ -19,6 +23,7 @@ import { AccountedGeminiMeasurements } from "../src/processor/gemini/counted-mea
 import { GeminiAnalysisProvider } from "../src/processor/gemini/provider.js";
 import { auditGeminiInput } from "../src/processor/gemini/input-bound.js";
 import { inputBoundFixture } from "../tests/helpers/input-bound-fixture.js";
+import { PostgresAnalysisDatabaseProbe, AnalysisDatabaseProbeError } from "../src/processor/analysis-database-probe.js";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -96,6 +101,145 @@ async function waitForFixtureLocks(pool: Pool, count: number) {
     await delay(10);
   }
   assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
+}
+
+test("real PostgreSQL: analysis database observation is read-only, private and not an execution permit", async t => {
+  const h = await fixture(t); await h.seed();
+  const before = await Promise.all(["guides", "guide_steps", "guide_drafts", "analysis_runs", "analysis_budget_windows",
+    "analysis_reservations", "analysis_batches", "analysis_accounting_controls", "analysis_request_attempts"].map(h.rows));
+  const probe = new PostgresAnalysisDatabaseProbe({ database: h.repository.database, migrationsFolder: "drizzle" });
+  const report = await probe.inspect(new AbortController().signal);
+  assert.equal(report.authorizesAnalysis, false); assert.equal(report.scope, "database-only");
+  assert.equal(report.countLaunchStatus, "supported"); assert.equal(report.accountingControl, "open");
+  assert.ok(Math.abs(Date.parse(report.observedAt) - Date.now()) < 5000);
+  const serialized = JSON.stringify(report);
+  for (const secret of ["synthetic-test-token", "synthetic guide", "fictional.mp4", h.connection, "fixture/", "postgresql:"]) assert.ok(!serialized.includes(secret));
+  assert.deepEqual(await Promise.all(["guides", "guide_steps", "guide_drafts", "analysis_runs", "analysis_budget_windows",
+    "analysis_reservations", "analysis_batches", "analysis_accounting_controls", "analysis_request_attempts"].map(h.rows)), before);
+  for (const table of ["analysis_count_attempts", "analysis_provider_quota_charges"]) {
+    assert.equal((await h.pool.query(`SELECT count(*)::int AS n FROM ${table}`)).rows[0].n, 0);
+  }
+  assert.equal((await h.pool.query("SHOW transaction_read_only")).rows[0].transaction_read_only, "off");
+});
+
+for (const scenario of ["healthy", "unmigrated", "halted", "wrong-password"] as const) {
+  test(`real PostgreSQL: standalone DB check ${scenario} is private, read-only and not readiness`, async t => {
+    const h = await fixture(t, scenario !== "unmigrated");
+    if (scenario === "halted") await h.pool.query("UPDATE analysis_accounting_controls SET payload='{\"halted\":true}' WHERE id='global'");
+    if (scenario === "healthy") await h.seed();
+    const before = scenario === "unmigrated" ? null : await Promise.all(["guides", "guide_steps", "guide_drafts", "analysis_accounting_controls"].map(h.rows));
+    const target = new URL(h.connection);
+    if (scenario === "wrong-password") target.password = "fictional-wrong-password";
+    const result = await new Promise<{ code: number; stdout: string; stderr: string }>((done) => {
+      execFile(process.execPath, ["--import", "tsx", resolve("src/processor/analysis-database-check.ts"), "--configured-database", "--read-only"], {
+        // Parent environment was scrubbed by the isolated Docker runner. No operational URL is used.
+        env: { ...process.env, DATABASE_URL: target.toString(), NODE_ENV: "production", PORT: "invalid",
+          PGHOST: "wrong.invalid", PGDATABASE: "wrong-db", PGUSER: "wrong-user", PGPASSWORD: "wrong-password",
+          PGOPTIONS: "-c default_transaction_read_only=on", PGREPLICATION: "database", PGSSLMODE: "no-verify",
+          GEMINI_API_KEY: "fictional-must-not-be-used" },
+        encoding: "utf8", windowsHide: true, timeout: 15000, maxBuffer: 16384,
+      }, (error, stdout, stderr) => done({ code: typeof error?.code === "number" ? error.code : error ? -1 : 0, stdout, stderr }));
+    });
+    assert.equal(result.code, scenario === "healthy" ? 0 : 1); assert.equal(result.stderr, "");
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.status, scenario === "healthy" ? "passed" : "failed");
+    assert.equal(output.ready, false); assert.equal(output.authorizesAnalysis, false); assert.equal(output.changesApplied, false);
+    for (const secret of [h.connection, target.password, "synthetic-test-token", "fixture/", "fictional-wrong-password", "wrong.invalid"]) {
+      assert.ok(!result.stdout.includes(secret));
+    }
+    if (scenario === "unmigrated") {
+      assert.equal((await h.pool.query("SELECT to_regclass('public.guides') AS relation")).rows[0].relation, null);
+      assert.equal((await h.pool.query("SELECT to_regclass('drizzle.__drizzle_migrations') AS relation")).rows[0].relation, null);
+    } else {
+      assert.deepEqual(await Promise.all(["guides", "guide_steps", "guide_drafts", "analysis_accounting_controls"].map(h.rows)), before);
+    }
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname=current_database() AND application_name='showme-analysis-database-check'")).rows[0].n, 0);
+  });
+}
+
+const databaseProbeFailures = [
+  ["unmigrated database", ""],
+  ["changed historical migration", "UPDATE drizzle.__drizzle_migrations SET hash=repeat('a',64) WHERE id=(SELECT min(id) FROM drizzle.__drizzle_migrations)"],
+  ["missing final migration", "DELETE FROM drizzle.__drizzle_migrations WHERE id=(SELECT max(id) FROM drizzle.__drizzle_migrations)"],
+  ["missing quota relation", "DROP TABLE analysis_provider_quota_charges"],
+  ["wrong column type", "ALTER TABLE analysis_count_attempts ALTER COLUMN batch_index TYPE bigint"],
+  ["missing unique key", "DROP INDEX analysis_count_slot_unique"],
+  ["missing safety check", "ALTER TABLE analysis_count_attempts DROP CONSTRAINT analysis_count_identity_check"],
+  ["unvalidated safety check", "ALTER TABLE analysis_count_attempts DROP CONSTRAINT analysis_count_identity_check; ALTER TABLE analysis_count_attempts ADD CONSTRAINT analysis_count_identity_check CHECK (false) NOT VALID"],
+  ["old count launch status", "ALTER TABLE analysis_count_attempts DROP CONSTRAINT analysis_count_status_check; ALTER TABLE analysis_count_attempts ADD CONSTRAINT analysis_count_status_check CHECK (status IN ('reserved','sending','settled','uncertain','overrun','released'))"],
+  ["weakened count launch status", "ALTER TABLE analysis_count_attempts DROP CONSTRAINT analysis_count_status_check; ALTER TABLE analysis_count_attempts ADD CONSTRAINT analysis_count_status_check CHECK (true)"],
+  ["row level filtering", "ALTER TABLE analysis_runs ENABLE ROW LEVEL SECURITY"],
+  ["missing global control", "DELETE FROM analysis_accounting_controls WHERE id='global'"],
+  ["halted accounting", "UPDATE analysis_accounting_controls SET payload='{\"halted\":true}' WHERE id='global'"],
+  ["malformed control", "UPDATE analysis_accounting_controls SET payload='{\"halted\":\"false\"}' WHERE id='global'"],
+] as const;
+for (const [name, change] of databaseProbeFailures) {
+  test(`real PostgreSQL: database probe rejects ${name} without repair`, async t => {
+    const h = await fixture(t, Boolean(change));
+    if (change) {
+      const healthy = new PostgresAnalysisDatabaseProbe({ database: h.repository.database, migrationsFolder: "drizzle" });
+      assert.equal((await healthy.inspect(new AbortController().signal)).accountingControl, "open");
+    }
+    if (change) await h.pool.query(change); // Only this test's disposable fixture database.
+    const probe = new PostgresAnalysisDatabaseProbe({ database: h.repository.database, migrationsFolder: "drizzle" });
+    await assert.rejects(probe.inspect(new AbortController().signal), (error: unknown) => {
+      assert.ok(error instanceof AnalysisDatabaseProbeError);
+      assert.equal(error.message, "ANALYSIS_DATABASE_UNAVAILABLE"); return true;
+    });
+    if (!change) assert.equal((await h.pool.query("SELECT to_regclass('public.analysis_runs') AS relation")).rows[0].relation, null);
+    if (name === "halted accounting") assert.deepEqual((await h.pool.query("SELECT payload FROM analysis_accounting_controls WHERE id='global'")).rows[0].payload, { halted: true });
+  });
+}
+
+test("real PostgreSQL: lock contention times out without cancelling or modifying the blocking transaction", async t => {
+  const h = await fixture(t);
+  const blocker = await h.pool.connect();
+  try {
+    await blocker.query("BEGIN"); await blocker.query("LOCK TABLE analysis_accounting_controls IN ACCESS EXCLUSIVE MODE");
+    const probe = new PostgresAnalysisDatabaseProbe({ database: h.repository.database, migrationsFolder: "drizzle" });
+    const rejection = assert.rejects(probe.inspect(new AbortController().signal), AnalysisDatabaseProbeError);
+    await waitForFixtureLocks(h.pool, 1);
+    await rejection;
+    assert.equal((await blocker.query("SELECT 1 AS alive")).rows[0].alive, 1);
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); }
+  const probe = new PostgresAnalysisDatabaseProbe({ database: h.repository.database, migrationsFolder: "drizzle" });
+  assert.equal((await probe.inspect(new AbortController().signal)).authorizesAnalysis, false);
+});
+
+test("real PostgreSQL: a read-only role cannot masquerade as a writable analysis runtime", async t => {
+  const h = await fixture(t); const client = await h.pool.connect();
+  const role = `showme_probe_${randomUUID().replaceAll("-", "")}`;
+  await client.query(`CREATE ROLE "${role}" NOLOGIN`);
+  try {
+    await client.query(`GRANT USAGE ON SCHEMA public,drizzle TO "${role}"`);
+    await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public,drizzle TO "${role}"`);
+    await client.query(`SET ROLE "${role}"`);
+    const probe = new PostgresAnalysisDatabaseProbe({ database: drizzle(client, { schema: processorSchema }), migrationsFolder: "drizzle" });
+    await assert.rejects(probe.inspect(new AbortController().signal), AnalysisDatabaseProbeError);
+    assert.equal((await client.query("SELECT has_table_privilege('public.analysis_count_attempts','INSERT') AS allowed")).rows[0].allowed, false);
+  } finally {
+    await client.query("RESET ROLE");
+    await client.query(`DROP OWNED BY "${role}"`); // Only the generated fixture role's grants in this disposable database.
+    await client.query(`DROP ROLE "${role}"`); client.release();
+  }
+});
+
+for (const mode of ["default-read-only", "shadow-schema"] as const) {
+  test(`real PostgreSQL: database inspection rejects ${mode} without changing the connection setting`, async t => {
+    const h = await fixture(t); const client = await h.pool.connect();
+    try {
+      if (mode === "default-read-only") await client.query("SET default_transaction_read_only=on");
+      else {
+        await client.query("CREATE SCHEMA probe_shadow");
+        await client.query("CREATE TABLE probe_shadow.analysis_runs AS TABLE public.analysis_runs WITH NO DATA");
+        await client.query("SET search_path=probe_shadow,public");
+      }
+      const probe = new PostgresAnalysisDatabaseProbe({ database: drizzle(client, { schema: processorSchema }), migrationsFolder: "drizzle" });
+      await assert.rejects(probe.inspect(new AbortController().signal), AnalysisDatabaseProbeError);
+      if (mode === "default-read-only") assert.equal((await client.query("SHOW default_transaction_read_only")).rows[0].default_transaction_read_only, "on");
+      else assert.equal((await client.query("SHOW search_path")).rows[0].search_path, "probe_shadow, public");
+    } finally { await client.query("RESET default_transaction_read_only"); await client.query("RESET search_path"); client.release(); }
+  });
 }
 
 test("real PostgreSQL: saved drafts fence expiry, legacy drafts filter before LIMIT, and retention updates roll back", async t => {
