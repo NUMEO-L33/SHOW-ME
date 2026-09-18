@@ -24,16 +24,27 @@
 
 실행 환경 근거를 발급하려면 저장소·실행기·프로젝트/키·한도·호스팅 근거와 연결하고 변경 시 철회하는 과정이 여전히 필요하다. 이 관측 결과를 HTTP/env JSON으로 복사해 이전 readiness 연결부에 넣거나 `isCurrent:()=>true`로 감싸지 않는다.
 
-## 명시적 실행 명령 — 운영 환경에서는 아직 실행하지 않음
+## 명시적 실행 명령 — Replit 개발 DB는 접속 전 거절
 
 `analysis-database-check.ts`는 현재 프로세스의 `DATABASE_URL`로 별도 연결 하나를 만들고 위 검사를 호출한다. **실행 중인 API 서버의 pool을 검사하는 것이 아니므로, 같은 설정·배포를 쓰는지 별도로 확인해야 한다.** 로컬 셸의 성공을 Replit 결과로 옮겨 적지 않는다.
 
-아래는 코드가 반영된 환경에서 대상 프로젝트와 개발/운영 구분을 확인한 뒤 별도 승인을 받아 실행할 명령이다. 현재 Replit에는 새 명령을 반영하지 않았다.
+아래 명령은 대상 프로젝트와 개발/운영 구분을 확인한 뒤 별도 승인을 받아 실행한다. 2026-09-18 사용자 승인으로 코드 `555b504cce54cffd2c4a98c5e949d21c816dff94`를 기존 브랜치에 커밋·푸시하고 SHOW-ME Replit 작업본에 fast-forward 반영했다. 서버 재시작·빌드·의존성 설치는 하지 않아 실행 중인 제품 번들은 이전 `1afce8f` 기준을 유지한다.
 
 ```sh
 pnpm --filter @workspace/api-server check:analysis-db --help
 pnpm --filter @workspace/api-server check:analysis-db --configured-database --read-only
 ```
+
+### 2026-09-18 Replit 실행 결과
+
+- 격리 환경의 B5 단위 검사 **55개 모두 통과, 실패·생략 0, 종료 코드 0**. API 제품/테스트 타입 검사도 종료 코드 0이다. 이 실행에서 일반 719개나 제품 빌드를 다시 실행한 것은 아니다.
+- 실제 설정 대상 명령은 **`status:target-invalid`, 종료 코드 1**로 Pool 생성 전에 끝났다. DB 인증·SQL 조회를 하지 않았으므로 실제 Replit DB 검증 통과로 기록하지 않는다.
+- 비밀값을 출력하지 않는 분류로 대상이 공식 개발 DB 호스트 `helium`과 일치하고, DNS 결과 한 개가 사설 주소이며 `sslmode=disable`인 점을 확인했다. 별도 단일 연결에서 PostgreSQL SSLRequest만 보내 `tls-not-supported`를 확인했다. 이 진단은 비밀번호·StartupMessage·SQL을 전송하지 않고 연결을 닫았다.
+- [Replit 공식 문서](https://docs.replit.com/features/data-and-storage/development-and-production#ssl-connection-errors-after-the-upgrade)는 Helium 개발 DB가 앱 옆에서 실행되고 SSL을 사용하지 않는다고 설명한다. 현재 점검기의 **loopback 이외 TLS 필수 조건과 Replit 개발 DB 연결 방식이 맞지 않는다**. 이 결과만으로 DB 고장이나 유출을 뜻하지 않으며 플랫폼 격리 전체를 검증한 것도 아니다.
+- Secrets·암호화 설정·점검 허용 조건을 변경하거나 URL을 덮어써 우회하지 않았다. DB 행·schema·Storage·사용자 영상에는 접근하지 않았고 외부 AI는 꺼진 상태다.
+- 다음 단계는 사용자 확인을 받고 **이 앱의 Replit 내부 개발 DB에 한정한 명시적 연결 방식**을 추가·시험하는 것이다. 해당 경로는 TLS 대신 Replit 내부 격리에 의존함을 분명히 하고, 원격 DB의 TLS/인증서 검증은 유지해야 한다. 임의 사설 주소 허용, 모든 개발 환경에서 SSL 해제, 공개·운영 DB로 자동 확대는 하지 않는다.
+
+### 명령의 경계와 로컬 검증
 
 - 두 실행 인수가 모두 있어야 접속한다. 인수 없음·오타·중복·추가 URL/쓰기/AI 옵션은 종료 코드 2로 거절한다. `--help`는 접속하지 않는다.
 - `.env`를 읽거나 설정을 바꾸지 않으며, URL·암호를 명령 인수로 받지 않는다. 연결 대상은 기존 `DATABASE_URL` 하나다. DB 이름·주소·계정·연결 문자열·원문 오류는 출력하지 않는다.
@@ -55,4 +66,4 @@ pnpm --filter @workspace/api-server check:analysis-db --configured-database --re
 - 재부팅 후 첫 실제 실행은 64개 통과·2개 실패였다. Drizzle raw timestamp가 Date가 아닌 문자열인데 Date를 요구한 문제와, 테이블 이름 배열이 SQL 행 매개변수로 펼쳐진 문제를 확인했다. 시각은 안전한 정수 epoch 밀리초로 조회하고 배열은 `sql.param` 하나로 바인딩하도록 수정했다. 수정 전 재발 방지 검사 2개의 실패를 확인했고 수정 후 단독 18개·실제 66개·일반 710개를 통과했다. 거절 조건·잠금 시간 제한을 완화하거나 원문 DB 오류를 노출하지 않았다.
 - 기존 설치/이미지를 쓰는 격리 실행기를 사용했으며 운영 환경값은 제외했다. 두 실행 모두 `postgres_fixture_removed`로 해당 임시 DB/컨테이너 정리를 확인했다. 시험 자료는 tmpfs의 일회용 데이터이며 보관하지 않는다. 새 설치/이미지 다운로드, Replit DB·Storage, 외부 AI, 사용자 영상 또는 CDP에 접근하지 않았다.
 - 이전 Docker 시작/종료 및 named pipe 오류는 **사용자 재부팅·Docker 실행 후 해소**됐다. Docker 29.7.2 응답을 확인한 뒤 검사했다. 이번에는 Docker 앱을 재시작하거나 강제 종료·재설정하지 않았으며 사용자가 켜 둔 상태를 유지했다.
-- 변경은 로컬이며 커밋·푸시·Replit 반영 전이다. DB 부분 조회 검증은 완료했으나, 실제 근거 발급/갱신/철회와 운영 대상 연결 검증은 여전히 남아 있다. 외부 AI와 서버 시작 연결은 계속 꺼져 있다.
+- 위 본체 검증 당시에는 로컬 미커밋 상태였다. 이후 코드 커밋·Replit 반영 및 실제 대상의 접속 전 거절 결과는 위 최신 실행 절을 따른다. 실제 근거 발급/갱신/철회와 운영 대상 연결 검증은 여전히 남아 있다. 외부 AI와 서버 시작 연결은 계속 꺼져 있다.
