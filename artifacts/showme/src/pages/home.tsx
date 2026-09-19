@@ -40,7 +40,7 @@ import { parsePersistedActiveJob, type ActiveJob, type PersistedActiveJob } from
 import { draftDocument, draftSteps, draftFailure, getDraft, putDraft, type DraftSnapshot } from "@/lib/draft-client";
 import { DraftAutosave } from "@/lib/draft-autosave";
 import { applyAnalysisPreview, type AnalysisPreview } from "@/lib/analysis-review";
-import { AnalysisReviewDialog } from "@/components/analysis-review-dialog";
+import { AnalysisWorkflow } from "@/components/analysis-workflow";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -1459,8 +1459,8 @@ export default function Home() {
           draftLoading={draftLoading}
           draftError={draftError}
           onCompositionChange={onDraftCompositionChange}
-          analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisReviewDialog
-            key={activeJob.guideId} identity={activeJob} base={draftSnapshot}
+          analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisWorkflow
+            key={`${activeJob.guideId}:${draftSnapshot.inputFingerprint}`} identity={activeJob} base={draftSnapshot}
             disabled={draftDirty || draftSaving || draftLoading || Boolean(draftError) || draftComposing}
             onApply={applyStoredAnalysis} /> : undefined}
         />

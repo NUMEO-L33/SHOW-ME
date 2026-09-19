@@ -117,9 +117,28 @@ export function createAnalysisRouter(options: {
     // Reauthenticate/re-read after asynchronous storage/admission. A deleted or
     // replaced guide must not return its old analysis as the current result.
     const current = await authenticate(request);
-    if (manifestFor(current).fingerprint !== run.manifest.fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
+    const fingerprint = manifestFor(current).fingerprint;
+    assertRequestedInput(request, fingerprint);
+    if (fingerprint !== run.manifest.fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
     return run;
   }
+
+  function assertRequestedInput(request: Request, fingerprint: string) {
+    const supplied = request.header("X-ShowMe-Input-Fingerprint");
+    if (supplied !== undefined && supplied !== fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
+  }
+
+  // Display contract only, NOT readiness evidence or an enable flag. Until
+  // trusted runtime evidence/dispatcher wiring exists, every product reports
+  // unavailable, including apps with a test admission injected elsewhere.
+  router.get("/capabilities", limiter(30, 60_000), auth, (request, response, next) => {
+    try {
+      const supplied = request.header("X-ShowMe-Input-Fingerprint");
+      if (!supplied || Object.keys(request.query).length) throw new AnalysisApiError("ANALYSIS_INVALID_REQUEST");
+      assertRequestedInput(request, manifestFor(guides.get(request)!).fingerprint);
+      response.json({ consentVersion: ANALYSIS_CONSENT_VERSION, startAvailable: false, reason: "ANALYSIS_UNAVAILABLE" });
+    } catch (error) { next(error); }
+  });
 
   router.post("/", limiter(10, 15 * 60_000), auth, requireJson, json, async (request, response, next) => {
     try {
@@ -129,6 +148,7 @@ export function createAnalysisRouter(options: {
         throw new AnalysisApiError("ANALYSIS_CONSENT_REQUIRED");
       }
       const guide = guides.get(request)!;
+      assertRequestedInput(request, manifestFor(guide).fingerprint);
       const command: AnalysisRequestCommand = {
         type: "request", runId: body.data.runId, baseDraftRevision: body.data.baseDraftRevision,
         consentVersion: ANALYSIS_CONSENT_VERSION, provider: "gemini", model: ANALYSIS_API_MODEL,

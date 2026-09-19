@@ -70,6 +70,37 @@ test("analysis startup is disabled without durable admission and creates no draf
   assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
 });
 
+test("UI capability is owner-only, input-bound, always blocked and never invokes admission", async context => {
+  const h = await harness(context);
+  const fingerprint = analysisManifest(h.guide).fingerprint;
+  const before = await h.repository.getAnalysisState(h.guideId);
+  for (const app of [h.app, h.appWith()]) {
+    const result = await request(app).get(`${h.url}/capabilities`).set("Authorization", h.authorization)
+      .set("X-ShowMe-Input-Fingerprint", fingerprint).expect(200);
+    assert.deepEqual(result.body, { consentVersion: ANALYSIS_CONSENT_VERSION, startAvailable: false, reason: "ANALYSIS_UNAVAILABLE" });
+    assert.equal(result.headers["cache-control"], "no-store");
+  }
+  await request(h.app).get(`${h.url}/capabilities`).set("X-ShowMe-Input-Fingerprint", fingerprint).expect(404);
+  await request(h.app).get(`${h.url}/capabilities`).set("Authorization", h.authorization).expect(400);
+  await request(h.app).get(`${h.url}/capabilities?enable=true`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", fingerprint).expect(400);
+  await request(h.app).get(`${h.url}/capabilities`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", "b".repeat(64)).expect(409);
+  assert.equal(h.submissions.length, 0); assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+});
+
+test("browser consent to an old media fingerprint cannot submit, read or cancel the replacement", async context => {
+  const h = await harness(context);
+  const stale = "b".repeat(64);
+  const sent = body();
+  await request(h.app).post(h.url).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", stale).send(sent).expect(409);
+  assert.equal(h.submissions.length, 0);
+  await request(h.app).post(h.url).set("Authorization", h.authorization)
+    .set("X-ShowMe-Input-Fingerprint", analysisManifest(h.guide).fingerprint).send(sent).expect(202);
+  const before = await h.repository.getAnalysisState(h.guideId);
+  await request(h.app).get(`${h.url}/${sent.runId}`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", stale).expect(409);
+  await request(h.app).post(`${h.url}/${sent.runId}/cancel`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", stale).expect(409);
+  assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+});
+
 test("latest analysis lookup is owner-only, draft-bound and has no initialization or admission side effects", async context => {
   const h = await harness(context);
   const query = { inputFingerprint: analysisManifest(h.guide).fingerprint };

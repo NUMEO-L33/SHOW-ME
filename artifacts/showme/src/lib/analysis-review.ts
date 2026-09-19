@@ -32,6 +32,7 @@ const envelopeSchema = z.object({
   inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/), frameIds: z.array(id).min(1).max(24), run: runSchema.nullable(),
 }).strict();
 export type StoredAnalysis = z.infer<typeof envelopeSchema>;
+export type AnalysisRunView = NonNullable<StoredAnalysis["run"]>;
 export type AnalysisPreview = { base: DraftSnapshot; analysis: StoredAnalysis };
 
 function invalid(): never { throw new ProcessorClientError("AI 결과와 현재 작업의 연결을 확인하지 못했어요.", undefined, "INVALID_RESPONSE"); }
@@ -51,6 +52,12 @@ export function parseStoredAnalysis(raw: unknown, base: DraftSnapshot): StoredAn
         steps.find(step => step.stepId === value.frameIds.at(-1))?.mergeWithNext) invalid();
   }
   return value;
+}
+
+export function parseAnalysisRun(raw: unknown, base: DraftSnapshot, frameIds: string[], runId: string): AnalysisRunView {
+  const envelope = z.object({ run: runSchema }).strict().safeParse(raw);
+  if (!envelope.success || envelope.data.run.runId !== runId) invalid();
+  return parseStoredAnalysis({ inputFingerprint: base.inputFingerprint, frameIds, run: envelope.data.run }, base).run!;
 }
 
 /** Explicit read only: no start, retry, polling, image upload or provider call. */
