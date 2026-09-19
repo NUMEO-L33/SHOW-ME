@@ -84,3 +84,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 설정 오류나 승인 만료로 enabled 모드 시작이 실패하면 `SHOWME_ANALYSIS_MODE=off`로 AI를 끈다. `verify-only`와 제한된 DB 계정은 유지하며, 이전 관리자 연결로 조용히 되돌리거나 승인 기한을 자동 연장하지 않는다. 이 조치는 기존 비공개 영상/편집 기능을 위한 복구 경로이고 AI 재개 허가가 아니다.
 
 개인정보 영구 가림·공개 공유 등 제품 전체의 미완료 항목은 별도로 남아 있다. 이번 단계에서는 커밋/푸시·Replit 반영·실환경 권한 변경·실제 AI 호출을 하지 않았다.
+
+후속 사용자 승인에 따른 실제 개발환경 반영은 `REPLIT_RUNTIME_ROLLOUT.md`에 기록한다. 위 내용은 bootstrap 구현 당시의 상태로 보존한다.

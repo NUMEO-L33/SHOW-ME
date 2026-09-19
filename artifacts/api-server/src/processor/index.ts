@@ -17,11 +17,11 @@ import { GUIDE_STATUSES, type GuideRepository } from "./domain.js";
 import { verifyMediaBinaryVersions } from "./media/binary-version.js";
 import { createGuidePipeline } from "./pipeline.js";
 import { ProcessingQueue } from "./queue.js";
-import { createGuideRepository, PostgresGuideRepository } from "./repository.js";
+import { createGuideRepository, PostgresGuideRepository, analysisPoolForRepository } from "./repository.js";
 import { createProcessorApp } from "./server.js";
 import { createStorage, type Storage } from "./storage.js";
 import { createAnalysisLifecycle, type ProcessorAnalysisFactory } from "./analysis-lifecycle.js";
-import { analysisBootstrapSettings, configuredAnalysisFactory } from "./analysis-bootstrap.js";
+import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "./analysis-bootstrap.js";
 
 const STORAGE_PROBE_PAYLOAD = Buffer.from("showme-storage-ready", "utf8");
 const STARTUP_CHECK_TIMEOUT_MS = 15_000;
@@ -76,9 +76,12 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
     await withStartupTimeout(
       "database migration",
       STARTUP_CHECK_TIMEOUT_MS,
-      () => {
+      async () => {
         if (config.databaseMigrationMode !== "verify-only") return runDatabaseMigrations(config.databaseUrl);
         if (!(repository instanceof PostgresGuideRepository)) throw new Error("DATABASE_MIGRATION_CHECK_FAILED");
+        const pool = analysisPoolForRepository(repository);
+        if (!pool) throw new Error("DATABASE_MIGRATION_CHECK_FAILED");
+        await verifyAnalysisRuntimeRole(pool, AbortSignal.timeout(10_000));
         return verifyDatabaseMigrations(repository.database);
       },
     );

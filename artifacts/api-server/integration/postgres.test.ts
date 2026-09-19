@@ -13,6 +13,7 @@ import { type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/
 import { runDatabaseMigrations, verifyDatabaseMigrations } from "../src/processor/database-migrations.js";
 import { loadConfig } from "../src/processor/config.js";
 import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "../src/processor/analysis-bootstrap.js";
+import { createRuntimeRole } from "../src/processor/runtime-role-setup.js";
 import { PostgresGuideRepository } from "../src/processor/repository.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { fakeOutput } from "../tests/helpers/analysis-fixtures.js";
@@ -157,6 +158,31 @@ async function withRuntimeLogin(h: Awaited<ReturnType<typeof fixture>>, check: (
     await pool?.end(); await h.pool.query(`DROP OWNED BY "${role}"`); await h.pool.query(`DROP ROLE "${role}"`);
   }
 }
+
+test("real PostgreSQL: deployment setup creates a bounded authenticated runtime login and never changes existing data", async t => {
+  const h = await fixture(t); await h.seed(); const before = await h.rows("guides");
+  const url = new URL(h.connection); let selected: { role: string; password: string } | undefined;
+  const target = { host: url.hostname, port: Number(url.port), database: url.pathname.slice(1),
+    connectionTimeoutMillis: 3000, statement_timeout: 3000 };
+  const result = await createRuntimeRole({ admin: h.pool, target, persist: async credentials => { selected = credentials; } });
+  assert.ok(selected); const runtime = new Pool({ ...target, user: selected.role, password: selected.password });
+  try {
+    assert.equal(result.aiEnabled, false); assert.equal(result.authenticationChecked, true);
+    assert.equal(JSON.stringify(result).includes(selected.password), false);
+    await verifyAnalysisRuntimeRole(runtime, operationsSignal());
+    assert.deepEqual(await h.rows("guides"), before);
+    await assert.rejects(runtime.query("DELETE FROM analysis_operations_reviews"), (error: { code?: string }) => error.code === "42501");
+  } finally { await runtime.end(); await h.pool.query(`DROP OWNED BY "${result.role}"`); await h.pool.query(`DROP ROLE "${result.role}"`); }
+});
+
+test("real PostgreSQL: failed credential persistence removes only the newly generated runtime role", async t => {
+  const h = await fixture(t); const url = new URL(h.connection);
+  const before = (await h.pool.query("SELECT rolname FROM pg_roles ORDER BY rolname")).rows;
+  await assert.rejects(createRuntimeRole({ admin: h.pool,
+    target: { host: url.hostname, port: Number(url.port), database: url.pathname.slice(1), connectionTimeoutMillis: 3000 },
+    persist: async () => { throw new Error("fictional file write failure"); } }), /SHOWME_RUNTIME_ROLE_SETUP_FAILED/);
+  assert.deepEqual((await h.pool.query("SELECT rolname FROM pg_roles ORDER BY rolname")).rows, before);
+});
 
 test("real PostgreSQL: runtime login verifies migrations without DDL and cannot alter approval history", async t => {
   const h = await fixture(t);
