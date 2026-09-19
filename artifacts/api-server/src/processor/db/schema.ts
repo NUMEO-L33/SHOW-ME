@@ -12,6 +12,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  uuid,
 } from "drizzle-orm/pg-core";
 
 import {
@@ -24,6 +25,7 @@ import type { DraftDocument } from "../analysis-contract.js";
 import type { AnalysisBudgetWindow, AnalysisReservation, AnalysisStoredBatch } from "../analysis-funding.js";
 import type { AnalysisAccountingControl, AnalysisRequestAttempt } from "../analysis-accounting-contract.js";
 import type { AnalysisCountRecord } from "../analysis-count-accounting.js";
+import type { AnalysisOperationsReview } from "../analysis-operations-review.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -214,5 +216,29 @@ export const analysisCountAttempts = pgTable("analysis_count_attempts", {
 ]);
 
 export type NewGuideRow = typeof guides.$inferInsert;
+// Administrative append-only API; no guide FK and no automatic seed/approval.
+export const analysisOperationsReviews = pgTable("analysis_operations_reviews", {
+  deploymentRef: text("deployment_ref").notNull(), version: integer("version").notNull(),
+  commandId: text("command_id").notNull(), commandHash: text("command_hash").notNull(),
+  actorRef: text("actor_ref").notNull(), action: text("action").$type<"put" | "revoke">().notNull(),
+  payload: jsonb("payload").$type<AnalysisOperationsReview>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+}, (table) => [
+  primaryKey({ name: "analysis_operations_reviews_pk", columns: [table.deploymentRef, table.version] }),
+  uniqueIndex("analysis_operations_command_unique").on(table.commandId),
+  check("analysis_operations_version_check", sql`${table.version} > 0 AND ${table.version} < 2147483647`),
+  check("analysis_operations_action_check", sql`${table.action} IN ('put', 'revoke')`),
+  check("analysis_operations_hash_check", sql`${table.commandHash} ~ '^[a-f0-9]{64}$'`),
+  check("analysis_operations_projection_check", sql`(${table.payload}->>'deploymentRef' = ${table.deploymentRef} AND
+    (${table.payload}->>'revision')::integer = ${table.version} AND (${table.action} <> 'revoke' OR ${table.payload}->>'state' = 'revoked')) IS TRUE`),
+]);
 export type GuideStepRow = typeof guideSteps.$inferSelect;
+export const analysisActivationEvents = pgTable("analysis_activation_events", {
+  version: integer("version").primaryKey(), commandId: uuid("command_id").notNull().unique(),
+  commandHash: text("command_hash").notNull(), actorRef: text("actor_ref").notNull(),
+  action: text("action").$type<"activate" | "deactivate">().notNull(), deploymentRef: text("deployment_ref").notNull(),
+  payload: jsonb("payload").notNull(), createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+}, table => [check("analysis_activation_events_version_check", sql`${table.version}>0 AND ${table.version}<2147483647`),
+  check("analysis_activation_events_command_hash_check", sql`${table.commandHash} ~ '^[a-f0-9]{64}$'`),
+  check("analysis_activation_events_action_check", sql`${table.action} IN ('activate','deactivate')`)]);
 export type NewGuideStepRow = typeof guideSteps.$inferInsert;

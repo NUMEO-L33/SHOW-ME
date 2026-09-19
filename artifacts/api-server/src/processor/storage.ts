@@ -148,8 +148,10 @@ export type ReplitStorageOptions = Readonly<{
 export class ReplitObjectStorage implements Storage {
   private readonly client: Client;
   private readonly prefix: string;
+  private readonly bucketId?: string;
 
   constructor(options: ReplitStorageOptions = {}) {
+    this.bucketId = options.bucketId;
     this.prefix = (options.prefix ?? "showme").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
     if (!this.prefix || this.prefix.split("/").some((segment) => segment === "." || segment === "..")) {
       throw new Error("Replit Object Storage prefix must be a safe, non-empty relative prefix.");
@@ -158,6 +160,9 @@ export class ReplitObjectStorage implements Storage {
     this.client =
       options.client ?? new Client(options.bucketId ? { bucketId: options.bucketId } : undefined);
   }
+
+  /** Configured target only, not remote access/IAM verification. Returns no credentials. */
+  analysisTarget() { return { bucketId: this.bucketId, prefix: this.prefix }; }
 
   private objectName(key: string): string {
     return `${this.prefix}/${normalizedKey(key)}`;

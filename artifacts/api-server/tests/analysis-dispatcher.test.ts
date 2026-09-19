@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 
 import type { AnalysisAdmissionInput, AnalysisAdmissionSnapshot } from "../src/processor/analysis-admission.js";
+import { operationsBasisFixture } from "./helpers/operations-review-fixture.js";
 import { ANALYSIS_CONSENT_VERSION, ANALYSIS_LIMITS, analysisBatches, analysisManifest } from "../src/processor/analysis-contract.js";
 import { DurableAnalysisDispatcher, type AnalysisDispatchProvider } from "../src/processor/analysis-dispatcher.js";
 import type { AnalysisFundingCommand, AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
@@ -19,6 +20,7 @@ import { inputBoundFixture } from "./helpers/input-bound-fixture.js";
 import { inputMeasurementFixture } from "./helpers/input-measurement-fixture.js";
 import { GeminiInputMeasurements } from "../src/processor/gemini/input-measurement.js";
 import type { AnalysisMeasurementStage } from "../src/processor/gemini/counted-measurements.js";
+import { SYNTHETIC_COUNT_LIMITS } from "../src/processor/gemini/count-policy.js";
 
 const now = new Date("2026-09-15T12:00:00.000Z");
 const limits = { requests: 100, inputTokens: 1_000_000, outputTokens: 1_000_000, costMicrousd: 1_000_000 };
@@ -48,6 +50,7 @@ async function harness(context: TestContext, count = 8, retries: 0 | 1 = 1) {
     model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION, scope: "approved_synthetic", inputApprovalId: "fictional-input",
     runtime: { repository: "postgres-0008", dispatcher: "durable-accounted-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
     policy: selectedPolicy, entitlement: { mode: "free_only", projectRef: "private-project", evidenceId: "private-evidence", paidFallback: false,
+      operationsBasis: operationsBasisFixture(clock(), "private-evidence"),
       providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250_000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } },
   };
   const inspections: AnalysisAdmissionInput[] = [];
@@ -436,12 +439,14 @@ test("provider identity, nested retries and output cap mismatches are rejected b
   assert.equal(adapter.transientRetries, 0); assert.equal(adapter.maxOutputTokens, 8192);
 });
 
-test("unavailable, changed, expired, paid or asynchronous permission reports never spend or claim", async (context) => {
-  for (const kind of ["revoked", "policy", "expired", "paid", "async"] as const) {
+test("unavailable, changed, expired, unreviewed, paid or asynchronous permission reports never spend or claim", async (context) => {
+  for (const kind of ["revoked", "policy", "expired", "unreviewed", "review-expired", "paid", "async"] as const) {
     const h = await harness(context); const before = await h.state();
     if (kind === "revoked") h.revoke();
     if (kind === "policy") h.snapshot.policy = { ...h.selectedPolicy, version: "changed" };
     if (kind === "expired") h.snapshot.validUntil = h.clock().toISOString();
+    if (kind === "unreviewed") Object.assign(h.snapshot.entitlement, { operationsBasis: undefined });
+    if (kind === "review-expired" && h.snapshot.entitlement.mode === "free_only") h.snapshot.entitlement.operationsBasis.expiresAt = h.clock().toISOString();
     if (kind === "paid") h.snapshot.entitlement = { mode: "paid_capped", approvalId: "unapproved", projectRef: "private-project", evidenceId: "private-evidence" };
     if (kind === "async") h.readiness.isCurrent = (() => Promise.resolve(true)) as unknown as () => boolean;
     assert.equal(await h.make().tick(), "unavailable"); assert.deepEqual(await h.state(), before); assert.equal(h.loads.length, 0);
@@ -457,6 +462,40 @@ test("revocation during image loading prevents a send and bounds frame bytes", a
     const bad = await harness(context, 2);
     assert.equal(await bad.make({ loadImage: async () => bytes }).tick(), "failed");
     assert.equal((await bad.run()).errorCode, "AI_INVALID_OUTPUT"); assert.deepEqual(bad.calls, []);
+  }
+});
+
+test("explicit count-first dispatcher needs no bound verifier but always measures before generation", async (t) => {
+  for (const count of [321, 1001]) {
+    const h = await harness(t, 2); const events: string[] = [];
+    h.snapshot.runtime = { repository: "postgres-0008", dispatcher: "durable-accounted-v1", counting: "count-accounted-0010-v1",
+      inputTokenLimit: 1000, countPolicy: { ...SYNTHETIC_COUNT_LIMITS } };
+    const cache = new GeminiInputMeasurements({ clock: h.clock, counter: { contract: "separately-metered-countTokens-v1",
+      async execute() { events.push("count"); return { totalTokens: count }; } } });
+    const stage: AnalysisMeasurementStage = { inspect: cache.inspect.bind(cache), isCurrent: cache.isCurrent.bind(cache),
+      async recover() {}, async measureForAnalysis(input, scope, _context, signal) { return cache.measure(input, scope, signal); } };
+    const analyze = h.provider.analyzeFrames; h.provider.analyzeFrames = async (...args) => { events.push("generate"); return analyze(...args); };
+    const worker = h.make({ inputBoundVerifier: undefined, inputMeasurementVerifier: undefined, inputMeasurementStage: stage });
+    assert.equal(await worker.tick(), count > 1000 ? "unavailable" : "completed");
+    assert.deepEqual(events, count > 1000 ? ["count"] : ["count", "generate"]);
+    assert.equal(h.quotaStore.receipts.length, count > 1000 ? 0 : 1);
+  }
+});
+
+test("count-first cannot substitute cached measurements for the count stage or exceed its payload policy", async (t) => {
+  for (const mode of ["no-stage", "oversized", "revoked", "changed-pixels"]) {
+    const h = await harness(t, 2); let measurements = 0;
+    h.snapshot.runtime = { repository: "postgres-0008", dispatcher: "durable-accounted-v1", counting: "count-accounted-0010-v1",
+      inputTokenLimit: 1000, countPolicy: { ...SYNTHETIC_COUNT_LIMITS } };
+    if (mode === "oversized") h.snapshot.runtime.countPolicy.maxRequestBytes = 100;
+    const stage: AnalysisMeasurementStage = { ...h.inputMeasurementVerifier, async recover() {}, async measureForAnalysis(input) {
+      measurements++; if (mode === "revoked") h.revoke();
+      if (mode === "changed-pixels") input.images[0].bytes[3] = 0;
+    } };
+    assert.equal(await h.make({ inputMeasurementStage: mode === "no-stage" ? undefined : stage }).tick(),
+      mode === "oversized" ? "failed" : "unavailable");
+    assert.equal(measurements, mode === "no-stage" || mode === "oversized" ? 0 : 1);
+    assert.deepEqual(h.calls, []); assert.equal(h.quotaStore.receipts.length, 0);
   }
 });
 

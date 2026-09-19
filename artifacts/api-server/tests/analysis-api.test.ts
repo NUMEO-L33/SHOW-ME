@@ -70,7 +70,7 @@ test("analysis startup is disabled without durable admission and creates no draf
   assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
 });
 
-test("UI capability is owner-only, input-bound, always blocked and never invokes admission", async context => {
+test("UI capability is owner-only, input-bound, blocked without a display inspector and never invokes admission", async context => {
   const h = await harness(context);
   const fingerprint = analysisManifest(h.guide).fingerprint;
   const before = await h.repository.getAnalysisState(h.guideId);
@@ -85,6 +85,36 @@ test("UI capability is owner-only, input-bound, always blocked and never invokes
   await request(h.app).get(`${h.url}/capabilities?enable=true`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", fingerprint).expect(400);
   await request(h.app).get(`${h.url}/capabilities`).set("Authorization", h.authorization).set("X-ShowMe-Input-Fingerprint", "b".repeat(64)).expect(409);
   assert.equal(h.submissions.length, 0); assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+});
+
+test("UI availability reflects the trusted read-only inspector without admitting or exposing operational details", async context => {
+  const h = await harness(context), fingerprint = analysisManifest(h.guide).fingerprint;
+  const before = await h.repository.getAnalysisState(h.guideId); let inspections = 0;
+  const app = h.appWith({ ...h.admission, async inspectAvailability(input, signal) {
+    inspections++; assert.equal(input.guideId, h.guideId); assert.equal(input.inputFingerprint, fingerprint);
+    assert.equal(signal.aborted, false); return true;
+  } });
+  await request(app).get(`${h.url}/capabilities`).set("X-ShowMe-Input-Fingerprint", fingerprint).expect(404);
+  assert.equal(inspections, 0);
+  const result = await request(app).get(`${h.url}/capabilities`).set("Authorization", h.authorization)
+    .set("X-ShowMe-Input-Fingerprint", fingerprint).expect(200);
+  assert.deepEqual(result.body, { consentVersion: ANALYSIS_CONSENT_VERSION, startAvailable: true, reason: null });
+  assert.equal(inspections, 1); assert.equal(h.submissions.length, 0);
+  assert.deepEqual(await h.repository.getAnalysisState(h.guideId), before);
+  const failed = h.appWith({ ...h.admission, async inspectAvailability() { throw new Error("private-credential-error"); } });
+  const unavailable = await request(failed).get(`${h.url}/capabilities`).set("Authorization", h.authorization)
+    .set("X-ShowMe-Input-Fingerprint", fingerprint).expect(200);
+  assert.equal(unavailable.body.startAvailable, false); assert.ok(!JSON.stringify(unavailable.body).includes("credential"));
+});
+
+test("availability reauthenticates after its asynchronous check and cannot disclose a deleted guide as enabled", async context => {
+  const h = await harness(context), fingerprint = analysisManifest(h.guide).fingerprint;
+  const app = h.appWith({ ...h.admission, async inspectAvailability() {
+    await h.repository.deleteGuide(h.guideId); return true;
+  } });
+  await request(app).get(`${h.url}/capabilities`).set("Authorization", h.authorization)
+    .set("X-ShowMe-Input-Fingerprint", fingerprint).expect(404);
+  assert.equal(h.submissions.length, 0);
 });
 
 test("browser consent to an old media fingerprint cannot submit, read or cancel the replacement", async context => {

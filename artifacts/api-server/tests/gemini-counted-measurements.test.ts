@@ -10,6 +10,8 @@ import { auditGeminiInput } from "../src/processor/gemini/input-bound.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
 import { inputBoundFixture } from "./helpers/input-bound-fixture.js";
+import { operationsBasisFixture } from "./helpers/operations-review-fixture.js";
+import { SYNTHETIC_COUNT_LIMITS } from "../src/processor/gemini/count-policy.js";
 
 // Fake DB/quota, tiny fixture bytes and injected fetch only. Real SQL tests live in integration/.
 async function harness(t: TestContext) {
@@ -35,6 +37,7 @@ async function harness(t: TestContext) {
     runtime: { repository: "postgres-0008", dispatcher: "durable-accounted-v1", counting: "count-accounted-0010-v1",
       inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" },
     entitlement: { mode: "free_only", projectRef: scope.projectRef, evidenceId: "fictional-project-evidence", paidFallback: false,
+      operationsBasis: operationsBasisFixture(clock(), "fictional-project-evidence"),
       providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } } };
   const readiness = { async inspect() { return structuredClone(snapshot); }, isCurrent: () => current };
   const inputBoundVerifier = inputBoundFixture(clock);
@@ -76,6 +79,65 @@ async function harness(t: TestContext) {
   return { state, repository, events, receipts, options, stage, snapshot, inputBoundVerifier, controller, input, scope, context, measure, clock,
     revoke: () => { current = false; }, advance: (ms: number) => { time += ms; } };
 }
+
+function countFirst(h: Awaited<ReturnType<typeof harness>>, inputTokenLimit = 1000) {
+  h.snapshot.runtime = { repository: "postgres-0008", dispatcher: "durable-accounted-v1", counting: "count-accounted-0010-v1",
+    inputTokenLimit, countPolicy: { ...SYNTHETIC_COUNT_LIMITS } };
+  return { ...h.options, inputBoundVerifier: undefined };
+}
+
+test("explicit bounded count-first mode works without any prior token bound and uses the existing durable slot", async (t) => {
+  const h = await harness(t); const options = countFirst(h); const stage = new AccountedGeminiMeasurements(options);
+  h.inputBoundVerifier.inspect = async () => { assert.fail("old upper-bound verifier must not be called"); };
+  await h.measure(stage);
+  assert.deepEqual(h.events, ["reserve", "sending", "claim-launch", "launch", "http", "settle"]);
+  assert.equal(h.state.previous?.charged.inputTokens, 321); assert.equal(h.state.control.halted, false);
+  assert.equal(h.state.previous?.inputAccounting, "acceptance-allowance");
+  assert.equal((await stage.inspect(h.scope, h.controller.signal) as { measuredInputTokens: number }).measuredInputTokens, 321);
+  await assert.rejects(h.measure(new AccountedGeminiMeasurements(options)), /ANALYSIS_UNAVAILABLE/);
+  assert.equal(h.events.filter((e) => e === "http").length, 1);
+});
+
+test("count-first payload limits and malformed authorization reject before allocation or network", async (t) => {
+  for (const mode of ["images", "bytes", "total", "body", "policy", "personal", "no-prior-proof"]) {
+    const h = await harness(t); const options = countFirst(h);
+    assert.ok("countPolicy" in h.snapshot.runtime);
+    if (mode === "images") h.snapshot.runtime.countPolicy.maxImages = 1;
+    if (mode === "bytes") { h.input.images[0].bytes = new Uint8Array([255, 216, 255, 0, 217]); h.scope = { ...h.scope, ...auditGeminiInput(h.input, h.scope.inputApprovalId, h.scope.inputFingerprint) }; h.snapshot.runtime.countPolicy.maxImageBytes = 4; }
+    if (mode === "total") h.snapshot.runtime.countPolicy.maxTotalImageBytes = 7;
+    if (mode === "body") h.snapshot.runtime.countPolicy.maxRequestBytes = 100;
+    if (mode === "policy") Object.assign(h.snapshot.runtime.countPolicy, { attemptsPerSlot: 2 });
+    if (mode === "personal") Object.assign(h.snapshot, { scope: "user_video" });
+    if (mode === "no-prior-proof") h.snapshot.runtime = { repository: "postgres-0008", dispatcher: "durable-accounted-v1",
+      counting: "count-accounted-0010-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" };
+    const stage = new AccountedGeminiMeasurements(options);
+    await assert.rejects(stage.measureForAnalysis(h.input, h.scope, h.context, h.controller.signal), /ANALYSIS_UNAVAILABLE/);
+    assert.deepEqual(h.events, [], mode);
+  }
+});
+
+test("count-first rejects over-limit measurements; ledger overrun records actual count and halts further work", async (t) => {
+  for (const lowerLimit of [false, true]) {
+    const h = await harness(t); let sends = 0;
+    const options = countFirst(h, lowerLimit ? 300 : 1000);
+    const stage = new AccountedGeminiMeasurements({ ...options, fetch: async () => { sends++; return Response.json({ totalTokens: lowerLimit ? 321 : 1001 }); } });
+    await assert.rejects(h.measure(stage), /ANALYSIS_UNAVAILABLE/);
+    assert.equal(sends, 1); assert.equal(await stage.inspect(h.scope, h.controller.signal), null);
+    assert.equal(h.state.previous?.status, lowerLimit ? "settled" : "overrun");
+    assert.equal(h.state.control.halted, !lowerLimit);
+    assert.deepEqual(h.state.previous?.usage, { status: "known", totalTokens: lowerLimit ? 321 : 1001 });
+  }
+});
+
+test("count-first preserves timeout, cancellation and no implicit retry even when fetch ignores abort", async (t) => {
+  const h = await harness(t); let sends = 0; let finish!: (r: Response) => void;
+  const stage = new AccountedGeminiMeasurements({ ...countFirst(h), timeoutMs: 30,
+    fetch: () => { sends++; return new Promise((resolve) => { finish = resolve; }); } });
+  await assert.rejects(h.measure(stage), /ANALYSIS_UNAVAILABLE/); assert.equal(sends, 1);
+  await assert.rejects(h.measure(stage), /ANALYSIS_UNAVAILABLE/); assert.equal(sends, 1);
+  finish(Response.json({ totalTokens: 100 })); await new Promise((r) => setImmediate(r));
+  assert.equal(await stage.inspect(h.scope, h.controller.signal), null); assert.equal(h.state.previous?.status, "uncertain");
+});
 
 test("counted stage commits count, quota and launch before fetch; only settled usage creates offline evidence", async (t) => {
   const h = await harness(t); assert.equal(await h.stage.inspect(h.scope, h.controller.signal), null); assert.deepEqual(h.events, []);
@@ -124,6 +186,21 @@ test("revocation or expiry after committed sending/claim blocks fetch and keeps 
     assert.equal(h.events.includes("http"), false); assert.equal(h.state.previous?.status, "uncertain");
     assert.equal(h.state.previous?.charged.inputTokens, 1000); assert.equal(h.receipts.length, 1);
   }
+});
+
+test("countTokens requires operator provenance and cannot launch past the operator review expiry", async (t) => {
+  const missing = await harness(t);
+  Object.assign(missing.snapshot.entitlement, { operationsBasis: undefined });
+  await assert.rejects(missing.measure(), /ANALYSIS_UNAVAILABLE/); assert.deepEqual(missing.events, []);
+  const h = await harness(t);
+  if (h.snapshot.entitlement.mode !== "free_only") assert.fail();
+  h.snapshot.validUntil = h.snapshot.entitlement.operationsBasis.expiresAt = new Date(h.clock().valueOf() + 1000).toISOString();
+  const launch = h.repository.launchAnalysisCount;
+  h.repository.launchAnalysisCount = async (...args) => { h.advance(1000); return launch(...args); };
+  await assert.rejects(h.measure(), /ANALYSIS_UNAVAILABLE/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.events.includes("http"), false); assert.equal(h.state.previous?.status, "uncertain");
+  assert.equal(h.state.previous?.charged.inputTokens, 1000);
 });
 
 test("HTTP errors and malformed count responses keep usage uncertain and never retry or cache", async (t) => {

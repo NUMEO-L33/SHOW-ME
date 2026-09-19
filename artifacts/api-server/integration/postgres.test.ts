@@ -10,7 +10,9 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import * as processorSchema from "../src/processor/db/schema.js";
 import { ANALYSIS_CONSENT_VERSION, analysisBatches, analysisManifest, initialDraft } from "../src/processor/analysis-contract.js";
 import { type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
-import { runDatabaseMigrations } from "../src/processor/database-migrations.js";
+import { runDatabaseMigrations, verifyDatabaseMigrations } from "../src/processor/database-migrations.js";
+import { loadConfig } from "../src/processor/config.js";
+import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "../src/processor/analysis-bootstrap.js";
 import { PostgresGuideRepository } from "../src/processor/repository.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { fakeOutput } from "../tests/helpers/analysis-fixtures.js";
@@ -23,7 +25,21 @@ import { AccountedGeminiMeasurements } from "../src/processor/gemini/counted-mea
 import { GeminiAnalysisProvider } from "../src/processor/gemini/provider.js";
 import { auditGeminiInput } from "../src/processor/gemini/input-bound.js";
 import { inputBoundFixture } from "../tests/helpers/input-bound-fixture.js";
+import { SYNTHETIC_COUNT_LIMITS } from "../src/processor/gemini/count-policy.js";
+import { operationsBasisFixture, operationsReviewFixture } from "../tests/helpers/operations-review-fixture.js";
+import { PostgresAnalysisOperationsStore, operationsActorRef } from "../src/processor/analysis-operations-store.js";
+import { OperationsReviewEvidenceSource } from "../src/processor/analysis-operations-source.js";
 import { PostgresAnalysisDatabaseProbe, AnalysisDatabaseProbeError } from "../src/processor/analysis-database-probe.js";
+import { createFixedSyntheticAnalysisRuntime, attachFixedSyntheticAnalysisRuntime, syntheticStorageRef } from "../src/processor/analysis-synthetic-runtime.js";
+import { bindAnalysisActivation } from "../src/processor/repository.js";
+import { runAnalysisOperationsAdmin } from "../src/processor/analysis-operations-admin.js";
+import { createAnalysisLifecycle } from "../src/processor/analysis-lifecycle.js";
+import { ReplitObjectStorage } from "../src/processor/storage.js";
+import { type SyntheticInputGrant } from "../src/processor/analysis-synthetic-input.js";
+import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
+import { attemptFrameObjectKey } from "../src/processor/asset-lifecycle.js";
+import { testMediaPaths } from "../tests/helpers/media-binaries.js";
+import { Readable } from "node:stream";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -62,14 +78,15 @@ async function fixture(t: TestContext, migrate = true) {
   if (migrate) await runDatabaseMigrations(connection.toString());
   const repository = PostgresGuideRepository.fromPool(pool);
   const now = () => new Date();
-  async function seed(id = "guide", frames = 2) {
+  async function seed(id = "guide", frames = 2, canonicalKeys = false) {
     await repository.createGuide({ id, slug: id, editToken: "synthetic-test-token", title: "synthetic guide", status: "queued",
       originalObjectKey: `fixture/${id}/source.mp4`, sourceFilename: "fictional.mp4", sourceMimeType: "video/mp4", sourceSizeBytes: 1 });
     await repository.claimProcessingAttempt(id, `media-${id}`); await repository.updateStatus(id, "extracting");
     const guide = await repository.completeProcessingAttempt(id, { attemptId: `media-${id}`, attemptCount: 1,
       steps: Array.from({ length: frames }, (_, i) => ({ id: `${id}-step-${i}`, position: i, shortLabel: "fixture", instruction: "fixture",
         startMs: i * 1000, endMs: (i + 1) * 1000, representativeTimestampMs: i * 1000 + 500,
-        representativeFrameKey: `fixture/${id}/${i}.jpg`, thumbnailFrameKey: `fixture/${id}/${i}-thumb.jpg`, frameWidth: 640, frameHeight: 360 })) });
+        representativeFrameKey: canonicalKeys ? attemptFrameObjectKey(id, 1, i + 1, "frame") : `fixture/${id}/${i}.jpg`,
+        thumbnailFrameKey: canonicalKeys ? attemptFrameObjectKey(id, 1, i + 1, "thumbnail") : `fixture/${id}/${i}-thumb.jpg`, frameWidth: 640, frameHeight: 360 })) });
     assert.ok(guide);
     const command: AnalysisFundingCommand = { type: "request", runId: identity.runId, baseDraftRevision: 0, consentVersion: ANALYSIS_CONSENT_VERSION,
       provider: "gemini", model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION, expectedInputFingerprint: analysisManifest(guide).fingerprint };
@@ -102,6 +119,367 @@ async function waitForFixtureLocks(pool: Pool, count: number) {
   }
   assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
 }
+
+function operatorStore(pool: Pool) { return new PostgresAnalysisOperationsStore({ pool, writerRoles: ["postgres"] }); }
+function operatorCommand() {
+  // Fictional manual confirmations, not observations of any user's cloud account.
+  const review = operationsReviewFixture(new Date(Date.now() - 1000), policy);
+  review.reviewerRef = operationsActorRef("postgres");
+  return { type: "put" as const, commandId: randomUUID(), expectedVersion: 0, review };
+}
+const operationsSignal = () => new AbortController().signal;
+function syntheticGrant(deploymentRef: string, guideId: string, inputFingerprint: string): SyntheticInputGrant {
+  return { kind: "fixed-synthetic-screens-v1", approvalId: "fixed-fixture-approval", deploymentRef,
+    input: { guideId, inputFingerprint, frameCount: 2, model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION },
+    createdAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    inputTokenLimit: 1000, countPolicy: SYNTHETIC_COUNT_LIMITS };
+}
+function activationCommand(change: ReturnType<typeof operatorCommand>, grant: SyntheticInputGrant, expectedVersion = 0) {
+  return { type: "activate" as const, commandId: randomUUID(), expectedVersion, deploymentRef: change.review.deploymentRef,
+    reviewId: change.review.id, expectedReviewVersion: change.review.revision, grant };
+}
+
+async function withRuntimeLogin(h: Awaited<ReturnType<typeof fixture>>, check: (pool: Pool, connection: string, role: string) => Promise<void>) {
+  const role = `showme_runtime_test_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  const password = randomUUID().replaceAll("-", ""); // Disposable local Docker fixture credential, never an application secret.
+  await h.pool.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+  const target = new URL(h.connection); target.username = role; target.password = password;
+  let pool: Pool | undefined;
+  try {
+    await h.pool.query(`GRANT USAGE ON SCHEMA public, drizzle TO "${role}"`);
+    await h.pool.query(`GRANT SELECT ON drizzle.__drizzle_migrations, analysis_operations_reviews, analysis_activation_events TO "${role}"`);
+    await h.pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON guides, guide_steps, guide_drafts, analysis_runs,
+      analysis_budget_windows, analysis_reservations, analysis_batches, analysis_accounting_controls,
+      analysis_request_attempts, analysis_provider_quota_charges, analysis_count_attempts TO "${role}"`);
+    pool = new Pool({ connectionString: target.toString(), max: 8, connectionTimeoutMillis: 5000, statement_timeout: 5000 });
+    await check(pool, target.toString(), role);
+  } finally {
+    await pool?.end(); await h.pool.query(`DROP OWNED BY "${role}"`); await h.pool.query(`DROP ROLE "${role}"`);
+  }
+}
+
+test("real PostgreSQL: runtime login verifies migrations without DDL and cannot alter approval history", async t => {
+  const h = await fixture(t);
+  await withRuntimeLogin(h, async (pool, _connection, role) => {
+    const repository = PostgresGuideRepository.fromPool(pool);
+    const before = (await h.pool.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows;
+    await verifyAnalysisRuntimeRole(pool, operationsSignal());
+    await verifyDatabaseMigrations(repository.database, resolve("drizzle"));
+    assert.deepEqual((await h.pool.query("SELECT * FROM drizzle.__drizzle_migrations ORDER BY id")).rows, before);
+    for (const query of ["CREATE TABLE public.unexpected_fixture(id int)", "DELETE FROM drizzle.__drizzle_migrations",
+      "UPDATE analysis_operations_reviews SET action='revoke'", "DELETE FROM analysis_activation_events",
+      "INSERT INTO analysis_activation_events DEFAULT VALUES"]) {
+      await assert.rejects(pool.query(query), (error: { code?: string }) => error.code === "42501");
+    }
+    // Column grants are an escalation too, even without a table-level UPDATE grant.
+    await h.pool.query(`GRANT UPDATE(payload) ON analysis_operations_reviews TO "${role}"`);
+    await assert.rejects(verifyAnalysisRuntimeRole(pool, operationsSignal()), /ANALYSIS_BOOTSTRAP_UNAVAILABLE/);
+    await h.pool.query(`REVOKE UPDATE(payload) ON analysis_operations_reviews FROM "${role}"`);
+    await verifyAnalysisRuntimeRole(pool, operationsSignal());
+    await assert.rejects(verifyAnalysisRuntimeRole(h.pool, operationsSignal()), /ANALYSIS_BOOTSTRAP_UNAVAILABLE/);
+    await h.pool.query("UPDATE drizzle.__drizzle_migrations SET hash='fixture-tampered-history' WHERE id=(SELECT max(id) FROM drizzle.__drizzle_migrations)");
+    await assert.rejects(verifyDatabaseMigrations(repository.database, resolve("drizzle")), /DATABASE_MIGRATION_CHECK_FAILED/);
+    assert.equal((await h.pool.query("SELECT hash FROM drizzle.__drizzle_migrations ORDER BY id DESC LIMIT 1")).rows[0].hash, "fixture-tampered-history");
+  });
+});
+
+test("real PostgreSQL: verify-only mode rejects an unmigrated DB without repairing or creating tables", async t => {
+  const h = await fixture(t, false);
+  await assert.rejects(verifyDatabaseMigrations(h.repository.database, resolve("drizzle")), /DATABASE_MIGRATION_CHECK_FAILED/);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema IN ('public','drizzle')")).rows[0].n, 0);
+});
+
+test("real PostgreSQL: configured bootstrap uses one runtime login and stored grant, then runs fixed screens through normal lifecycle", async t => {
+  const h = await fixture(t); const { guide, command } = await h.seed("guide", 2, true);
+  const change = operatorCommand(); change.review.storageRef = syntheticStorageRef("fictional-bucket", "showme-test");
+  const store = operatorStore(h.pool); await store.execute(change, operationsSignal());
+  const grant = syntheticGrant(change.review.deploymentRef, guide.id, command.expectedInputFingerprint);
+  const activate = activationCommand(change, grant); await store.executeActivation(activate, operationsSignal());
+  const screens = await syntheticAnalysisInput(); const sends: string[] = []; let reads = 0;
+  await withRuntimeLogin(h, async (pool, connection) => {
+    const config = { ...loadConfig({ NODE_ENV: "test", DATABASE_URL: connection, SHOWME_STORAGE: "replit",
+      SHOWME_DATABASE_MIGRATIONS: "verify-only", REPLIT_OBJECT_STORAGE_BUCKET_ID: "fictional-bucket",
+      REPLIT_OBJECT_STORAGE_PREFIX: "showme-test" }), ...testMediaPaths() };
+    const settings = analysisBootstrapSettings({ SHOWME_ANALYSIS_MODE: "fixed-synthetic", SHOWME_ANALYSIS_ACTIVATION_ID: activate.commandId,
+      SHOWME_ANALYSIS_DEPLOYMENT_REF: change.review.deploymentRef, SHOWME_ANALYSIS_PROJECT_REF: change.review.projectRef,
+      SHOWME_ANALYSIS_CREDENTIAL_REF: change.review.credentialRef, GEMINI_API_KEY: "fictional-fixture-key" }, config)!;
+    const repository = PostgresGuideRepository.fromPool(pool);
+    const storage = new ReplitObjectStorage({ bucketId: "fictional-bucket", prefix: "showme-test", client: {
+      downloadAsStream: async (name: string) => {
+        reads++; const index = guide.steps.findIndex(s => `showme-test/${s.representativeFrameKey}` === name);
+        assert.ok(index >= 0); return Readable.from(Buffer.from(screens.images[index].bytes));
+      },
+    } as never });
+    const factory = configuredAnalysisFactory(settings, config, { migrationsFolder: resolve("drizzle"), fetch: async url => {
+      if (String(url).endsWith(":countTokens")) { sends.push("count"); return Response.json({ totalTokens: 321 }); }
+      assert.ok(String(url).endsWith(":generateContent")); sends.push("generate");
+      return Response.json({ modelVersion: GEMINI_TEST_MODEL,
+        candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(fakeOutput(guide.steps.map(s => s.id))) }] } }],
+        usageMetadata: { promptTokenCount: 322, candidatesTokenCount: 20, totalTokenCount: 342 } });
+    } });
+    // Wrong selector/project cannot replace an existing reviewed activation, nor send or read media.
+    for (const override of [{ activationId: randomUUID() }, { projectRef: "wrong-project" }]) {
+      await assert.rejects(async () => configuredAnalysisFactory({ ...settings, ...override }, config)({ repository, storage }), /ANALYSIS_BOOTSTRAP_UNAVAILABLE/);
+    }
+    const before = (await h.pool.query("SELECT * FROM analysis_activation_events ORDER BY version")).rows;
+    const lifecycle = (await createAnalysisLifecycle({ repository, storage }, factory))!;
+    try {
+      assert.deepEqual((await h.pool.query("SELECT * FROM analysis_activation_events ORDER BY version")).rows, before);
+      assert.equal(reads, 0); assert.deepEqual(sends, []);
+      assert.equal(await lifecycle.admission.inspectAvailability!(grant.input, operationsSignal()), false);
+      lifecycle.start();
+      assert.equal(await lifecycle.admission.inspectAvailability!(grant.input, operationsSignal()), true);
+      assert.equal(reads, 0); assert.deepEqual(sends, []);
+      assert.ok(await lifecycle.admission.request(guide.id, command, operationsSignal()));
+      for (let i = 0; i < 400; i++) {
+        const status = (await repository.getAnalysisState(guide.id))?.runs[0]?.status;
+        if (status === "succeeded" || status === "failed") break;
+        await delay(25);
+      }
+      assert.equal((await repository.getAnalysisState(guide.id))?.runs[0]?.status, "succeeded");
+      assert.equal((await repository.getAnalysisState(guide.id))?.draft?.revision, 1);
+      assert.equal(reads, 2); assert.deepEqual(sends, ["count", "generate"]);
+      await store.execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+        deploymentRef: change.review.deploymentRef, reviewId: change.review.id }, operationsSignal());
+      assert.equal(await lifecycle.admission.inspectAvailability!(grant.input, operationsSignal()), false);
+      await assert.rejects(async () => factory({ repository, storage }), /ANALYSIS_BOOTSTRAP_UNAVAILABLE/);
+      assert.deepEqual(sends, ["count", "generate"]);
+    } finally { await lifecycle.stop(); }
+    assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
+  });
+});
+
+test("real PostgreSQL: bootstrap resolver rejects a stopped or replayed activation and mutated grant history", async t => {
+  const h = await fixture(t), seeded = await h.seed(), change = operatorCommand(), store = operatorStore(h.pool);
+  await store.execute(change, operationsSignal());
+  const binding = { deploymentRef: change.review.deploymentRef, projectRef: change.review.projectRef,
+    credentialRef: change.review.credentialRef, storageRef: change.review.storageRef };
+  const grant = syntheticGrant(binding.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint);
+  const activate = activationCommand(change, grant); await store.executeActivation(activate, operationsSignal());
+  const resolved = await store.resolveRuntimeActivation(activate.commandId, binding, operationsSignal());
+  assert.deepEqual(resolved.grant, grant); assert.equal(resolved.activation.id, activate.commandId);
+  const before = (await h.pool.query("SELECT payload FROM analysis_activation_events WHERE version=1")).rows[0].payload;
+  await h.pool.query("UPDATE analysis_activation_events SET payload=jsonb_set(payload,'{command,grant,inputTokenLimit}','999') WHERE version=1");
+  await assert.rejects(store.resolveRuntimeActivation(activate.commandId, binding, operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+  await h.pool.query("UPDATE analysis_activation_events SET payload=$1::jsonb WHERE version=1", [JSON.stringify(before)]);
+  await store.executeActivation({ type: "deactivate", commandId: randomUUID(), expectedVersion: 1, deploymentRef: binding.deploymentRef }, operationsSignal());
+  await store.executeActivation(activate, operationsSignal());
+  await assert.rejects(store.resolveRuntimeActivation(activate.commandId, binding, operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+});
+
+test("real PostgreSQL: operations evidence reads the current DB review but cannot bypass a committed halt", async (t) => {
+  const h = await fixture(t); const change = operatorCommand();
+  await operatorStore(h.pool).execute(change, operationsSignal());
+  const store = new PostgresAnalysisOperationsStore({ pool: h.pool });
+  const r = change.review;
+  const source = new OperationsReviewEvidenceSource({ store, binding: { deploymentRef: r.deploymentRef,
+    projectRef: r.projectRef, credentialRef: r.credentialRef, storageRef: r.storageRef } });
+  const input = { guideId: "guide", frameCount: 2, inputFingerprint: "a".repeat(64), model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION } as const;
+  const observed = await store.observe(r.deploymentRef, operationsSignal());
+  assert.equal(observed.authorizesAnalysis, false); assert.equal(observed.halted, true); assert.equal(observed.entry?.version, 1);
+  await assert.rejects(source.inspect(input, operationsSignal()), /ANALYSIS_UNAVAILABLE/);
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+  // Fixture ONLY: emulate a previously enabled runtime. Neither source nor store can unhalt.
+  await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":false}'::jsonb WHERE id='global'");
+  const funded = await h.fund(); const owner = await h.begin();
+  const evidence = await source.inspect({ ...input, inputFingerprint: funded.command.expectedInputFingerprint }, operationsSignal());
+  assert.equal(evidence.review.recordedAt, r.recordedAt); assert.equal(source.isCurrent(evidence), true);
+  const otherPool = new Pool({ connectionString: h.connection, max: 1 });
+  try {
+    await operatorStore(otherPool).execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+      deploymentRef: r.deploymentRef, reviewId: r.id }, operationsSignal());
+    // Local isCurrent is NOT an imaginary synchronous cross-process notification.
+    assert.equal(source.isCurrent(evidence), true);
+    let sends = 0;
+    assert.equal(await h.repository.launchAnalysisRequest("guide", { ...identity, owner,
+      inputFingerprint: funded.command.expectedInputFingerprint }, () => { sends++; }), false);
+    assert.equal(sends, 0);
+    await assert.rejects(source.inspect(input, operationsSignal()), /ANALYSIS_UNAVAILABLE/);
+    assert.equal(source.isCurrent(evidence), false);
+    assert.equal((await new PostgresAnalysisOperationsStore({ pool: otherPool }).observe(r.deploymentRef, operationsSignal())).entry?.review.state, "revoked");
+  } finally { await otherPool.end(); }
+});
+
+test("real PostgreSQL: operations observation uses a consistent read-only snapshot during concurrent revocation", async (t) => {
+  const h = await fixture(t); const change = operatorCommand(); await operatorStore(h.pool).execute(change, operationsSignal());
+  await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":false}'::jsonb WHERE id='global'");
+  const observingPool = { async connect() {
+    const client = await h.pool.connect(); const original = client.query.bind(client);
+    client.query = (async (text: string, values?: unknown[]) => {
+      const result = await original(text, values);
+      if (text.startsWith("SELECT payload, floor")) {
+        await operatorStore(h.pool).execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+          deploymentRef: change.review.deploymentRef, reviewId: change.review.id }, operationsSignal());
+      }
+      return result;
+    }) as typeof client.query;
+    const release = client.release.bind(client);
+    client.release = (...args) => { client.query = original; release(...args); };
+    return client;
+  } } as Pick<Pool, "connect">;
+  const before = await new PostgresAnalysisOperationsStore({ pool: observingPool }).observe(change.review.deploymentRef, operationsSignal());
+  assert.equal(before.halted, false); assert.equal(before.entry?.version, 1); assert.equal(before.entry?.review.state, "approved");
+  const after = await new PostgresAnalysisOperationsStore({ pool: h.pool }).observe(change.review.deploymentRef, operationsSignal());
+  assert.equal(after.halted, true); assert.equal(after.entry?.version, 2); assert.equal(after.entry?.review.state, "revoked");
+});
+
+test("real PostgreSQL: operations observation works with SELECT-only role and never repairs missing or corrupt state", async (t) => {
+  const h = await fixture(t); const command = operatorCommand(); await operatorStore(h.pool).execute(command, operationsSignal());
+  const reader = new Pool({ connectionString: h.connection, max: 1, options: "-c role=pg_read_all_data" });
+  try {
+    const store = new PostgresAnalysisOperationsStore({ pool: reader });
+    const observed = await store.observe(command.review.deploymentRef, operationsSignal());
+    assert.equal(observed.entry?.version, 1); assert.equal(observed.halted, true);
+    await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":\"unknown\"}'::jsonb WHERE id='global'");
+    await assert.rejects(store.observe(command.review.deploymentRef, operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+    await h.pool.query("DELETE FROM analysis_accounting_controls");
+    await assert.rejects(store.observe(command.review.deploymentRef, operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_accounting_controls")).rows[0].n, 0);
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 1);
+  } finally { await reader.end(); }
+});
+
+test("real PostgreSQL: operator record persists across pools and role-gated writes never authorize execution", async (t) => {
+  const h = await fixture(t); const command = operatorCommand();
+  const unconfigured = new PostgresAnalysisOperationsStore({ pool: h.pool });
+  assert.equal(await unconfigured.readLatest(command.review.deploymentRef, operationsSignal()), null);
+  await assert.rejects(unconfigured.execute(command, operationsSignal()), /OPERATIONS_FORBIDDEN/);
+  await assert.rejects(new PostgresAnalysisOperationsStore({ pool: h.pool, writerRoles: ["not_the_db_login"] }).execute(command, operationsSignal()), /OPERATIONS_FORBIDDEN/);
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, false);
+  const result = await operatorStore(h.pool).execute(command, operationsSignal());
+  assert.equal(result.authorizesAnalysis, false); assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+  const pool = new Pool({ connectionString: h.connection, max: 1 });
+  try {
+    const other = new PostgresAnalysisOperationsStore({ pool });
+    assert.deepEqual(await other.readLatest(command.review.deploymentRef, operationsSignal()), result.entry);
+    assert.equal((await operatorStore(pool).execute(command, operationsSignal())).replayed, true);
+  } finally { await pool.end(); }
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 1);
+});
+
+test("real PostgreSQL: SET ROLE cannot borrow an operator identity; reader-only role cannot insert", async (t) => {
+  const h = await fixture(t); const command = operatorCommand(); await operatorStore(h.pool).execute(command, operationsSignal());
+  const reader = new Pool({ connectionString: h.connection, max: 1, options: "-c role=pg_read_all_data" });
+  try {
+    const store = new PostgresAnalysisOperationsStore({ pool: reader, writerRoles: ["postgres", "pg_read_all_data"] });
+    assert.equal((await store.readLatest(command.review.deploymentRef, operationsSignal()))?.version, 1);
+    await assert.rejects(store.execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+      deploymentRef: command.review.deploymentRef, reviewId: command.review.id }, operationsSignal()), /OPERATIONS_FORBIDDEN/);
+    await assert.rejects(reader.query("INSERT INTO analysis_operations_reviews SELECT * FROM analysis_operations_reviews"), /permission denied/);
+  } finally { await reader.end(); }
+  assert.equal((await operatorStore(h.pool).readLatest(command.review.deploymentRef, operationsSignal()))?.review.state, "approved");
+});
+
+test("real PostgreSQL: concurrent operator retries insert once; different commands race by expected version", async (t) => {
+  const h = await fixture(t); const command = operatorCommand();
+  const results = await Promise.all(Array.from({ length: 12 }, () => operatorStore(h.pool).execute(command, operationsSignal())));
+  assert.equal(results.filter((r) => !r.replayed).length, 1);
+  const updates = Array.from({ length: 8 }, () => ({ ...command, commandId: randomUUID(), expectedVersion: 1,
+    review: { ...command.review, revision: 2 } }));
+  const races = await Promise.allSettled(updates.map((c) => operatorStore(h.pool).execute(c, operationsSignal())));
+  assert.equal(races.filter((r) => r.status === "fulfilled").length, 1);
+  assert.ok(races.filter((r) => r.status === "rejected").every((r) => r.reason.code === "OPERATIONS_CONFLICT"));
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 2);
+  await assert.rejects(operatorStore(h.pool).execute({ ...command, review: { ...command.review, id: "collision" } }, operationsSignal()), /OPERATIONS_CONFLICT/);
+});
+
+test("real PostgreSQL: revocation appends history, retains observations and survives guide deletion", async (t) => {
+  const h = await fixture(t); await h.seed(); const command = operatorCommand();
+  await operatorStore(h.pool).execute(command, operationsSignal());
+  const revoke = { type: "revoke", commandId: randomUUID(), expectedVersion: 1, deploymentRef: command.review.deploymentRef, reviewId: command.review.id };
+  const result = await operatorStore(h.pool).execute(revoke, operationsSignal());
+  assert.equal(result.entry.review.state, "revoked"); assert.equal(result.entry.version, 2);
+  assert.equal(result.entry.review.recordedAt, command.review.recordedAt);
+  await h.repository.deleteGuide("guide");
+  assert.equal((await operatorStore(h.pool).readLatest(command.review.deploymentRef, operationsSignal()))?.version, 2);
+  const rows = (await h.pool.query("SELECT payload FROM analysis_operations_reviews ORDER BY version")).rows;
+  assert.deepEqual(rows.map((r) => r.payload.state), ["approved", "revoked"]);
+  assert.equal((await operatorStore(h.pool).execute(revoke, operationsSignal())).replayed, true);
+  assert.equal((await operatorStore(h.pool).execute(command, operationsSignal())).entry.version, 1);
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+});
+
+test("real PostgreSQL: failed review insert or failed/silently skipped halt rolls both writes back", async (t) => {
+  for (const mode of ["insert-failure", "halt-failure", "halt-skipped"]) {
+    const h = await fixture(t); const command = operatorCommand();
+    const target = mode === "insert-failure" ? "analysis_operations_reviews" : "analysis_accounting_controls";
+    await h.pool.query(mode === "halt-skipped"
+      ? "CREATE FUNCTION reject_operator_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+      : "CREATE FUNCTION reject_operator_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'private operator failure'; END $$");
+    // target comes from this fixed test list, never from application input.
+    await h.pool.query(`CREATE TRIGGER reject_operator_change BEFORE INSERT OR UPDATE ON ${target} FOR EACH ROW EXECUTE FUNCTION reject_operator_change()`);
+    await assert.rejects(operatorStore(h.pool).execute(command, operationsSignal()), /^AnalysisOperationsStoreError: OPERATIONS_UNAVAILABLE$/);
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 0);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, false);
+  }
+});
+
+test("real PostgreSQL: incomplete records stay pending; expiry, missing control and corrupt rows fail closed", async (t) => {
+  const h = await fixture(t); const command = operatorCommand(); command.review.checks.storageAccess = { status: "unknown" };
+  await assert.rejects(operatorStore(h.pool).execute(command, operationsSignal()), /OPERATIONS_INVALID/);
+  command.review.state = "pending";
+  assert.equal((await operatorStore(h.pool).execute(command, operationsSignal())).entry.review.state, "pending");
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+  // This asserts an ALREADY expired review, not equality between the host and Docker DB clocks.
+  const dbNow = (await h.pool.query("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::double precision AS at_ms")).rows[0].at_ms;
+  const next = { ...command, commandId: randomUUID(), expectedVersion: 1,
+    review: { ...command.review, revision: 2, expiresAt: new Date(dbNow - 250).toISOString() } };
+  await assert.rejects(operatorStore(h.pool).execute(next, operationsSignal()), /OPERATIONS_INVALID/);
+  await h.pool.query("UPDATE analysis_operations_reviews SET payload = payload || '{\"kind\":\"corrupt\"}'::jsonb");
+  await assert.rejects(operatorStore(h.pool).readLatest(command.review.deploymentRef, operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+  const empty = await fixture(t); await empty.pool.query("DELETE FROM analysis_accounting_controls");
+  await assert.rejects(operatorStore(empty.pool).execute(operatorCommand(), operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+  assert.equal((await empty.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 0);
+});
+
+test("real PostgreSQL: revoked review stops new admission and queued generation across repository instances", async (t) => {
+  const h = await fixture(t); const change = operatorCommand(); await operatorStore(h.pool).execute(change, operationsSignal());
+  // Fixture ONLY: emulate an earlier enabled runtime. Product store has NO resume API.
+  await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":false}'::jsonb WHERE id='global'");
+  const funded = await h.fund(); const owner = await h.begin(); const second = await h.seed("second");
+  await operatorStore(h.pool).execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+    deploymentRef: change.review.deploymentRef, reviewId: change.review.id }, operationsSignal());
+  const other = PostgresGuideRepository.fromPool(h.pool); let sends = 0;
+  assert.equal(await other.launchAnalysisRequest("guide", { ...identity, owner, inputFingerprint: funded.command.expectedInputFingerprint }, () => { sends++; }), false);
+  await assert.rejects(other.reserveAnalysisRequest("second", second.command, policy), /ANALYSIS_/);
+  assert.equal(sends, 0); assert.equal((await h.rows("analysis_reservations")).length, 1);
+});
+
+test("real PostgreSQL: review mutation invalidates an already claimed count launch ticket", async (t) => {
+  const h = await launchFixture(t); let sends = 0;
+  await operatorStore(h.pool).execute(operatorCommand(), operationsSignal());
+  await assert.rejects(h.repository.launchAnalysisCount(h.ticket, () => { sends++; }), /ANALYSIS_COUNT_UNAVAILABLE/);
+  assert.equal(sends, 0); assert.equal((await h.quotas()).length, 1);
+});
+
+test("real PostgreSQL: operator mutation and generation serialize on the existing shared halt lock", async (t) => {
+  const h = await fixture(t); const { command } = await h.fund(); const owner = await h.begin();
+  const blocker = await h.pool.connect(); let sends = 0;
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM analysis_accounting_controls WHERE id='global' FOR UPDATE");
+    const write = operatorStore(h.pool).execute(operatorCommand(), operationsSignal());
+    await waitForFixtureLocks(h.pool, 1);
+    const launch = h.repository.launchAnalysisRequest("guide", { ...identity, owner, inputFingerprint: command.expectedInputFingerprint }, () => { sends++; });
+    await waitForFixtureLocks(h.pool, 2); await blocker.query("COMMIT");
+    await write; assert.equal(await launch, false); assert.equal(sends, 0);
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); }
+});
+
+test("real PostgreSQL: operator cancellation while waiting for the lock commits nothing", async (t) => {
+  const h = await fixture(t); const blocker = await h.pool.connect(); const controller = new AbortController();
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM analysis_accounting_controls WHERE id='global' FOR UPDATE");
+    const pending = operatorStore(h.pool).execute(operatorCommand(), controller.signal);
+    const rejected = assert.rejects(pending, /OPERATIONS_UNAVAILABLE/);
+    await waitForFixtureLocks(h.pool, 1); controller.abort(); await rejected;
+    await blocker.query("COMMIT");
+    // Let the owned transaction observe its abort and release; no subsequent write may begin.
+    await h.pool.query("SELECT id FROM analysis_accounting_controls WHERE id='global' FOR UPDATE");
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 0);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, false);
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); }
+});
 
 test("real PostgreSQL: analysis database observation is read-only, private and not an execution permit", async t => {
   const h = await fixture(t); await h.seed();
@@ -366,10 +744,10 @@ test("real PostgreSQL: twenty simultaneous editor saves commit one revision and 
   }
 });
 
-test("real PostgreSQL: all eleven migrations apply and replay without resetting the halt or accounting", async (t) => {
+test("real PostgreSQL: all thirteen migrations apply and replay without resetting the halt or accounting", async (t) => {
   const h = await fixture(t);
-  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 11);
-  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0010`);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 13);
+  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0012`);
   await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":true}'::jsonb WHERE id='global'");
   await runDatabaseMigrations(h.connection);
   assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
@@ -627,7 +1005,7 @@ test("real PostgreSQL: closure's final write failure rolls back expiry, release 
   assert.deepEqual(await Promise.all(tables.map(h.rows)), before);
 });
 
-test("real PostgreSQL: legacy 0004 payloads backfill safely through migrations 0005–0010", async (t) => {
+test("real PostgreSQL: legacy 0004 payloads backfill safely through migrations 0005–0012", async (t) => {
   const h = await fixture(t, false);
   const journal = JSON.parse(await readFile("drizzle/meta/_journal.json", "utf8"));
   for (const entry of journal.entries.slice(0, 5)) await h.pool.query(await readFile(`drizzle/${entry.tag}.sql`, "utf8"));
@@ -904,13 +1282,17 @@ test("real PostgreSQL: failed launch claim transaction cannot leak a ticket or d
   assert.equal(await h.repository.launchAnalysisCount(ticket, () => { launches++; }), true); assert.equal(launches, 1);
 });
 
-function pipelineReadiness(guideId: string, fingerprint: string): AnalysisAdmissionReadiness {
+function pipelineReadiness(guideId: string, fingerprint: string, countFirst = false): AnalysisAdmissionReadiness {
+  const operationsBasis = operationsBasisFixture(new Date(), "fictional-free-evidence");
   return { async inspect(input) {
     const snapshot: AnalysisAdmissionSnapshot = { ...input, id: "pg-pipeline-fixture", guideId, inputFingerprint: fingerprint,
       checkedAt: new Date().toISOString(), validUntil: new Date(Date.now() + 25000).toISOString(), scope: "approved_synthetic",
       inputApprovalId: "pg-pipeline-approval", runtime: { repository: "postgres-0008", dispatcher: "durable-accounted-v1",
-        counting: "count-accounted-0010-v1", inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" }, policy,
+        counting: "count-accounted-0010-v1", ...(countFirst
+          ? { inputTokenLimit: 1000, countPolicy: { ...SYNTHETIC_COUNT_LIMITS } }
+          : { inputTokenBound: 1000, boundIncludes: "prompt-schema-targets-context" as const }) }, policy,
       entitlement: { mode: "free_only", projectRef: "pg-pipeline-project", evidenceId: "fictional-free-evidence", paidFallback: false,
+        operationsBasis,
         providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } } };
     return snapshot;
   }, isCurrent: () => true };
@@ -968,4 +1350,305 @@ test("real PostgreSQL: late count result after cancellation settles usage but ca
   await assert.rejects(stage.measureForAnalysis(input, scope, { guideId: "guide", ...h.slot, frameCount: 2, owner: h.owner, policy }, signal));
   assert.equal((await h.counts())[0].status, "settled"); assert.equal((await h.counts())[0].payload.charged.inputTokens, 321);
   assert.equal(await stage.inspect(scope, signal), null); assert.equal((await h.quotas()).length, 1);
+});
+
+test("real PostgreSQL: count-first pipeline has no bound verifier and gates generation on durable exact measurements", async (t) => {
+  for (const outcome of ["ok", "overrun", "cancel", "http-failure"] as const) {
+    const h = await fixture(t); const { guide, command } = await h.fund(); let approved = true;
+    const readiness = pipelineReadiness("guide", command.expectedInputFingerprint, true); readiness.isCurrent = () => approved;
+    const events: string[] = []; let countedBody: unknown;
+    const stage = new AccountedGeminiMeasurements({ repository: h.repository, readiness,
+      apiKey: "fictional-pg-key", allowExternalProcessing: true, fetch: async (url, init) => {
+        assert.ok(String(url).endsWith(":countTokens")); events.push("count");
+        const rows = (await h.pool.query("SELECT status, payload FROM analysis_count_attempts")).rows;
+        assert.equal(rows.length, 1); assert.equal(rows[0].status, "launch_claimed");
+        assert.equal(rows[0].payload.inputAccounting, "acceptance-allowance");
+        const { model, ...body } = JSON.parse(String(init?.body)).generateContentRequest;
+        assert.equal(model, `models/${GEMINI_TEST_MODEL}`); countedBody = body;
+        if (outcome === "cancel") { await h.repository.executeAnalysisCommand("guide", { type: "cancel", runId: "run" }); approved = false; }
+        return outcome === "http-failure" ? new Response(null, { status: 503 }) : Response.json({ totalTokens: outcome === "overrun" ? 1001 : 321 });
+      } });
+    const provider = new GeminiAnalysisProvider({ model: GEMINI_TEST_MODEL, apiKey: "fictional-pg-key", allowExternalProcessing: true,
+      transientRetries: 0, reserveRequest: async () => {}, fetch: async (url, init) => {
+        assert.ok(String(url).endsWith(":generateContent")); assert.equal(outcome, "ok"); events.push("generate");
+        assert.deepEqual(JSON.parse(String(init?.body)), countedBody);
+        assert.equal((await h.pool.query("SELECT status FROM analysis_count_attempts")).rows[0].status, "settled");
+        return Response.json({ modelVersion: GEMINI_TEST_MODEL,
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(fakeOutput(guide.steps.map((s) => s.id))) }] } }],
+          usageMetadata: { promptTokenCount: 322, candidatesTokenCount: 20, thoughtsTokenCount: 0, totalTokenCount: 342 } });
+      } });
+    const worker = new DurableAnalysisDispatcher({ repository: h.repository, provider, readiness, inputMeasurementStage: stage,
+      quotaStore: new PostgresAnalysisQuotaStore(h.repository.database), loadImage: async () => new Uint8Array([255, 216, 255, 217]), statusPollMs: 500 });
+    t.after(() => worker.stop());
+    assert.equal(await worker.tick(), outcome === "ok" ? "completed" : "unavailable", outcome);
+    assert.deepEqual(events, outcome === "ok" ? ["count", "generate"] : ["count"]);
+    const record = (await h.pool.query("SELECT status, payload FROM analysis_count_attempts")).rows[0];
+    assert.equal(record.status, outcome === "overrun" ? "overrun" : outcome === "http-failure" ? "uncertain" : "settled");
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, outcome === "overrun");
+    if (outcome === "overrun") assert.deepEqual(record.payload.usage, { status: "known", totalTokens: 1001 });
+    assert.equal((await h.repository.getAnalysisState("guide"))?.draft?.revision, outcome === "ok" ? 1 : 0);
+    assert.equal(await worker.tick(), "idle"); assert.equal(events.length, outcome === "ok" ? 2 : 1);
+    const reopened = new Pool({ connectionString: h.connection, max: 1 });
+    try { assert.equal((await reopened.query("SELECT payload FROM analysis_count_attempts")).rows[0].payload.inputAccounting, "acceptance-allowance"); }
+    finally { await reopened.end(); }
+  }
+});
+
+test("real PostgreSQL: composed fixed-synthetic runtime checks real DB, operator record and real JPEGs before count and generation", async (t) => {
+  const h = await fixture(t); const { guide, command } = await h.seed("guide", 2, true);
+  const screens = await syntheticAnalysisInput(); const change = operatorCommand();
+  change.review.storageRef = syntheticStorageRef("fictional-bucket", "showme-test");
+  await operatorStore(h.pool).execute(change, operationsSignal());
+  const grant: SyntheticInputGrant = { kind: "fixed-synthetic-screens-v1", approvalId: "fixed-fixture-approval",
+    deploymentRef: change.review.deploymentRef, input: { guideId: guide.id, frameCount: 2,
+      inputFingerprint: command.expectedInputFingerprint, model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION },
+    createdAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    inputTokenLimit: 1000, countPolicy: SYNTHETIC_COUNT_LIMITS };
+  const reads: string[] = [], sends: string[] = []; let countedBody: unknown;
+  const activate = activationCommand(change, grant);
+  await operatorStore(h.pool).executeActivation(activate, operationsSignal());
+  const runtime = createFixedSyntheticAnalysisRuntime({ pool: h.pool, grant, activationId: activate.commandId, migrationsFolder: resolve("drizzle"), ffmpegPath: testMediaPaths().ffmpegPath,
+    config: { deploymentRef: change.review.deploymentRef, projectRef: change.review.projectRef,
+      credentialRef: change.review.credentialRef, bucketId: "fictional-bucket", prefix: "showme-test" },
+    apiKey: "fictional-fixture-key", allowExternalProcessing: true,
+    storageClient: { downloadAsStream: async (name: string) => {
+      reads.push(name); const index = guide.steps.findIndex((s) => `showme-test/${s.representativeFrameKey}` === name);
+      assert.ok(index >= 0); return Readable.from(Buffer.from(screens.images[index].bytes));
+    } } as never,
+    fetch: async (url, init) => {
+      assert.equal(init?.redirect, "error"); const body = JSON.parse(String(init?.body));
+      if (String(url).endsWith(":countTokens")) {
+        sends.push("count"); const { model: _model, ...request } = body.generateContentRequest; countedBody = request;
+        const pixels = request.contents[0].parts.filter((p: { inlineData?: unknown }) => p.inlineData).map((p: { inlineData: { data: string } }) => p.inlineData.data);
+        assert.deepEqual(pixels, screens.images.map((image) => Buffer.from(image.bytes).toString("base64")));
+        return Response.json({ totalTokens: 321 });
+      }
+      assert.ok(String(url).endsWith(":generateContent")); sends.push("generate"); assert.deepEqual(body, countedBody);
+      return Response.json({ modelVersion: GEMINI_TEST_MODEL,
+        candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(fakeOutput(guide.steps.map((s) => s.id))) }] } }],
+        usageMetadata: { promptTokenCount: 322, candidatesTokenCount: 20, totalTokenCount: 342 } });
+    } });
+  t.after(() => runtime.stop()); assert.equal(reads.length, 0); assert.equal(sends.length, 0);
+  const snapshot = await runtime.readiness.inspect(grant.input, operationsSignal());
+  assert.equal(runtime.readiness.isCurrent(snapshot.id), true); assert.equal(reads.length, 0);
+  assert.equal(await runtime.admission.inspectAvailability(grant.input, operationsSignal()), true);
+  assert.equal(reads.length, 0); assert.equal(sends.length, 0);
+  assert.ok(await runtime.admission.request(guide.id, command, operationsSignal()));
+  assert.equal(await runtime.tick(), "completed"); assert.deepEqual(sends, ["count", "generate"]); assert.equal(reads.length, 2);
+  assert.equal((await h.repository.getAnalysisState(guide.id))?.draft?.revision, 1);
+  assert.equal(await runtime.tick(), "idle"); assert.equal(sends.length, 2);
+  await runtime.stop(); assert.equal(runtime.readiness.isCurrent(snapshot.id), false); assert.equal(await runtime.tick(), "disabled");
+  assert.equal((await h.pool.query("SELECT 1 AS ok")).rows[0].ok, 1); // Caller pool remains open.
+});
+
+test("real PostgreSQL: composed runtime refuses mismatched binding, revoked review and altered synthetic bytes without AI sends", async (t) => {
+  for (const reason of ["binding", "revoked", "pixels"] as const) {
+    const h = await fixture(t); const { guide, command } = await h.seed("guide", 2, true);
+    const screens = await syntheticAnalysisInput(); const change = operatorCommand();
+    change.review.storageRef = syntheticStorageRef("fictional-bucket", "showme-test");
+    await operatorStore(h.pool).execute(change, operationsSignal());
+    let sends = 0, reads = 0;
+    const grant = syntheticGrant(change.review.deploymentRef, guide.id, command.expectedInputFingerprint);
+    const activate = activationCommand(change, grant); await operatorStore(h.pool).executeActivation(activate, operationsSignal());
+    const runtime = createFixedSyntheticAnalysisRuntime({ pool: h.pool, grant, activationId: activate.commandId, migrationsFolder: resolve("drizzle"), ffmpegPath: testMediaPaths().ffmpegPath,
+      config: { deploymentRef: change.review.deploymentRef, projectRef: change.review.projectRef,
+        credentialRef: reason === "binding" ? "other-key-version" : change.review.credentialRef, bucketId: "fictional-bucket", prefix: "showme-test" },
+      apiKey: "fictional-fixture-key", allowExternalProcessing: true,
+      storageClient: { downloadAsStream: async () => { reads++; const bytes = Buffer.from(screens.images[0].bytes); bytes[20] ^= 1; return Readable.from(bytes); } } as never,
+      fetch: async () => { sends++; throw new Error("must never send"); } });
+    t.after(() => runtime.stop());
+    if (reason === "binding") {
+      await assert.rejects(runtime.admission.request(guide.id, command, operationsSignal()), /ANALYSIS_UNAVAILABLE/);
+      assert.equal(await h.repository.getAnalysisFunding(guide.id, command.runId), null);
+    } else {
+      assert.ok(await runtime.admission.request(guide.id, command, operationsSignal()));
+      if (reason === "revoked") await operatorStore(h.pool).execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1,
+        deploymentRef: change.review.deploymentRef, reviewId: change.review.id }, operationsSignal());
+      assert.notEqual(await runtime.tick(), "completed");
+    }
+    assert.equal(sends, 0); assert.equal(reads, reason === "pixels" ? 1 : 0);
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_count_attempts")).rows[0].n, 0);
+    await runtime.stop();
+  }
+});
+
+test("real PostgreSQL: operator entry authenticates a separate minimal-role login for review, activation, stop and revoke", async (t) => {
+  const h = await fixture(t); const seeded = await h.seed();
+  const role = `showme_analysis_operator_test_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  const password = randomUUID().replaceAll("-", ""); // Generated temporary credential only.
+  await h.pool.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+  const target = new URL(h.connection); target.username = role; target.password = password;
+  let operatorPool: Pool | undefined;
+  try {
+    await h.pool.query(`GRANT USAGE ON SCHEMA public TO "${role}"`);
+    await h.pool.query(`GRANT SELECT, INSERT ON analysis_operations_reviews TO "${role}"`);
+    await h.pool.query(`GRANT SELECT, INSERT ON analysis_activation_events TO "${role}"`);
+    await h.pool.query(`GRANT SELECT(status) ON analysis_runs, analysis_count_attempts, analysis_request_attempts TO "${role}"`);
+    await h.pool.query(`GRANT SELECT, UPDATE(payload) ON analysis_accounting_controls TO "${role}"`);
+    operatorPool = new Pool({ connectionString: target.toString(), max: 1 });
+    for (const query of ["SELECT * FROM guides", "SELECT * FROM guide_steps", "DELETE FROM analysis_operations_reviews",
+      "UPDATE analysis_operations_reviews SET action='revoke'", "DELETE FROM analysis_accounting_controls",
+      "SELECT payload FROM analysis_runs", "DELETE FROM analysis_activation_events", "UPDATE analysis_activation_events SET action='deactivate'"]) {
+      await assert.rejects(operatorPool.query(query), (error: { code?: string }) => error.code === "42501");
+    }
+    const command = operatorCommand(); const { reviewerRef: _actor, ...review } = command.review;
+    const payload = { ...command, review }; const database = target.pathname.slice(1);
+    const invoke = async (action: "put" | "revoke" | "status" | "activate" | "deactivate", raw: unknown, overrides = {}) => {
+      const result = await runAnalysisOperationsAdmin({ args: [`--action=${action}`, `--deployment=${review.deploymentRef}`, `--database=${database}`,
+        ...(action === "status" ? [] : [action === "activate" ? "--confirm-synthetic-activation" : "--confirm-stop"])], env: { SHOWME_OPERATOR_DATABASE_URL: target.toString(), ...overrides },
+        signal: operationsSignal(), readCommand: async () => raw });
+      assert.ok(!result.output.includes(password)); assert.ok(!result.output.includes(target.toString())); return result;
+    };
+    const first = await invoke("put", payload); assert.equal(first.exitCode, 0); assert.equal(JSON.parse(first.output).authorizesAnalysis, false);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+    assert.equal((await operatorStore(h.pool).readLatest(review.deploymentRef, operationsSignal()))?.actorRef, operationsActorRef(role));
+    assert.equal(JSON.parse((await invoke("put", payload)).output).replayed, true);
+    const status = JSON.parse((await invoke("status", null)).output); assert.equal(status.version, 1); assert.equal(status.halted, true);
+    const activation = activationCommand(command, syntheticGrant(review.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint));
+    assert.equal((await invoke("activate", activation)).exitCode, 0);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).activation?.id, activation.commandId);
+    assert.equal(JSON.parse((await invoke("status", null)).output).lastActivationVersion, 1);
+    const stop = { type: "deactivate", commandId: randomUUID(), expectedVersion: 1, deploymentRef: review.deploymentRef };
+    assert.equal((await invoke("deactivate", stop)).exitCode, 0);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+    assert.equal(JSON.parse((await invoke("activate", activation)).output).replayed, true);
+    assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+    const revoke = { type: "revoke", commandId: randomUUID(), expectedVersion: 1, deploymentRef: review.deploymentRef, reviewId: review.id };
+    assert.equal((await invoke("revoke", revoke)).exitCode, 0);
+    assert.equal(JSON.parse((await invoke("status", null)).output).state, "revoked");
+    // Replaying an old write is explicitly not a current-state receipt or permission.
+    assert.equal(JSON.parse((await invoke("put", payload)).output).requiresCurrentStatusCheck, true);
+    assert.equal(JSON.parse((await invoke("status", null)).output).version, 2);
+    assert.equal((await invoke("status", null, { SHOWME_OPERATOR_DATABASE_URL: target.toString().replace(password, "wrong-password") })).exitCode, 1);
+    assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_operations_reviews")).rows[0].n, 2);
+  } finally {
+    await operatorPool?.end(); await h.pool.query(`DROP OWNED BY "${role}"`); await h.pool.query(`DROP ROLE "${role}"`);
+  }
+});
+
+test("real PostgreSQL: activation is audited, replay cannot reopen a stop and old replicas cannot spend after reactivation", async t => {
+  const h = await fixture(t), seeded = await h.seed(), change = operatorCommand();
+  const store = operatorStore(h.pool); await store.execute(change, operationsSignal());
+  const grant = syntheticGrant(change.review.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint);
+  const first = activationCommand(change, grant);
+  const result = await store.executeActivation(first, operationsSignal());
+  assert.equal(result.entry.version, 1); assert.equal(result.authorizesAnalysis, false); assert.ok(result.entry.activation);
+  const oldReplica = PostgresGuideRepository.fromPool(h.pool); bindAnalysisActivation(oldReplica, result.entry.activation);
+  await assert.rejects(h.repository.reserveAnalysisRequest(seeded.guide.id, seeded.command, policy), /ANALYSIS_ACCOUNTING_HALTED/);
+  await store.executeActivation({ type: "deactivate", commandId: randomUUID(), expectedVersion: 1, deploymentRef: grant.deploymentRef }, operationsSignal());
+  const replay = await store.executeActivation(first, operationsSignal()); assert.equal(replay.replayed, true);
+  assert.deepEqual(await h.repository.getAnalysisAccountingControl(), { halted: true });
+  const second = activationCommand(change, grant, 2);
+  const activated = await store.executeActivation(second, operationsSignal()); assert.ok(activated.entry.activation);
+  await assert.rejects(oldReplica.reserveAnalysisRequest(seeded.guide.id, seeded.command, policy), /ANALYSIS_ACCOUNTING_HALTED/);
+  const current = PostgresGuideRepository.fromPool(h.pool); bindAnalysisActivation(current, activated.entry.activation);
+  assert.ok(await current.reserveAnalysisRequest(seeded.guide.id, seeded.command, policy));
+  assert.throws(() => bindAnalysisActivation(oldReplica, activated.entry.activation!), /ANALYSIS_ACCOUNTING_HALTED/);
+  assert.equal((await store.activationStatus(operationsSignal()))?.version, 3);
+  // Review mutation invalidates the permit and its cached readiness in every replica.
+  await store.execute({ type: "revoke", commandId: randomUUID(), expectedVersion: 1, deploymentRef: grant.deploymentRef, reviewId: change.review.id }, operationsSignal());
+  await assert.rejects(current.claimAnalysisWork(seeded.guide.id, { runId: seeded.command.runId, attemptId: randomUUID(), expectedAttemptCount: 0, leaseMs: 30_000 }), /ANALYSIS_ACCOUNTING_HALTED/);
+});
+
+test("real PostgreSQL: activation rejects stale reviews, bad scope, expired grants and simultaneous switches without partial history", async t => {
+  const h = await fixture(t), seeded = await h.seed(), change = operatorCommand();
+  const store = operatorStore(h.pool); await store.execute(change, operationsSignal());
+  const grant = syntheticGrant(change.review.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint);
+  const valid = activationCommand(change, grant);
+  for (const invalid of [{ ...valid, expectedReviewVersion: 2 }, { ...valid, reviewId: "wrong" },
+    { ...valid, grant: { ...grant, deploymentRef: "other" } }, { ...valid, grant: { ...grant, inputTokenLimit: 1001 } },
+    { ...valid, grant: { ...grant, expiresAt: new Date(Date.now() - 10_000).toISOString() } },
+    { ...valid, grant: { ...grant, input: { ...grant.input, frameCount: 3 } } }]) {
+    await assert.rejects(store.executeActivation(invalid, operationsSignal()));
+    assert.equal(await store.activationStatus(operationsSignal()), null);
+    assert.deepEqual(await h.repository.getAnalysisAccountingControl(), { halted: true });
+  }
+  await assert.rejects(new PostgresAnalysisOperationsStore({ pool: h.pool }).executeActivation(valid, operationsSignal()), /OPERATIONS_FORBIDDEN/);
+  const both = await Promise.allSettled([store.executeActivation(valid, operationsSignal()),
+    operatorStore(h.pool).executeActivation({ ...valid, commandId: randomUUID() }, operationsSignal())]);
+  assert.equal(both.filter(r => r.status === "fulfilled").length, 1);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM analysis_activation_events")).rows[0].n, 1);
+});
+
+test("real PostgreSQL: activation cannot clear unresolved work or unknown prior usage", async t => {
+  const h = await fixture(t); const funded = await h.fund(); await h.begin();
+  const change = operatorCommand(), store = operatorStore(h.pool); await store.execute(change, operationsSignal());
+  const activate = activationCommand(change, syntheticGrant(change.review.deploymentRef, funded.guide.id, funded.command.expectedInputFingerprint));
+  await assert.rejects(store.executeActivation(activate, operationsSignal()), /OPERATIONS_CONFLICT/);
+  await h.repository.executeAnalysisCommand(funded.guide.id, { type: "cancel", runId: funded.command.runId });
+  await h.repository.executeAnalysisAccounting(funded.guide.id, { type: "settle", ...identity, usage: { status: "unknown" } });
+  await assert.rejects(store.executeActivation(activate, operationsSignal()), /OPERATIONS_CONFLICT/);
+  assert.equal(await store.activationStatus(operationsSignal()), null);
+  assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);
+});
+
+test("real PostgreSQL: scoped activation is rechecked at both final send boundaries, not just readiness", async t => {
+  for (const boundary of ["count", "generation"] as const) {
+  const h = await fixture(t), seeded = await h.seed(), change = operatorCommand(), store = operatorStore(h.pool);
+  await store.execute(change, operationsSignal());
+  const grant = syntheticGrant(change.review.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint);
+  const result = await store.executeActivation(activationCommand(change, grant), operationsSignal()); assert.ok(result.entry.activation);
+  bindAnalysisActivation(h.repository, result.entry.activation);
+  assert.ok(await h.repository.reserveAnalysisRequest("guide", seeded.command, policy));
+  const claim = await h.repository.claimAnalysisWork("guide", { runId: "run", attemptId: randomUUID(), expectedAttemptCount: 0, leaseMs: 30_000 }); assert.ok(claim);
+  const owner = { attemptId: claim.run.attemptId!, attemptCount: claim.run.attemptCount };
+  let ticket: object | undefined;
+  if (boundary === "count") {
+  const reserve: Extract<AnalysisCountCommand, { type: "reserve" }> = { type: "reserve", runId: "run", batchIndex: 0, generationOrdinal: 0, owner,
+    binding: { projectRef: change.review.projectRef, inputApprovalId: grant.approvalId,
+      inputFingerprint: seeded.command.expectedInputFingerprint, requestFingerprint: "d".repeat(64), model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION } };
+  await h.repository.executeAnalysisCount("guide", reserve);
+  const count = { ...reserve, limits: quotaCommand().limits, notAfter: new Date(Date.now() + 20000).toISOString() };
+  await h.repository.executeAnalysisCount("guide", { ...count, type: "sending" });
+  ticket = await h.repository.claimAnalysisCountLaunch("guide", { ...count, type: "claim-launch" });
+  } else {
+    assert.ok(await h.repository.executeAnalysisAccounting("guide", { type: "allocate", ...identity, owner }));
+    assert.ok(await h.repository.executeAnalysisAccounting("guide", { type: "sending", ...identity, owner }));
+  }
+  // Fixture fault injection: force an open switch with a different nonce. This
+  // isolates scope fencing from halt handling; real activation refuses pending work.
+  await h.pool.query("UPDATE analysis_accounting_controls SET payload=$1 WHERE id='global'",
+    [{ halted: false, activation: { ...result.entry.activation, id: randomUUID() } }]);
+  let sends = 0;
+  if (boundary === "count") {
+    assert.ok(ticket); await assert.rejects(h.repository.launchAnalysisCount(ticket, () => { sends++; }), /ANALYSIS_COUNT_UNAVAILABLE/);
+    assert.equal(await h.repository.launchAnalysisCount(ticket, () => { sends++; }), false);
+  } else await assert.rejects(h.repository.launchAnalysisRequest("guide", { ...identity, owner,
+    inputFingerprint: seeded.command.expectedInputFingerprint }, () => { sends++; }), /ANALYSIS_ACCOUNTING_HALTED/);
+  assert.equal(sends, 0);
+  }
+});
+
+test("real PostgreSQL: a silently skipped activation switch rolls back its audit event", async t => {
+  const h = await fixture(t), seeded = await h.seed(), change = operatorCommand(), store = operatorStore(h.pool);
+  await store.execute(change, operationsSignal());
+  await h.pool.query("CREATE FUNCTION skip_activation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.payload->>'halted'='false' THEN RETURN NULL; END IF; RETURN NEW; END $$");
+  await h.pool.query("CREATE TRIGGER skip_activation BEFORE UPDATE ON analysis_accounting_controls FOR EACH ROW EXECUTE FUNCTION skip_activation()");
+  await assert.rejects(store.executeActivation(activationCommand(change,
+    syntheticGrant(change.review.deploymentRef, seeded.guide.id, seeded.command.expectedInputFingerprint)), operationsSignal()), /OPERATIONS_UNAVAILABLE/);
+  assert.equal(await store.activationStatus(operationsSignal()), null);
+  assert.deepEqual(await h.repository.getAnalysisAccountingControl(), { halted: true });
+});
+
+test("real PostgreSQL: API attachment shares actual repository/storage and lifecycle shutdown stops the worker without closing its pool", async (t) => {
+  const h = await fixture(t); const { guide, command } = await h.seed("guide", 2, true);
+  const storage = new ReplitObjectStorage({ bucketId: "fictional-bucket", prefix: "fixture", client: {} as never });
+  const options: Parameters<typeof attachFixedSyntheticAnalysisRuntime>[1] = { config: { deploymentRef: "test", projectRef: "test", credentialRef: "test", bucketId: "fictional-bucket", prefix: "fixture" },
+    grant: { kind: "fixed-synthetic-screens-v1" as const, approvalId: "fixture-only", deploymentRef: "test",
+      input: { guideId: guide.id, frameCount: 2, inputFingerprint: command.expectedInputFingerprint, model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION },
+      createdAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), inputTokenLimit: 1000, countPolicy: SYNTHETIC_COUNT_LIMITS },
+    activationId: randomUUID(), migrationsFolder: resolve("drizzle"), ffmpegPath: testMediaPaths().ffmpegPath, apiKey: "fictional-fixture-key", allowExternalProcessing: true,
+    fetch: (async () => { assert.fail("no external request is allowed"); }) as typeof fetch };
+  const runtime = attachFixedSyntheticAnalysisRuntime({ repository: h.repository, storage }, options);
+  assert.equal(runtime.repository, h.repository); assert.equal(runtime.storage, storage);
+  assert.throws(() => attachFixedSyntheticAnalysisRuntime({ repository: h.repository, storage }, { ...options,
+    config: { ...options.config, bucketId: "another-bucket" } }), /ANALYSIS_UNAVAILABLE/);
+  const lifecycle = (await createAnalysisLifecycle({ repository: h.repository, storage }, () => runtime))!;
+  t.after(() => runtime.stop());
+  await assert.rejects(lifecycle.admission.request(guide.id, command, operationsSignal()), /ANALYSIS_UNAVAILABLE/);
+  lifecycle.start(); assert.equal(runtime.getStatus().running, true);
+  // There is no operator record: starting a loop is not approval to admit or transmit.
+  await assert.rejects(lifecycle.admission.request(guide.id, command, operationsSignal()), /ANALYSIS_UNAVAILABLE/);
+  await lifecycle.stop(); assert.equal(runtime.getStatus().running, false); assert.equal(await runtime.tick(), "disabled");
+  assert.equal((await h.pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
 });

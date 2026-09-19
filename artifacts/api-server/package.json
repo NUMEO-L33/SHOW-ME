@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "node ../../scripts/run-tests.mjs server",
     "test:postgres": "node scripts/verify-postgres.mjs --local-docker",
-    "check:analysis-db": "node --import tsx src/processor/analysis-database-check.ts"
+    "check:analysis-db": "node --import tsx src/processor/analysis-database-check.ts",
+    "admin:analysis-operations": "node --import tsx src/processor/analysis-operations-admin.ts"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.22.0",

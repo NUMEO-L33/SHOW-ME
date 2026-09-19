@@ -78,6 +78,20 @@
       "when": 1789477746093,
       "tag": "0010_analysis_count_launch_claim",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789819200000,
+      "tag": "0011_analysis_operations_reviews",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789822800000,
+      "tag": "0012_analysis_activation_events",
+      "breakpoints": true
     }
   ]
 }

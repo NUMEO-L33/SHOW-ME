@@ -27,7 +27,9 @@ const identity = { runId: z.string().min(1).max(128), batchIndex: z.number().int
   // The generation slot this measurement precedes, NOT a count retry ordinal.
   generationOrdinal: z.union([z.literal(0), z.literal(1)]) };
 const bindingSchema = z.object({ projectRef: id, inputApprovalId: id, inputFingerprint: hash, requestFingerprint: hash,
-  model: z.literal(GEMINI_TEST_MODEL), promptVersion: z.literal(GEMINI_PROMPT_VERSION) }).strict();
+  model: z.literal(GEMINI_TEST_MODEL), promptVersion: z.literal(GEMINI_PROMPT_VERSION),
+  // Absent on historical reviewed-bound records; explicitly distinguish the new allowance semantics.
+  inputAccounting: z.literal("acceptance-allowance").optional() }).strict();
 export type AnalysisCountBinding = z.infer<typeof bindingSchema>;
 const usageSchema = z.discriminatedUnion("status", [z.object({ status: z.literal("unknown") }).strict(),
   z.object({ status: z.literal("known"), totalTokens: positive }).strict()]);
@@ -50,6 +52,7 @@ export const analysisCountRecordSchema = z.object({
   maximum: analysisBudgetUnitsSchema, charged: analysisBudgetUnitsSchema,
   // Conservative accounting proxy from the funded input price, NOT an invoice or free-tier proof.
   accountingInputRate: positive, usage: usageSchema.nullable(),
+  inputAccounting: z.literal("acceptance-allowance").optional(),
   createdAt: canonicalTime, sentAt: canonicalTime.nullable(), finishedAt: canonicalTime.nullable(),
 }).strict();
 export type AnalysisCountRecord = z.infer<typeof analysisCountRecordSchema>;
@@ -116,6 +119,7 @@ export function prepareCountAccounting(options: {
   const bindingHash = "binding" in command ? countBindingHash(command.binding) : command.bindingHash;
   if (previous && previous.bindingHash !== bindingHash) invalid();
   if (previous && "binding" in command && previous.scopeKey !== quotaScopeKey(command.binding.projectRef, command.binding.model)) invalid();
+  if (previous && "binding" in command && previous.inputAccounting !== command.binding.inputAccounting) invalid();
   function finish(record: AnalysisCountRecord, replayed = false): CountTransition {
     record = parseCountRecord(record);
     const halted = control.halted || record.status === "overrun";
@@ -168,10 +172,14 @@ export function prepareCountAccounting(options: {
         (a.ordinal === command.generationOrdinal && a.status !== "reserved")))) throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
     if (command.type === "reserve") {
       const p = reservation.details.policy;
+      // In bounded-count mode this is the accepted generation/accounting allowance,
+      // NOT a proved countTokens upper bound. An observed overrun below records the
+      // actual usage and halts future work; it cannot undo that first count request.
       const maximum = { requests: 1, inputTokens: p.maxInputTokensPerRequest, outputTokens: 0,
         costMicrousd: cost(p.maxInputTokensPerRequest, p.price.inputMicrousdPerMillionTokens) };
       return finish({ guideId: options.guideId, runId: command.runId, batchIndex: command.batchIndex, generationOrdinal: command.generationOrdinal,
         operation: "countTokens", requestKey: countRequestKey(options.guideId, command), bindingHash,
+        ...(command.binding.inputAccounting ? { inputAccounting: command.binding.inputAccounting } : {}),
         scopeKey: quotaScopeKey(command.binding.projectRef, command.binding.model), owner: command.owner, day,
         status: "reserved", maximum, charged: maximum, accountingInputRate: p.price.inputMicrousdPerMillionTokens,
         createdAt: timestamp, sentAt: null, finishedAt: null, usage: null });

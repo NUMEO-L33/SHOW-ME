@@ -5,6 +5,7 @@ import path from "node:path";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool, type PoolConfig } from "pg";
+import { analysisActivationSchema, matchesAnalysisActivation, type AnalysisActivation } from "./analysis-activation.js";
 
 import {
   DEFAULT_GUIDE_STATUS_MESSAGES,
@@ -56,7 +57,7 @@ import {
   type AnalysisFundingCommand, type AnalysisFundingLedger, type AnalysisFundingPolicy, type AnalysisFundingResult,
 } from "./analysis-funding.js";
 import {
-  parseAccountingCommand, parseAccountingControl, parseRequestAttempt,
+  AnalysisAccountingError, parseAccountingCommand, parseAccountingControl, parseRequestAttempt,
   type AnalysisAccountingCommand, type AnalysisAccountingResult, type AnalysisRequestAttempt,
 } from "./analysis-accounting-contract.js";
 import { prepareAnalysisAccounting } from "./analysis-accounting.js";
@@ -1292,6 +1293,26 @@ class FundingRollback extends Error {
   constructor(readonly result: AnalysisFundingResult | null) { super("Analysis funding transaction not committed."); }
 }
 
+const analysisPools = new WeakMap<PostgresGuideRepository, Pool>();
+const analysisActivations = new WeakMap<PostgresGuideRepository, AnalysisActivation>();
+/** Trusted, immutable process binding. Switching grants requires a new repository/runtime. */
+export function bindAnalysisActivation(repository: PostgresGuideRepository, raw: AnalysisActivation) {
+  const activation = analysisActivationSchema.parse(raw);
+  const old = analysisActivations.get(repository);
+  if (old && JSON.stringify(old) !== JSON.stringify(activation)) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
+  analysisActivations.set(repository, Object.freeze(activation));
+}
+async function checkLockedActivation(transaction: ProcessorTransaction, repository: PostgresGuideRepository,
+  control: ReturnType<typeof parseAccountingControl>, guideId: string) {
+  const expected = analysisActivations.get(repository);
+  if (!control.activation && !expected) return;
+  if (!matchesAnalysisActivation(control.activation, expected, guideId, await analysisWorkClock(transaction))) {
+    throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
+  }
+}
+/** Trusted composition only: recover the exact pool used by a factory-created repository. */
+export function analysisPoolForRepository(repository: PostgresGuideRepository): Pool | undefined { return analysisPools.get(repository); }
+
 export class PostgresGuideRepository implements GuideRepository {
   readonly countDispatchContract = "postgres-count-0010" as const;
   // Only a successfully acknowledged, irreversible claim creates a local capability.
@@ -1303,10 +1324,12 @@ export class PostgresGuideRepository implements GuideRepository {
   ) {}
 
   static fromPool(pool: Pool, ownsPool = false): PostgresGuideRepository {
-    return new PostgresGuideRepository(
+    const repository = new PostgresGuideRepository(
       drizzle(pool, { schema: processorSchema }),
       ownsPool ? () => pool.end() : undefined,
     );
+    analysisPools.set(repository, pool);
+    return repository;
   }
 
   static connect(databaseUrl: string, poolConfig: Omit<PoolConfig, "connectionString"> = {}) {
@@ -1434,6 +1457,7 @@ export class PostgresGuideRepository implements GuideRepository {
       // All funded claimants share this mutex, including across different guides/replicas.
       // No budget window changes: global control -> guide is a subsequence of the accounting lock order.
       const control = await lockAccountingControl(transaction);
+      await checkLockedActivation(transaction, this, control, guideId);
       const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
       if (!guide) return null;
       const [stored] = await transaction.select().from(analysisReservations).where(and(
@@ -1474,6 +1498,7 @@ export class PostgresGuideRepository implements GuideRepository {
     try {
       return await this.database.transaction(async (transaction) => {
         const control = await lockAccountingControl(transaction);
+        await checkLockedActivation(transaction, this, control, guideId);
         const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
         const [initialReservation] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
         const windows: Array<ReturnType<typeof parseBudgetWindow>> = [];
@@ -1583,6 +1608,7 @@ export class PostgresGuideRepository implements GuideRepository {
         await transaction.execute(sql`SET LOCAL lock_timeout = '4s'`);
         await transaction.execute(sql`SET LOCAL statement_timeout = '4s'`);
         const control = await lockAccountingControl(transaction);
+        await checkLockedActivation(transaction, this, control, guideId);
         const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
         if (!guide) return false;
         const [stored] = await transaction.select().from(analysisReservations).where(and(
@@ -1612,6 +1638,7 @@ export class PostgresGuideRepository implements GuideRepository {
         const started = performance.now(); const at = await analysisWorkClock(transaction, fixedTime);
         const clock = () => fixedTime ? workTime(fixedTime) : new Date(at.valueOf() + Math.ceil(performance.now() - started));
         const guard = () => {
+          if (!matchesAnalysisActivation(control.activation, analysisActivations.get(this), guideId, clock())) throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
           // Re-evaluate the full claim prerequisites without persisting/reissuing it.
           prepareCountAccounting({ guideId, guide: { ...guideFromRow(guide), steps: steps.map(stepFromRow) }, analysis,
             reservation, batches: batches.map(batchFromRow), attempts, windows, control,
@@ -1642,6 +1669,7 @@ export class PostgresGuideRepository implements GuideRepository {
         await transaction.execute(sql`SET LOCAL lock_timeout = '4s'`);
         await transaction.execute(sql`SET LOCAL statement_timeout = '4s'`);
         const control = await lockAccountingControl(transaction); guard();
+        if (["reserve", "sending", "claim-launch"].includes(command.type)) await checkLockedActivation(transaction, this, control, guideId);
         const [stored] = await transaction.select().from(analysisReservations).where(and(
           eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId))).limit(1);
         if (!stored) throw new AnalysisCountError("ANALYSIS_COUNT_UNAVAILABLE");
@@ -1710,6 +1738,7 @@ export class PostgresGuideRepository implements GuideRepository {
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.database.transaction(async (transaction) => {
       const control = await lockAccountingControl(transaction);
+      if (command.type === "allocate" || command.type === "sending") await checkLockedActivation(transaction, this, control, guideId);
       const reservationWhere = and(eq(analysisReservations.guideId, guideId), eq(analysisReservations.runId, command.runId));
       const [initial] = await transaction.select().from(analysisReservations).where(reservationWhere).limit(1);
       if (!initial?.details) return null;
@@ -1773,6 +1802,7 @@ export class PostgresGuideRepository implements GuideRepository {
     const fixedTime = now === undefined ? undefined : workTime(now);
     return this.database.transaction(async (transaction) => {
       const control = await lockAccountingControl(transaction);
+      await checkLockedActivation(transaction, this, control, guideId);
       const [guide] = await transaction.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
       if (!guide) return false;
       const [stored] = await transaction.select().from(analysisReservations).where(and(
@@ -1794,7 +1824,10 @@ export class PostgresGuideRepository implements GuideRepository {
       validateFundingCommit(() => beforeLaunch?.(lockedAt));
       // Cancel/delete/media replacement need the guide lock; halt/takeover need the control lock.
       // Start the request now, but do NOT await its response or hold locks across network latency.
-      validateFundingCommit(() => launch(lockedClock));
+      validateFundingCommit(() => {
+        if (!matchesAnalysisActivation(control.activation, analysisActivations.get(this), guideId, lockedClock())) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
+        launch(lockedClock);
+      });
       return true;
     }, { isolationLevel: "read committed" });
   }

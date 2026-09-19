@@ -16,6 +16,7 @@ import { LocalStorage } from "../src/processor/storage.js";
 import { analysisAccountingControls, analysisBudgetWindows, analysisRuns, guides } from "../src/processor/db/schema.js";
 import { emptyFundingLedger } from "../src/processor/analysis-funding.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
+import { operationsBasisFixture } from "./helpers/operations-review-fixture.js";
 import { postgresAccountingFixture } from "./helpers/accounting-postgres-fixture.js";
 
 const now = new Date("2026-09-14T12:00:00.000Z");
@@ -37,6 +38,7 @@ async function harness(context: TestContext) {
       inputMicrousdPerMillionTokens: 100000, outputMicrousdPerMillionTokens: 200000 },
       maxInputTokensPerRequest: 1000, maxOutputTokensPerRequest: 8192, transientRetries: 1, globalLimit: { ...limits }, guideLimit: { ...limits } },
     entitlement: { mode: "free_only", projectRef: "private-project", evidenceId: "private-quota-evidence", paidFallback: false,
+      operationsBasis: operationsBasisFixture(now, "private-quota-evidence"),
       providerLimits: { requestsPerMinute: 15, inputTokensPerMinute: 250_000, requestsPerDay: 100, resetTimeZone: "America/Los_Angeles" } },
   };
   let timestamp = now.valueOf(); let current = true;
@@ -58,6 +60,16 @@ async function harness(context: TestContext) {
     app: appWith(admission), url: `/api/guides/${h.guideId}/analysis`, authorization: `Bearer ${token}`,
     setTime: (date: Date) => { timestamp = date.valueOf(); }, setCurrent: (value: boolean) => { current = value; } };
 }
+
+test("read-only availability verifies the same readiness and preserves all persisted state", async context => {
+  const h = await harness(context), before = await h.state();
+  const input: AnalysisAdmissionInput = { guideId: h.guideId, inputFingerprint: h.command.expectedInputFingerprint, frameCount: 2,
+    model: GEMINI_TEST_MODEL, promptVersion: GEMINI_PROMPT_VERSION };
+  assert.equal(await h.admission.inspectAvailability(input, new AbortController().signal), true);
+  h.setCurrent(false);
+  assert.equal(await h.admission.inspectAvailability(input, new AbortController().signal), false);
+  assert.deepEqual(await h.state(), before);
+});
 
 test("default server admission remains closed and saves no draft, run, window or reservation", async (context) => {
   const h = await harness(context); const before = await h.state();
@@ -169,6 +181,27 @@ test("paid contract needs explicit matching project, approval and spending cap (
   const permitted = h.makeAdmission({ mode: "paid_capped", projectRef: "fixture-project", approvalId: "fixture-approval", dailyCostMicrousd: 1_000_000 });
   assert.ok(await permitted.request(h.guideId, h.command, new AbortController().signal));
   assert.equal((await h.state()).funding.attempts.length, 0);
+});
+
+test("manual provenance is mandatory: missing, forged-basis, expired or mismatched review summaries reserve nothing", async (context) => {
+  const h = await harness(context); const before = await h.state();
+  const entitlement = h.snapshot.entitlement;
+  if (entitlement.mode !== "free_only") assert.fail();
+  const basis = entitlement.operationsBasis;
+  for (const operationsBasis of [undefined, { ...basis, kind: "automatically-verified" },
+    { ...basis, changeDetection: "automatic" }, { ...basis, reviewId: "other-review" },
+    { ...basis, expiresAt: now.toISOString() }, { ...basis, expiresAt: new Date(now.valueOf() + 1000).toISOString() },
+    { ...basis, recordedAt: new Date(now.valueOf() + 1).toISOString() }]) {
+    context.mock.method(h.readiness, "inspect", async () => ({ ...h.snapshot, entitlement: { ...entitlement, operationsBasis } }), { times: 1 });
+    await assert.rejects(h.submit(), /ANALYSIS_UNAVAILABLE/); assert.deepEqual(await h.state(), before);
+  }
+  // Review expiry must still block while waiting for the writer, even with isCurrent() true.
+  entitlement.operationsBasis.expiresAt = h.snapshot.validUntil = new Date(now.valueOf() + 1000).toISOString();
+  const reserve = h.repository.reserveAnalysisRequest.bind(h.repository);
+  h.repository.reserveAnalysisRequest = async (...args) => {
+    h.setTime(new Date(now.valueOf() + 1000)); return reserve(...args);
+  };
+  await assert.rejects(h.submit(), /ANALYSIS_UNAVAILABLE/); assert.deepEqual(await h.state(), before);
 });
 
 test("revocation, expiry, midnight or abort while awaiting the writer rejects before commit", async (context) => {

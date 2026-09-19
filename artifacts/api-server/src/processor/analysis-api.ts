@@ -6,7 +6,7 @@ import { ANALYSIS_CONSENT_VERSION, AnalysisContractError, analysisManifest, pars
 import { parseAnalysisState, type AnalysisCommand, type AnalysisRun, type AnalysisState } from "./analysis-state.js";
 import type { GuideRepository, GuideWithSteps } from "./domain.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
-import { AnalysisAdmissionError } from "./analysis-admission.js";
+import { AnalysisAdmissionError, type AnalysisAdmissionInput } from "./analysis-admission.js";
 
 export const ANALYSIS_API_MODEL = GEMINI_TEST_MODEL;
 export const ANALYSIS_ADMISSION_TIMEOUT_MS = 5_000;
@@ -39,6 +39,8 @@ export type AnalysisRequestCommand = Extract<AnalysisCommand, { type: "request" 
  */
 export interface AnalysisAdmission {
   request(guideId: string, command: AnalysisRequestCommand, signal: AbortSignal): Promise<AnalysisState | null>;
+  /** Read-only display check. Never submits work, loads image bytes or invokes a provider. */
+  inspectAvailability?(input: AnalysisAdmissionInput, signal: AbortSignal): Promise<boolean>;
 }
 
 const runIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
@@ -128,15 +130,27 @@ export function createAnalysisRouter(options: {
     if (supplied !== undefined && supplied !== fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
   }
 
-  // Display contract only, NOT readiness evidence or an enable flag. Until
-  // trusted runtime evidence/dispatcher wiring exists, every product reports
-  // unavailable, including apps with a test admission injected elsewhere.
-  router.get("/capabilities", limiter(30, 60_000), auth, (request, response, next) => {
+  // Display only: admission and send-time checks are repeated even after a true response.
+  router.get("/capabilities", limiter(30, 60_000), auth, async (request, response, next) => {
     try {
       const supplied = request.header("X-ShowMe-Input-Fingerprint");
       if (!supplied || Object.keys(request.query).length) throw new AnalysisApiError("ANALYSIS_INVALID_REQUEST");
-      assertRequestedInput(request, manifestFor(guides.get(request)!).fingerprint);
-      response.json({ consentVersion: ANALYSIS_CONSENT_VERSION, startAvailable: false, reason: "ANALYSIS_UNAVAILABLE" });
+      const guide = guides.get(request)!, manifest = manifestFor(guide);
+      assertRequestedInput(request, manifest.fingerprint);
+      let startAvailable = false;
+      if (admission?.inspectAvailability) {
+        const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          startAvailable = (await Promise.race([admission.inspectAvailability({ guideId: guide.id,
+            inputFingerprint: manifest.fingerprint, frameCount: manifest.frames.length,
+            model: ANALYSIS_API_MODEL, promptVersion: GEMINI_PROMPT_VERSION }, controller.signal),
+          new Promise<false>(resolve => { timer = setTimeout(() => { resolve(false); controller.abort(); }, ANALYSIS_ADMISSION_TIMEOUT_MS); })])) === true;
+        } catch { startAvailable = false; }
+        finally { if (timer) clearTimeout(timer); controller.abort(); }
+        const current = await authenticate(request);
+        if (manifestFor(current).fingerprint !== manifest.fingerprint) throw new AnalysisApiError("ANALYSIS_STATE_CHANGED");
+      }
+      response.json({ consentVersion: ANALYSIS_CONSENT_VERSION, startAvailable, reason: startAvailable ? null : "ANALYSIS_UNAVAILABLE" });
     } catch (error) { next(error); }
   });
 

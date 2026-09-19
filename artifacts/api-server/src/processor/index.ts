@@ -4,22 +4,24 @@ import path from "node:path";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { CONFIG, type ProcessorConfig } from "./config.js";
+import { CONFIG, loadConfig, type ProcessorConfig } from "./config.js";
 import {
   DELETION_PENDING,
   DELETION_PENDING_ACTIVE,
   finalizeGuideDeletion,
   UPLOAD_CANCELLATION_TOMBSTONE,
 } from "./asset-lifecycle.js";
-import { runDatabaseMigrations } from "./database-migrations.js";
+import { runDatabaseMigrations, verifyDatabaseMigrations } from "./database-migrations.js";
 import { DurableProcessingDispatcher } from "./dispatcher.js";
 import { GUIDE_STATUSES, type GuideRepository } from "./domain.js";
 import { verifyMediaBinaryVersions } from "./media/binary-version.js";
 import { createGuidePipeline } from "./pipeline.js";
 import { ProcessingQueue } from "./queue.js";
-import { createGuideRepository } from "./repository.js";
+import { createGuideRepository, PostgresGuideRepository } from "./repository.js";
 import { createProcessorApp } from "./server.js";
 import { createStorage, type Storage } from "./storage.js";
+import { createAnalysisLifecycle, type ProcessorAnalysisFactory } from "./analysis-lifecycle.js";
+import { analysisBootstrapSettings, configuredAnalysisFactory } from "./analysis-bootstrap.js";
 
 const STORAGE_PROBE_PAYLOAD = Buffer.from("showme-storage-ready", "utf8");
 const STARTUP_CHECK_TIMEOUT_MS = 15_000;
@@ -30,7 +32,7 @@ const LIFECYCLE_STORAGE_OPERATION_TIMEOUT_MS = 5_000;
 const UPLOAD_CANCELLATION_RETENTION_MS = 24 * 60 * 60_000;
 const UNPUBLISHED_DRAFT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
-export async function startProcessor(config: ProcessorConfig = CONFIG) {
+export async function startProcessor(config: ProcessorConfig = CONFIG, options: { createAnalysis?: ProcessorAnalysisFactory } = {}) {
   await mkdir(config.dataDir, { recursive: true });
   const repository = createGuideRepository({
     databaseUrl: config.databaseUrl,
@@ -46,9 +48,11 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
   let startupDispatcher: DurableProcessingDispatcher | undefined;
   let lifecycleTimer: NodeJS.Timeout | undefined;
   let lifecycleSweepPromise: Promise<void> | undefined;
+  let analysis: Awaited<ReturnType<typeof createAnalysisLifecycle>>;
 
   try {
     const storage = createStorage(config);
+    analysis = await createAnalysisLifecycle({ repository, storage }, options.createAnalysis);
     const pipeline = createGuidePipeline({ config, repository, storage });
     const queue = new ProcessingQueue(1, config.queueCapacity);
     startupQueue = queue;
@@ -60,6 +64,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
       pipeline,
       queue,
       readiness,
+      analysisAdmission: analysis?.admission,
     });
 
     server = await new Promise<Server>((resolve, reject) => {
@@ -71,7 +76,11 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
     await withStartupTimeout(
       "database migration",
       STARTUP_CHECK_TIMEOUT_MS,
-      () => runDatabaseMigrations(config.databaseUrl),
+      () => {
+        if (config.databaseMigrationMode !== "verify-only") return runDatabaseMigrations(config.databaseUrl);
+        if (!(repository instanceof PostgresGuideRepository)) throw new Error("DATABASE_MIGRATION_CHECK_FAILED");
+        return verifyDatabaseMigrations(repository.database);
+      },
     );
     await withStartupTimeout(
       "database",
@@ -120,6 +129,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
     };
     lifecycleTimer = setInterval(() => { void runLifecycleSweep(); }, LIFECYCLE_SWEEP_INTERVAL_MS);
     lifecycleTimer.unref();
+    analysis?.start();
     readiness.ready = true;
     // Durable cleanup starts immediately, but it is intentionally outside the
     // readiness critical path and bounded so a large backlog cannot block boot.
@@ -131,9 +141,14 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
       repository: config.databaseUrl ? "postgres" : "json",
     }));
 
-    const close = async () => {
-      if (lifecycleTimer) clearInterval(lifecycleTimer);
-      await closeResources(activeServer, repository, queue, dispatcher, lifecycleSweepPromise);
+    let closing: Promise<void> | undefined;
+    const close = () => {
+      if (!closing) {
+        readiness.ready = false;
+        if (lifecycleTimer) clearInterval(lifecycleTimer);
+        closing = closeResources(activeServer, repository, queue, dispatcher, lifecycleSweepPromise, analysis);
+      }
+      return closing;
     };
     return { app, server: activeServer, repository, queue, dispatcher, close };
   } catch (error) {
@@ -144,6 +159,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG) {
       startupQueue,
       startupDispatcher,
       lifecycleSweepPromise,
+      analysis,
     ).catch(() => undefined);
     throw error;
   }
@@ -304,8 +320,12 @@ async function closeResources(
   queue?: ProcessingQueue,
   dispatcher?: DurableProcessingDispatcher,
   lifecycleSweep?: Promise<void>,
+  analysis?: Awaited<ReturnType<typeof createAnalysisLifecycle>>,
 ): Promise<void> {
   const failures: unknown[] = [];
+  if (analysis) {
+    try { await analysis.stop(); } catch (error) { failures.push(error); }
+  }
   if (server) {
     try {
       await closeServer(server);
@@ -411,8 +431,15 @@ export async function verifyStorage(
   }
 }
 
+/** Product entry: absence of an explicit scoped mode still starts the ordinary AI-disabled server. */
+export async function startConfiguredProcessor(env: Readonly<Record<string, string | undefined>> = process.env) {
+  const config = loadConfig(env);
+  const settings = analysisBootstrapSettings(env, config);
+  return startProcessor(config, { createAnalysis: settings ? configuredAnalysisFactory(settings, config) : undefined });
+}
+
 if (process.env.NODE_ENV !== "test") {
-  startProcessor().then(({ close }) => {
+  startConfiguredProcessor().then(({ close }) => {
     let closing = false;
     const shutdown = () => {
       if (closing) return;

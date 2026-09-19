@@ -4,6 +4,15 @@ import { test } from "node:test";
 
 import { ConfigurationError, loadConfig } from "../src/processor/config.js";
 
+test("database migration mode stays automatic by default; verify-only requires an explicit database", () => {
+  assert.equal(loadConfig({ NODE_ENV: "test" }).databaseMigrationMode, "automatic");
+  assert.equal(loadConfig({ NODE_ENV: "test", DATABASE_URL: "postgresql://fixture:fake@localhost/fixture",
+    SHOWME_DATABASE_MIGRATIONS: "verify-only" }).databaseMigrationMode, "verify-only");
+  for (const mode of ["verify-only", "skip", "off"]) {
+    assert.throws(() => loadConfig({ NODE_ENV: "test", SHOWME_DATABASE_MIGRATIONS: mode }), /SHOWME_DATABASE_MIGRATIONS/);
+  }
+});
+
 test("Replit deployment fails closed without durable services and a stable asset secret", () => {
   assert.throws(
     () => loadConfig({

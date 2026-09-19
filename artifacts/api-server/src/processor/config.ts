@@ -35,6 +35,7 @@ export type ProcessorConfig = Readonly<{
   ffprobePath: string;
   expectedMediaVersion?: string;
   databaseUrl?: string;
+  databaseMigrationMode: "automatic" | "verify-only";
   storageDriver: StorageDriver;
   replitBucketId?: string;
   replitObjectPrefix: string;
@@ -294,6 +295,9 @@ export function loadConfig(env: Environment = process.env): ProcessorConfig {
   const resolvedStorageDriver = storageDriver(env, issues);
   const resolvedCorsOrigins = corsOrigins(env, issues);
   const resolvedDatabaseUrl = databaseUrl(env, issues);
+  const migrationMode = optionalString(env, "SHOWME_DATABASE_MIGRATIONS") ?? "automatic";
+  if (migrationMode !== "automatic" && migrationMode !== "verify-only") issues.push("SHOWME_DATABASE_MIGRATIONS must be automatic or verify-only.");
+  if (migrationMode === "verify-only" && !resolvedDatabaseUrl) issues.push("SHOWME_DATABASE_MIGRATIONS=verify-only requires PostgreSQL.");
   const assetTicketSecret = optionalString(env, "ASSET_TICKET_SECRET");
   const expectedMediaVersion = optionalString(env, "EXPECTED_MEDIA_VERSION");
 
@@ -396,6 +400,7 @@ export function loadConfig(env: Environment = process.env): ProcessorConfig {
     ),
     expectedMediaVersion,
     databaseUrl: resolvedDatabaseUrl,
+    databaseMigrationMode: migrationMode === "verify-only" ? "verify-only" : "automatic",
     storageDriver: resolvedStorageDriver,
     replitBucketId: optionalString(env, "REPLIT_OBJECT_STORAGE_BUCKET_ID"),
     replitObjectPrefix: objectPrefix(env, issues),

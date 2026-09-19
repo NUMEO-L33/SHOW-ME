@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { analysisBudgetUnitsSchema, type AnalysisBudgetUnits } from "./analysis-budget.js";
 import { ANALYSIS_LIMITS } from "./analysis-contract.js";
+import { analysisActivationSchema } from "./analysis-activation.js";
 
 /** Internal accounting only; none of these records authorizes a provider call. */
 export class AnalysisAccountingError extends Error {
@@ -28,7 +29,7 @@ const commandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("release"), ...identity }).strict(),
 ]);
 export type AnalysisAccountingCommand = z.infer<typeof commandSchema>;
-export const accountingControlSchema = z.object({ halted: z.boolean() }).strict();
+export const accountingControlSchema = z.object({ halted: z.boolean(), activation: analysisActivationSchema.optional() }).strict();
 export type AnalysisAccountingControl = z.infer<typeof accountingControlSchema>;
 export const analysisRequestAttemptSchema = z.object({
   guideId: z.string().min(1).max(128), ...identity,

@@ -74,6 +74,20 @@ test("count identities stay fixed across approval/project/owner changes and cann
   assert.equal(h.step({ ...h.reserve, type: "reserve", binding: h.binding, owner: { attemptId: "takeover", attemptCount: 2 } }).replayed, true);
 });
 
+test("count allowance semantics are persisted and bound without changing the stable one-shot slot", async (t) => {
+  const h = await fixture(t); const binding = { ...h.binding, inputAccounting: "acceptance-allowance" as const };
+  const command = { ...h.reserve, type: "reserve" as const, binding, owner: h.owner };
+  const record = h.step(command).record;
+  assert.equal(record.inputAccounting, "acceptance-allowance");
+  assert.equal(record.requestKey, countRequestKey(h.guideId, h.reserve));
+  assert.notEqual(record.bindingHash, countBindingHash(h.binding));
+  assert.throws(() => h.step(h.reserve));
+  assert.equal(h.step(command).replayed, true);
+  const historical = await fixture(t); historical.step(historical.reserve);
+  assert.throws(() => historical.step({ ...historical.reserve, type: "reserve", owner: historical.owner,
+    binding: { ...historical.binding, inputAccounting: "acceptance-allowance" } }));
+});
+
 test("count sending is one-way and neither replay nor changed owner can obtain a new sending transition", async (t) => {
   const h = await fixture(t); h.step(h.reserve);
   assert.throws(() => h.step({ ...h.sending, type: "sending", binding: h.binding, limits: providerLimits, notAfter: now.toISOString(),

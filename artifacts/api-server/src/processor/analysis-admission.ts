@@ -6,6 +6,8 @@ import { analysisFundingPolicySchema, AnalysisFundingError, fundingDay, parseFun
 import type { GuideRepository } from "./domain.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "./gemini/request.js";
 import { providerQuotaDay, providerQuotaLimitsSchema } from "./analysis-provider-quota.js";
+import { analysisOperationsBasisSchema, assertAnalysisOperationsBasis } from "./analysis-operations-review.js";
+import { boundedCountPolicySchema } from "./gemini/count-policy.js";
 
 export class AnalysisAdmissionError extends Error {
   override name = "AnalysisAdmissionError";
@@ -25,30 +27,41 @@ const snapshotSchema = z.object({
   frameCount: positive.max(24), model: z.literal(GEMINI_TEST_MODEL), promptVersion: z.literal(GEMINI_PROMPT_VERSION),
   scope: z.literal("approved_synthetic"), inputApprovalId: id,
   // These are claims from a TRUSTED verifier, not proof derived from their spelling.
-  runtime: z.object({ repository: z.literal("postgres-0008"), dispatcher: z.literal("durable-accounted-v1"),
+  runtime: z.union([z.object({ repository: z.literal("postgres-0008"), dispatcher: z.literal("durable-accounted-v1"),
     counting: z.literal("count-accounted-0010-v1").optional(),
     inputTokenBound: positive, boundIncludes: z.literal("prompt-schema-targets-context") }).strict(),
+  z.object({ repository: z.literal("postgres-0008"), dispatcher: z.literal("durable-accounted-v1"),
+    counting: z.literal("count-accounted-0010-v1"), inputTokenLimit: positive, countPolicy: boundedCountPolicySchema }).strict()]),
   policy: analysisFundingPolicySchema,
   entitlement: z.discriminatedUnion("mode", [
-    z.object({ mode: z.literal("free_only"), projectRef: id, evidenceId: id, paidFallback: z.literal(false), providerLimits: providerQuotaLimitsSchema }).strict(),
+    z.object({ mode: z.literal("free_only"), projectRef: id, evidenceId: id, paidFallback: z.literal(false),
+      providerLimits: providerQuotaLimitsSchema, operationsBasis: analysisOperationsBasisSchema }).strict(),
     z.object({ mode: z.literal("paid_capped"), projectRef: id, evidenceId: id, approvalId: id }).strict(),
   ]),
 }).strict();
 export type AnalysisAdmissionSnapshot = z.infer<typeof snapshotSchema>;
+/** Acceptance/accounting ceiling in count-first mode; never a claim of pre-count token knowledge. */
+export function analysisInputTokenCeiling(runtime: AnalysisAdmissionSnapshot["runtime"]): number {
+  return "countPolicy" in runtime ? runtime.inputTokenLimit : runtime.inputTokenBound;
+}
 export const analysisAdmissionInputSchema = snapshotSchema.pick({ guideId: true, inputFingerprint: true,
   frameCount: true, model: true, promptVersion: true });
 export type AnalysisAdmissionInput = z.infer<typeof analysisAdmissionInputSchema>;
 
 /**
- * Trusted B4/B5 adapter. Must verify the configured DB/worker, approved
- * synthetic input, full token bound, provider project/free quota or spending
- * approval. Never source this object from HTTP or smoke-test env booleans.
- * The evidence coordinator is not a live source of these facts. Startup supplies
- * neither one; inspect must not transmit images (including via countTokens).
+ * Trusted B4/B5 adapter. Checks live DB/worker and approved synthetic input/full
+ * token bound OR explicit bounded-count approval separately from the current
+ * operator review of platform conditions. Count-first still requires an exact
+ * measured request before generation, and never infers permission from a size.
+ * That review is NOT live cloud verification or a zero-spend guarantee.
+ * Never source this object from HTTP or smoke-test env booleans.
+ * The evidence coordinator is not a live source of these facts. Default startup
+ * supplies neither one; authenticated synthetic bootstrap is explicit. Inspect
+ * must not transmit images (including via countTokens).
  */
 export interface AnalysisAdmissionReadiness {
   inspect(input: AnalysisAdmissionInput, signal: AbortSignal): Promise<unknown>;
-  /** Synchronous no-I/O check: revoke the snapshot when any prerequisite changes. */
+  /** Synchronous no-I/O check of local prerequisites and current review revision/revocation. */
   isCurrent(snapshotId: string): boolean;
 }
 
@@ -89,6 +102,13 @@ export function verifyAnalysisReadiness(options: {
         current.valueOf() < at.valueOf() || fundingDay(current) !== fundingDay(at) ||
         providerQuotaDay(current) !== providerQuotaDay(at) || fundingDay(new Date(checked)) !== fundingDay(current) ||
         providerQuotaDay(new Date(checked)) !== providerQuotaDay(current)) unavailable();
+    if (snapshot.entitlement.mode === "free_only") {
+      try {
+        const basis = assertAnalysisOperationsBasis(snapshot.entitlement.operationsBasis, current);
+        if (basis.reviewId !== snapshot.entitlement.evidenceId ||
+            Date.parse(basis.recordedAt) > checked || expiry > Date.parse(basis.expiresAt)) unavailable();
+      } catch { unavailable(); }
+    }
     const valid: unknown = readiness.isCurrent(snapshot.id);
     if (valid !== true) {
       void Promise.resolve(valid).catch(() => undefined);
@@ -96,7 +116,8 @@ export function verifyAnalysisReadiness(options: {
     }
   };
   if (Object.entries(input).some(([key, value]) => snapshot[key as keyof AnalysisAdmissionInput] !== value) ||
-      snapshot.policy.price.model !== input.model || snapshot.policy.maxInputTokensPerRequest < snapshot.runtime.inputTokenBound) unavailable();
+      snapshot.policy.price.model !== input.model || snapshot.policy.maxInputTokensPerRequest < analysisInputTokenCeiling(snapshot.runtime)) unavailable();
+  if ("countPolicy" in snapshot.runtime && (spending.mode !== "free_only" || snapshot.entitlement.mode !== "free_only")) unavailable();
   const { policy, entitlement } = snapshot;
   if ([policy.globalLimit, policy.guideLimit].some((limit) => Object.values(limit).some((value) => value === 0))) unavailable();
   if (spending.mode === "free_only") {
@@ -147,6 +168,16 @@ export class DurableAnalysisAdmission implements AnalysisAdmission {
     const date = new Date(this.clock().valueOf());
     if (!Number.isFinite(date.valueOf())) unavailable();
     return date;
+  }
+
+  async inspectAvailability(input: AnalysisAdmissionInput, signal: AbortSignal): Promise<boolean> {
+    try {
+      if (!this.readiness) return false;
+      checkAbort(signal);
+      const { assertCurrent } = verifyAnalysisReadiness({ raw: await abortable(this.readiness.inspect(input, signal), signal),
+        input, readiness: this.readiness, spending: this.spending, clock: () => this.time(), signal });
+      assertCurrent(); return true;
+    } catch { return false; }
   }
 
   private async perform(guideId: string, command: AnalysisRequestCommand, signal: AbortSignal) {

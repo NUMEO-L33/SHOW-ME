@@ -30,7 +30,7 @@ const identity = (input: MeasurementLookup | GeminiInputMeasurement) => JSON.str
   input.projectRef, input.model, input.promptVersion, input.inputApprovalId, input.inputFingerprint, input.requestFingerprint,
 ]);
 
-/** Measurements are an additional check, NOT a substitute for the reviewed upper bound. */
+/** Exact measured input, checked against the approved generation ceiling; not a pre-count upper-bound proof. */
 export function verifyGeminiInputMeasurement(options: {
   raw: unknown; input: MeasurementLookup; verifier: AnalysisInputMeasurementVerifier;
   maxInputTokens: number; clock: () => Date; signal: AbortSignal;
@@ -57,7 +57,7 @@ export function verifyGeminiInputMeasurement(options: {
 /**
  * Trusted count-stage dependency, intentionally NOT supplied by startup.
  * execute must separately persist countTokens usage/attempt identity and enforce
- * consent, current guide ownership, reviewed input bound and provider quota BEFORE
+ * consent, current guide ownership, reviewed bound OR explicit bounded-count approval, and request quota BEFORE
  * transmission. An existing generateContent send permit is NOT valid here.
  * The complete request must be counted, and no hidden retries are permitted.
  */

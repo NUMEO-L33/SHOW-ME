@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { AnalysisAccountingError, retryableHttpStatusSchema, type AnalysisAccountingCommand } from "./analysis-accounting-contract.js";
-import { AnalysisAdmissionError, verifyAnalysisReadiness, type AnalysisAdmissionReadiness } from "./analysis-admission.js";
+import { AnalysisAdmissionError, analysisInputTokenCeiling, verifyAnalysisReadiness, type AnalysisAdmissionReadiness } from "./analysis-admission.js";
 import { ANALYSIS_LIMITS, AnalysisContractError, analysisBatches, analysisManifest, type AnalysisProvider } from "./analysis-contract.js";
 import { ANALYSIS_IMAGE_BUDGET } from "./analysis-image-policy.js";
 import { fundingDay, type AnalysisFundingPolicy } from "./analysis-funding.js";
@@ -15,6 +15,7 @@ import { assertQuotaPermit, parseQuotaReceipt, quotaRequestKey, type AnalysisQuo
 import { auditGeminiInput, verifyGeminiInputBound, type AnalysisInputBoundVerifier } from "./gemini/input-bound.js";
 import { verifyGeminiInputMeasurement, type AnalysisInputMeasurementVerifier } from "./gemini/input-measurement.js";
 import type { AnalysisMeasurementStage } from "./gemini/counted-measurements.js";
+import { boundedCountBody } from "./gemini/count-policy.js";
 
 /** Trusted adapter contract: exactly one external attempt per invocation, never nested retries. */
 export type AnalysisDispatchProvider = Pick<AnalysisProvider, "name" | "model"> & {
@@ -154,8 +155,11 @@ export class DurableAnalysisDispatcher {
     // Never reinterpret an already reserved run with a different price, quota or retry policy.
     if (JSON.stringify(checked.snapshot.policy) !== JSON.stringify(policy)) throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
     if (checked.snapshot.entitlement.mode !== "free_only") throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
+    const countFirst = "countPolicy" in checked.snapshot.runtime;
+    if (countFirst ? !this.options.inputMeasurementStage : !this.options.inputBoundVerifier) throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
     return { assertCurrent: checked.assertCurrent, entitlement: checked.snapshot.entitlement, validUntil: checked.snapshot.validUntil,
-      inputApprovalId: checked.snapshot.inputApprovalId, inputTokenBound: checked.snapshot.runtime.inputTokenBound };
+      inputApprovalId: checked.snapshot.inputApprovalId, inputTokenLimit: analysisInputTokenCeiling(checked.snapshot.runtime), countFirst,
+      countPolicy: "countPolicy" in checked.snapshot.runtime ? checked.snapshot.runtime.countPolicy : undefined };
   }
   private async current(guideId: string, claimed: AnalysisRun, signal: AbortSignal, sending: boolean, watchTerminal = false) {
     const repository = this.options.repository;
@@ -178,7 +182,8 @@ export class DurableAnalysisDispatcher {
 
   private async pass(): Promise<AnalysisDispatchOutcome> {
     if (!this.options.provider || !this.options.readiness || !this.options.loadImage || !this.options.quotaStore ||
-        !this.options.inputBoundVerifier || (!this.options.inputMeasurementVerifier && !this.options.inputMeasurementStage)) return "disabled";
+        (!this.options.inputBoundVerifier && !this.options.inputMeasurementStage) ||
+        (!this.options.inputMeasurementVerifier && !this.options.inputMeasurementStage)) return "disabled";
     const repository = this.options.repository;
     let active: { guideId: string; run: AnalysisRun } | undefined;
     const deadline = new AbortController();
@@ -313,11 +318,15 @@ export class DurableAnalysisDispatcher {
             if (error instanceof AnalysisContractError) throw new WorkFailure("AI_INVALID_OUTPUT");
             throw new WorkFailure("AI_PROVIDER_FAILED");
           }
-          const inputBoundVerifier = this.options.inputBoundVerifier!;
+          const inputBoundVerifier = this.options.inputBoundVerifier;
+          if (permission.countPolicy) {
+            try { boundedCountBody({ ...batch, images }, permission.countPolicy); }
+            catch { throw new WorkFailure("AI_INVALID_OUTPUT"); }
+          }
           const audit = auditGeminiInput({ ...batch, images }, permission.inputApprovalId, run.manifest.fingerprint);
-          const inputBound = verifyGeminiInputBound({ audit,
-            raw: await this.io((s) => inputBoundVerifier.inspect(structuredClone(audit), s), signal), verifier: inputBoundVerifier,
-            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenBound), clock: () => this.time(), signal });
+          const inputBound = permission.countFirst ? undefined : verifyGeminiInputBound({ audit,
+            raw: await this.io((s) => inputBoundVerifier!.inspect(structuredClone(audit), s), signal), verifier: inputBoundVerifier!,
+            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenLimit), clock: () => this.time(), signal });
           const measurementVerifier = this.options.inputMeasurementStage ?? this.options.inputMeasurementVerifier!;
           const measurementInput = { ...audit, projectRef: permission.entitlement.projectRef };
           if (this.options.inputMeasurementStage) {
@@ -328,7 +337,7 @@ export class DurableAnalysisDispatcher {
           }
           const measured = verifyGeminiInputMeasurement({ input: measurementInput,
             raw: await this.io((s) => measurementVerifier.inspect(structuredClone(measurementInput), s), signal), verifier: measurementVerifier,
-            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenBound, inputBound.evidence.totalInputTokenUpperBound),
+            maxInputTokens: Math.min(policy.maxInputTokensPerRequest, permission.inputTokenLimit, inputBound?.evidence.totalInputTokenUpperBound ?? Infinity),
             clock: () => this.time(), signal });
           const assertInputCurrent = (clock: () => Date = () => this.time()) => {
             // Recheck bytes/metadata, not only the stored guide manifest, at the actual send boundary.
@@ -336,7 +345,7 @@ export class DurableAnalysisDispatcher {
               throw new AnalysisAdmissionError("ANALYSIS_UNAVAILABLE");
             }
             // Hashing a large payload takes time: check expiry AFTER hashing with a fresh clock.
-            inputBound.assertCurrent(clock()); measured.assertCurrent(clock());
+            inputBound?.assertCurrent(clock()); measured.assertCurrent(clock());
           };
           await this.current(guideId, run, signal, true);
           const sent = await this.io((s) => repository.executeAnalysisAccounting(guideId,
