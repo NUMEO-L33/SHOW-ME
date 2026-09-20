@@ -12,6 +12,7 @@ import { rateLimit } from "express-rate-limit";
 import { createAssetTicket, verifyAssetTicket } from "./asset-token.js";
 import { AnalysisApiError, createAnalysisRouter, type AnalysisAdmission } from "./analysis-api.js";
 import { createDraftRouter } from "./draft-api.js";
+import { createPrivacyPreviewRouter } from "./privacy-preview-api.js";
 import { DurableAnalysisAdmission } from "./analysis-admission.js";
 import {
   cleanupStorageKeys,
@@ -424,6 +425,11 @@ export function createProcessorApp({
 
   app.use("/api/guides/:guideId/draft", createDraftRouter({
     repository, authenticate: (request) => requireGuideAccess(request, repository),
+  }));
+
+  app.use("/api/guides/:guideId/privacy-preview", createPrivacyPreviewRouter({
+    repository, storage, ffmpegPath: config.ffmpegPath,
+    authenticate: (request) => requireGuideAccess(request, repository),
   }));
 
   app.use("/api/guides/:guideId/analysis", createAnalysisRouter({

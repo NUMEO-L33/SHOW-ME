@@ -27,7 +27,7 @@ export class AnalysisImageError extends Error {
 function invalid(): never { throw new AnalysisImageError(); }
 
 /** Only the pipeline's single-scan baseline JPEG profile; no EXIF, extra images or trailing payload. */
-function checkJpeg(bytes: Buffer, width: number, height: number) {
+export function checkJpeg(bytes: Buffer, width: number, height: number) {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 ||
       width > 4096 || height > 4096 || bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) invalid();
   let offset = 2; let frame = false; let quantization = false; let huffman = false;

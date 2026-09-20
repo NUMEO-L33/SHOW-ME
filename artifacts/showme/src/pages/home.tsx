@@ -41,6 +41,8 @@ import { draftDocument, draftSteps, draftFailure, getDraft, putDraft, type Draft
 import { DraftAutosave } from "@/lib/draft-autosave";
 import { applyAnalysisPreview, type AnalysisPreview } from "@/lib/analysis-review";
 import { AnalysisWorkflow } from "@/components/analysis-workflow";
+import { PrivacyEditor } from "@/components/privacy-editor";
+import type { DraftIdentity } from "@/lib/draft-client";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -342,9 +344,11 @@ type ReviewScreenProps = {
   draftError: string | null;
   onCompositionChange: (composing: boolean) => void;
   analysisReview?: React.ReactNode;
+  privacyIdentity?: DraftIdentity;
+  privacyBase?: DraftSnapshot;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview, privacyIdentity, privacyBase }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -573,7 +577,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           <div className="mx-auto flex h-full max-w-[800px] flex-col">
             {isLiveDraft && (
               <p role="note" className="mb-3 rounded-xl border border-[#e3d6ad] bg-[#fffbeb] p-3 text-sm font-semibold leading-6 text-[#786238]">
-                설명과 누를 위치를 편집하면 약 1초 뒤 자동 저장됩니다. ‘자동 저장됨’을 확인한 뒤 창을 닫아 주세요. 새 AI 분석·개인정보 가림·공개 공유는 아직 시작할 수 없습니다.
+                설명·누를 위치·가림 영역은 약 1초 뒤 자동 저장됩니다. ‘자동 저장됨’을 확인한 뒤 창을 닫아 주세요. 가림 처리본은 ‘가림 영역 편집’에서 확인할 수 있습니다. 새 AI 분석과 공개 공유는 준비 중입니다.
               </p>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -630,6 +634,10 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
           </div>
 
           <div className="border-b border-[#e8ebf1] px-5 py-5">
+            {isLiveDraft && activeStep.draft ? <PrivacyEditor key={activeStep.draft.id} step={activeStep}
+              onChange={draft => updateActiveStep({ draft }, true)} disabled={draftLoading}
+              previewDisabled={draftDirty || draftSaving || draftLoading || Boolean(draftError)}
+              identity={privacyIdentity} base={privacyBase} /> : <>
             <div className="flex items-center justify-between"><div><p className="flex items-center gap-1.5 text-sm font-black"><LockKeyhole className="size-4 text-[#74539b]" />개인정보 가림</p><p className="mt-1 text-xs font-semibold text-[#8b94a6]">{isLiveDraft ? "개인정보 탐지·가림 준비 중" : `이 단계에서 ${activeStep.privacyCount}곳 발견`}</p></div>{!isLiveDraft && <span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${activeStep.privacyEnabled ? "bg-[#ece8f5] text-[#6c4b91]" : "bg-[#fff0ed] text-[#bc503c]"}`}>{activeStep.privacyEnabled ? "적용 중" : "가림 해제"}</span>}</div>
             {isLiveDraft ? (
               <p className="mt-4 rounded-[14px] bg-[#fff8ed] p-3.5 text-sm font-semibold leading-6 text-[#84653e]">현재 화면에는 개인정보가 가려져 있지 않아요. 탐지와 영구 가림을 연결한 뒤 공개할 수 있어요.</p>
@@ -642,6 +650,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
               <div className="mt-4 flex items-center gap-2.5 rounded-[14px] bg-[#f5f7fa] p-3.5 text-xs font-semibold text-[#768197]"><BadgeCheck className="size-4 text-[#2b8568]" />개인정보로 보이는 내용이 없어요.</div>
             )}
             <Button variant="outline" disabled={isLiveDraft} className="mt-3 h-10 w-full rounded-[12px] border-dashed border-[#cfc5dc] font-extrabold text-[#6f538e]" onClick={() => updateActiveStep({ privacyCount: activeStep.privacyCount + 1, privacyEnabled: true }, true)}><Plus className="size-4" />{isLiveDraft ? "가림 영역 편집 준비 중" : "가림 영역 추가"}</Button>
+            </>}
           </div>
 
           <div className="space-y-2 px-5 py-5">
@@ -1459,6 +1468,8 @@ export default function Home() {
           draftLoading={draftLoading}
           draftError={draftError}
           onCompositionChange={onDraftCompositionChange}
+          privacyIdentity={processingKind === "video" && activeJob ? activeJob : undefined}
+          privacyBase={draftSnapshot ?? undefined}
           analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisWorkflow
             key={`${activeJob.guideId}:${draftSnapshot.inputFingerprint}`} identity={activeJob} base={draftSnapshot}
             disabled={draftDirty || draftSaving || draftLoading || Boolean(draftError) || draftComposing}
