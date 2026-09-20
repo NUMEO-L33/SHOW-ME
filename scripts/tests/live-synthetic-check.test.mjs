@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkArguments, singleSendTransport } from "../../artifacts/api-server/scripts/check-live-synthetic.mjs";
+import { checkArguments, singleSendTransport, assertRecoveryGuide } from "../../artifacts/api-server/scripts/check-live-synthetic.mjs";
 
 const env = { REPL_ID: "00000000-0000-4000-8000-000000000000", GEMINI_API_KEY: "fictional-synthetic-key" };
 const args = ["--run-synthetic", "--evidence=./fictional.json"];
@@ -36,4 +36,17 @@ test("an uncertain transport failure consumes its slot and cannot be retried", a
   await assert.rejects(transport.fetch(url, { method: "POST" }));
   await assert.rejects(transport.fetch(url, { method: "POST" }));
   assert.equal(calls, 1);
+});
+test("cleanup recovery refuses unrelated or changed media and object keys", () => {
+  const id = env.REPL_ID, journal = { guideId: id };
+  const guide = { id, sourceFilename: "showme-fixed-synthetic-acceptance.mp4", sourceSizeBytes: 1,
+    originalObjectKey: `guides/${id}/source/${"0".repeat(64)}.mp4`, processingAttemptCount: 1,
+    steps: [{ position: 0, representativeFrameKey: `guides/${id}/attempts/1/frames/frame-001.jpg`,
+      thumbnailFrameKey: `guides/${id}/attempts/1/frames/frame-001-thumb.jpg` }] };
+  assert.doesNotThrow(() => assertRecoveryGuide(journal, guide));
+  for (const changed of [{ id: "other" }, { sourceFilename: "personal.mp4" }, { sourceSizeBytes: 100 },
+    { originalObjectKey: "other/source.mp4" }, { processingAttemptCount: 2 },
+    { steps: [{ ...guide.steps[0], representativeFrameKey: "other/frame.jpg" }] }]) {
+    assert.throws(() => assertRecoveryGuide(journal, { ...guide, ...changed }));
+  }
 });

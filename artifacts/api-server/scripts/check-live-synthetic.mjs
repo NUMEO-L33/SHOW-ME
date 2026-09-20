@@ -41,6 +41,18 @@ export function singleSendTransport(transport, model, onResponse = () => {}) {
   } };
 }
 
+export function assertRecoveryGuide(journal, guide) {
+  check(uuid.test(journal.guideId) && guide.id === journal.guideId &&
+    guide.sourceFilename === "showme-fixed-synthetic-acceptance.mp4" && guide.sourceSizeBytes === 1 &&
+    guide.originalObjectKey === `guides/${journal.guideId}/source/${"0".repeat(64)}.mp4` &&
+    guide.processingAttemptCount <= 1 && guide.steps.length <= 2);
+  for (const step of guide.steps) {
+    check([0, 1].includes(step.position));
+    const prefix = `guides/${guide.id}/attempts/1/frames/frame-${String(step.position + 1).padStart(3, "0")}`;
+    check(step.representativeFrameKey === `${prefix}.jpg` && step.thumbnailFrameKey === `${prefix}-thumb.jpg`);
+  }
+}
+
 async function privateJson(path) {
   const { constants } = await import("node:fs");
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -227,7 +239,7 @@ async function childMain() {
     api = async (path, method = "GET", body, auth = true) => {
       const response = await fetch(base + path, { method, headers: { ...(auth ? { Authorization: `Bearer ${token}` } : {}),
         "X-ShowMe-Input-Fingerprint": manifest.fingerprint, ...(body ? { "Content-Type": "application/json" } : {}) },
-        body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10000), redirect: "error" });
+        body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(method === "DELETE" ? 60000 : 10000), redirect: "error" });
       const result = response.status === 204 ? null : await response.json(); return { status: response.status, data: result };
     };
     stage = "consent-and-readiness";
@@ -277,7 +289,11 @@ async function childMain() {
         check(!(await repository.getGuideById(id)));
       }
       send({ type: "cleaned" });
-    } catch { send({ type: "cleanup-failed" }); process.exitCode = 1; }
+    } catch (error) {
+      send({ type: "progress", stage: "CLEANUP_FAILED", details: {
+        reason: ["TimeoutError", "AbortError"].includes(error?.name) ? error.name : "cleanup-not-confirmed" } });
+      send({ type: "cleanup-failed" }); process.exitCode = 1;
+    }
     server?.closeAllConnections();
     if (server) await new Promise(resolve => server.close(resolve));
     if (temp) await rm(temp, { recursive: true, force: true });
@@ -285,9 +301,52 @@ async function childMain() {
   }
 }
 
+async function cleanupOnly() {
+  check(process.env.REPL_ID && !["1", "true"].includes(process.env.REPLIT_DEPLOYMENT));
+  check(!process.env.SHOWME_ANALYSIS_MODE || process.env.SHOWME_ANALYSIS_MODE === "off");
+  const journal = await privateJson(journalPath);
+  check(journal.kind === "showme-live-synthetic-v1" && journal.replId === process.env.REPL_ID && uuid.test(journal.guideId));
+  const { readRuntimeBinding, runtimeEnvironment } = await import("./start.mjs");
+  const { Pool } = await import("pg");
+  const { loadConfig } = await import("../src/processor/config.ts");
+  const { PostgresGuideRepository } = await import("../src/processor/repository.ts");
+  const { ReplitObjectStorage } = await import("../src/processor/storage.ts");
+  const { verifyAnalysisRuntimeRole } = await import("../src/processor/analysis-bootstrap.ts");
+  const { finalizeGuideDeletion, DELETION_PENDING } = await import("../src/processor/asset-lifecycle.ts");
+  const { PostgresAnalysisOperationsStore } = await import("../src/processor/analysis-operations-store.ts");
+  const { syntheticStorageRef } = await import("../src/processor/analysis-synthetic-runtime.ts");
+  const env = runtimeEnvironment(process.env, await readRuntimeBinding());
+  check(!env.GEMINI_API_KEY && !env.SHOWME_OPERATOR_DATABASE_URL);
+  const config = loadConfig(env);
+  const pool = new Pool({ connectionString: config.databaseUrl, max: 1, connectionTimeoutMillis: 5000, statement_timeout: 15000 });
+  pool.on("error", () => {});
+  try {
+    await verifyAnalysisRuntimeRole(pool, AbortSignal.timeout(10000));
+    const repository = PostgresGuideRepository.fromPool(pool);
+    const observation = await new PostgresAnalysisOperationsStore({ pool }).observe(journal.deploymentRef, AbortSignal.timeout(10000));
+    check(config.storageDriver === "replit" && config.replitBucketId && observation.halted &&
+      observation.entry?.review.id === journal.reviewId && observation.entry.review.state === "revoked" &&
+      observation.entry.review.storageRef === syntheticStorageRef(config.replitBucketId, config.replitObjectPrefix));
+    const guide = await repository.getGuideById(journal.guideId);
+    if (guide) {
+      // Recovery can act only on this journal's exact, unchanged generated fixture.
+      assertRecoveryGuide(journal, guide);
+      const state = await repository.getAnalysisState(guide.id);
+      check(!state?.runs.some(run => ["queued", "running"].includes(run.status)));
+      check(await repository.updateStatus(guide.id, "failed", { expectedUpdatedAt: guide.updatedAt, errorCode: DELETION_PENDING }));
+      const storage = new ReplitObjectStorage({ bucketId: config.replitBucketId, prefix: config.replitObjectPrefix });
+      check(await finalizeGuideDeletion(repository, storage, guide.id, 2, { timeoutMs: 60000 }));
+      check(!(await repository.getGuideById(guide.id)));
+    }
+    await unlink(journalPath);
+    report("CLEANUP_ONLY_DONE", { testGuideDeleted: true, aiHalted: true, aiCalls: 0 });
+  } finally { await pool.end(); }
+}
+
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   try {
-    if (process.argv.length === 3 && process.argv[2] === "--help") console.log("Opt-in Replit fixed-synthetic acceptance: --run-synthetic --evidence-stdin (reviewed JSON, no credentials), or --evidence=<private JSON>. One count, one generation; journal blocks reruns. No .env loading or key output.");
+    if (process.argv.length === 3 && process.argv[2] === "--help") console.log("Opt-in Replit fixed-synthetic acceptance: --run-synthetic --evidence-stdin (reviewed JSON, no credentials), or --evidence=<private JSON>. One count, one generation; journal blocks reruns. --cleanup-only removes only the retained journal's fixture while halted; never sends AI calls. No .env loading or key output.");
+    else if (process.argv.length === 3 && process.argv[2] === "--cleanup-only") await cleanupOnly();
     else if (process.argv.length === 3 && process.argv[2] === "--child" && process.send) await childMain();
     else await parent(process.argv.slice(2));
   } catch { report("FAILED_NO_SECRET_DETAILS"); process.exitCode = 1; }
