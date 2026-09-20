@@ -13,6 +13,20 @@ const checkSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("confirmed"), observedAt: timestamp, evidenceRef: id }).strict(),
   z.object({ status: z.enum(["unknown", "rejected"]) }).strict(),
 ]);
+const storageAssuranceSchema = z.discriminatedUnion("basis", [
+  z.object({ basis: z.literal("direct-permission-review"), internalPermissionsVerified: z.literal(true) }).strict(),
+  z.object({ basis: z.literal("replit-policy-and-app-check"), internalPermissionsVerified: z.literal(false) }).strict(),
+]);
+// The platform-backed basis is an explicitly accepted limitation, not an IAM audit.
+// No default: previously unqualified confirmations must be reviewed again.
+const storageCheckSchema = z.union([
+  z.object({ status: z.enum(["unknown", "rejected"]) }).strict(),
+  z.object({ status: z.literal("confirmed"), observedAt: timestamp, evidenceRef: id,
+    assurance: storageAssuranceSchema.options[0] }).strict(),
+  z.object({ status: z.literal("confirmed"), observedAt: timestamp, evidenceRef: id,
+    assurance: storageAssuranceSchema.options[1], platformPolicyRef: id,
+    targetCheckRef: id, appAccessCheckRef: id }).strict(),
+]);
 
 /** Server-side operator record. Shape validation does NOT authenticate its author or prove cloud facts. */
 export const analysisOperationsReviewSchema = z.object({
@@ -23,7 +37,7 @@ export const analysisOperationsReviewSchema = z.object({
   model: z.literal(GEMINI_TEST_MODEL), scope: z.literal("approved_synthetic"),
   mode: z.literal("free_only"), paidFallback: z.literal(false),
   changeDetection: z.literal("operator-recheck-required"),
-  checks: z.object({ storageAccess: checkSchema, freeProject: checkSchema, providerLimits: checkSchema,
+  checks: z.object({ storageAccess: storageCheckSchema, freeProject: checkSchema, providerLimits: checkSchema,
     hostingBudget: checkSchema, projectSenders: checkSchema }).strict(),
   providerLimits: providerQuotaLimitsSchema, policy: analysisFundingPolicySchema,
 }).strict();
@@ -34,6 +48,7 @@ export const analysisOperationsBasisSchema = z.object({
   kind: z.literal("operator-review"), reviewId: id, revision: z.number().int().positive().safe(),
   recordedAt: timestamp, oldestObservationAt: timestamp, expiresAt: timestamp,
   changeDetection: z.literal("operator-recheck-required"),
+  storageAssurance: storageAssuranceSchema,
 }).strict();
 export type AnalysisOperationsBasis = z.infer<typeof analysisOperationsBasisSchema>;
 
@@ -64,9 +79,13 @@ export function checkAnalysisOperationsReview(raw: unknown, at: Date) {
     if (check.status !== "confirmed" || Date.parse(check.observedAt) > Date.parse(review.recordedAt)) unavailable();
     return Date.parse(check.observedAt);
   });
+  const storage = review.checks.storageAccess;
+  if (storage.status !== "confirmed") unavailable();
+  if (storage.assurance.basis === "replit-policy-and-app-check" &&
+      !/^replit:[a-f0-9]{64}$/.test(review.storageRef)) unavailable();
   const basis = assertAnalysisOperationsBasis({ kind: "operator-review", reviewId: review.id, revision: review.revision,
     recordedAt: review.recordedAt, oldestObservationAt: new Date(Math.min(...observations)).toISOString(),
-    expiresAt: review.expiresAt, changeDetection: review.changeDetection }, at);
+    expiresAt: review.expiresAt, changeDetection: review.changeDetection, storageAssurance: storage.assurance }, at);
   // The daily app budget and the provider's per-minute/per-day caps are different units.
   if (review.policy.price.model !== review.model ||
       review.policy.globalLimit.requests > review.providerLimits.requestsPerDay ||

@@ -57,7 +57,8 @@ test("expiry is at most 24h from the oldest observation, not from record creatio
   raw.expiresAt = new Date(at.valueOf() + ANALYSIS_OPERATIONS_REVIEW_MAX_MS + 1).toISOString();
   assert.throws(() => checkAnalysisOperationsReview(raw, at), denied);
   raw.expiresAt = fixture().expiresAt;
-  raw.checks.storageAccess = { status: "confirmed", evidenceRef: "old-storage-check", observedAt: new Date(at.valueOf() - 1).toISOString() };
+  raw.checks.storageAccess = { status: "confirmed", evidenceRef: "old-storage-check", observedAt: new Date(at.valueOf() - 1).toISOString(),
+    assurance: { basis: "direct-permission-review", internalPermissionsVerified: true } };
   assert.throws(() => checkAnalysisOperationsReview(raw, at), denied);
   raw.expiresAt = new Date(Date.parse(raw.expiresAt) - 1).toISOString();
   const { basis } = checkAnalysisOperationsReview(raw, at);
@@ -96,4 +97,39 @@ test("reviewed caps retain provider/app unit distinctions and prohibit empty app
     (r: ReturnType<typeof fixture>) => { r.policy.guideLimit.requests = 0; },
     (r: ReturnType<typeof fixture>) => { r.policy.globalLimit.costMicrousd = 0; },
   ]) { const review = fixture(); change(review); assert.throws(() => checkAnalysisOperationsReview(review, at), denied); }
+});
+
+function platformFixture() {
+  const review = fixture(); review.storageRef = `replit:${"a".repeat(64)}`;
+  review.checks.storageAccess = { status: "confirmed", observedAt: at.toISOString(), evidenceRef: "synthetic-only-decision",
+    assurance: { basis: "replit-policy-and-app-check", internalPermissionsVerified: false },
+    platformPolicyRef: "replit-doc-observation", targetCheckRef: "exact-project-bucket", appAccessCheckRef: "synthetic-access-pass" };
+  return review;
+}
+
+test("platform-backed synthetic review keeps its non-IAM basis through admission summaries", () => {
+  const review = platformFixture(); const before = structuredClone(review);
+  const checked = checkAnalysisOperationsReview(review, at);
+  assert.deepEqual(checked.basis.storageAssurance, { basis: "replit-policy-and-app-check", internalPermissionsVerified: false });
+  assert.deepEqual(checked.review, before);
+  assert.deepEqual(assertAnalysisOperationsBasis(checked.basis, at).storageAssurance, checked.basis.storageAssurance);
+  assert.throws(() => checkAnalysisOperationsReview({ ...review, scope: "user_video" }, at), denied);
+  assert.throws(() => checkAnalysisOperationsReview({ ...review, storageRef: "another-platform" }, at), denied);
+  assert.throws(() => checkAnalysisOperationsReview({ ...review, paidFallback: true }, at), denied);
+});
+
+test("storage evidence cannot silently upgrade a platform check or inherit an old unqualified confirmation", () => {
+  const review = platformFixture();
+  for (const field of ["assurance", "platformPolicyRef", "targetCheckRef", "appAccessCheckRef"]) {
+    const raw = structuredClone(review) as any; delete raw.checks.storageAccess[field];
+    assert.throws(() => checkAnalysisOperationsReview(raw, at), denied);
+  }
+  for (const assurance of [{ basis: "replit-policy-and-app-check", internalPermissionsVerified: true },
+    { basis: "direct-permission-review", internalPermissionsVerified: false }, { basis: "automatic", internalPermissionsVerified: true }]) {
+    const raw = structuredClone(review) as any; raw.checks.storageAccess.assurance = assurance;
+    assert.throws(() => checkAnalysisOperationsReview(raw, at), denied);
+    assert.throws(() => assertAnalysisOperationsBasis({ ...operationsBasisFixture(at, "review"), storageAssurance: assurance }, at), denied);
+  }
+  const old = structuredClone(fixture()) as any; delete old.checks.storageAccess.assurance;
+  assert.throws(() => checkAnalysisOperationsReview(old, at), denied);
 });

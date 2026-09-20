@@ -87,6 +87,25 @@ test("matching facts produce a bounded snapshot compatible with admission/send v
   assert.throws(permission.assertCurrent);
 });
 
+test("platform-backed storage assurance survives readiness and send checks without becoming an IAM audit", async () => {
+  const f = fixture(); const review = f.evidence.operations.review;
+  review.storageRef = f.evidence.runtime.storageRef = `replit:${"a".repeat(64)}`;
+  review.checks.storageAccess = { status: "confirmed", observedAt: review.recordedAt, evidenceRef: "fictional-decision",
+    assurance: { basis: "replit-policy-and-app-check", internalPermissionsVerified: false },
+    platformPolicyRef: "fictional-policy", targetCheckRef: "fictional-target", appAccessCheckRef: "fictional-access" };
+  const snapshot = await f.inspect();
+  assert.equal(snapshot.entitlement.mode, "free_only");
+  if (snapshot.entitlement.mode !== "free_only") assert.fail();
+  assert.deepEqual(snapshot.entitlement.operationsBasis.storageAssurance, review.checks.storageAccess.assurance);
+  const permission = verifyAnalysisReadiness({ raw: snapshot, input: f.input, readiness: f.readiness,
+    spending: { mode: "free_only" }, clock: f.clock, signal: signal() });
+  permission.assertCurrent();
+  // Changing the supporting access-check receipt invalidates an already issued send permission.
+  review.checks.storageAccess.appAccessCheckRef = "replacement-access-check";
+  assert.equal(f.readiness.isCurrent(snapshot.id), false);
+  assert.throws(permission.assertCurrent, denied);
+});
+
 for (const name of names) {
   test(`missing/malformed ${name} evidence cannot issue readiness`, async () => {
     for (const raw of [null, {}, { ready: true }, { ...fixture().evidence[name], unexpected: "private" }]) {

@@ -14,6 +14,7 @@ import { runDatabaseMigrations, verifyDatabaseMigrations } from "../src/processo
 import { loadConfig } from "../src/processor/config.js";
 import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "../src/processor/analysis-bootstrap.js";
 import { createRuntimeRole } from "../src/processor/runtime-role-setup.js";
+import { createOperatorRole, verifyOperatorRole } from "../src/processor/operator-role-setup.js";
 import { PostgresGuideRepository } from "../src/processor/repository.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { fakeOutput } from "../tests/helpers/analysis-fixtures.js";
@@ -215,10 +216,19 @@ test("real PostgreSQL: verify-only mode rejects an unmigrated DB without repairi
   assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema IN ('public','drizzle')")).rows[0].n, 0);
 });
 
-test("real PostgreSQL: configured bootstrap uses one runtime login and stored grant, then runs fixed screens through normal lifecycle", async t => {
+for (const storageBasis of ["direct-permission-review", "replit-policy-and-app-check"] as const) {
+test(`real PostgreSQL: ${storageBasis} survives authenticated bootstrap, normal lifecycle and revocation`, async t => {
   const h = await fixture(t); const { guide, command } = await h.seed("guide", 2, true);
   const change = operatorCommand(); change.review.storageRef = syntheticStorageRef("fictional-bucket", "showme-test");
+  if (storageBasis === "replit-policy-and-app-check") {
+    change.review.checks.storageAccess = { status: "confirmed", observedAt: change.review.recordedAt,
+      evidenceRef: "fictional-synthetic-only-decision", platformPolicyRef: "fictional-platform-document",
+      targetCheckRef: "fictional-exact-target", appAccessCheckRef: "fictional-access-check",
+      assurance: { basis: storageBasis, internalPermissionsVerified: false } };
+  }
   const store = operatorStore(h.pool); await store.execute(change, operationsSignal());
+  assert.deepEqual((await store.observe(change.review.deploymentRef, operationsSignal())).entry?.review.checks.storageAccess,
+    change.review.checks.storageAccess);
   const grant = syntheticGrant(change.review.deploymentRef, guide.id, command.expectedInputFingerprint);
   const activate = activationCommand(change, grant); await store.executeActivation(activate, operationsSignal());
   const screens = await syntheticAnalysisInput(); const sends: string[] = []; let reads = 0;
@@ -274,6 +284,7 @@ test("real PostgreSQL: configured bootstrap uses one runtime login and stored gr
     assert.equal((await pool.query("SELECT 1 AS ok")).rows[0].ok, 1);
   });
 });
+}
 
 test("real PostgreSQL: bootstrap resolver rejects a stopped or replayed activation and mutated grant history", async t => {
   const h = await fixture(t), seeded = await h.seed(), change = operatorCommand(), store = operatorStore(h.pool);
@@ -1500,19 +1511,24 @@ test("real PostgreSQL: composed runtime refuses mismatched binding, revoked revi
 
 test("real PostgreSQL: operator entry authenticates a separate minimal-role login for review, activation, stop and revoke", async (t) => {
   const h = await fixture(t); const seeded = await h.seed();
-  const role = `showme_analysis_operator_test_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-  const password = randomUUID().replaceAll("-", ""); // Generated temporary credential only.
-  await h.pool.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
-  const target = new URL(h.connection); target.username = role; target.password = password;
+  const before = await h.rows("guides"); const controlsBefore = await h.rows("analysis_accounting_controls");
+  const target = new URL(h.connection); let selected: { role: string; password: string } | undefined;
+  const connection = { host: target.hostname, port: Number(target.port), database: target.pathname.slice(1), connectionTimeoutMillis: 3000, statement_timeout: 3000 };
+  const result = await createOperatorRole({ admin: h.pool, target: connection, persist: async credentials => { selected = credentials; } });
+  assert.ok(selected); const { role, password } = selected;
+  target.username = role; target.password = password;
   let operatorPool: Pool | undefined;
   try {
-    await h.pool.query(`GRANT USAGE ON SCHEMA public TO "${role}"`);
-    await h.pool.query(`GRANT SELECT, INSERT ON analysis_operations_reviews TO "${role}"`);
-    await h.pool.query(`GRANT SELECT, INSERT ON analysis_activation_events TO "${role}"`);
-    await h.pool.query(`GRANT SELECT(status) ON analysis_runs, analysis_count_attempts, analysis_request_attempts TO "${role}"`);
-    await h.pool.query(`GRANT SELECT, UPDATE(payload) ON analysis_accounting_controls TO "${role}"`);
+    assert.equal(result.aiEnabled, false); assert.equal(result.permissionsChecked, true); assert.equal(result.authenticationChecked, true);
+    assert.equal(JSON.stringify(result).includes(password), false);
+    assert.deepEqual(await h.rows("guides"), before); assert.deepEqual(await h.rows("analysis_accounting_controls"), controlsBefore);
+    await assert.rejects(createOperatorRole({ admin: h.pool, target: connection, persist: async () => assert.fail("no duplicate") }), /SHOWME_OPERATOR_ROLE_SETUP_FAILED/);
     operatorPool = new Pool({ connectionString: target.toString(), max: 1 });
-    for (const query of ["SELECT * FROM guides", "SELECT * FROM guide_steps", "DELETE FROM analysis_operations_reviews",
+    await h.pool.query(`GRANT SELECT(instruction) ON guide_steps TO "${role}"`);
+    await assert.rejects(verifyOperatorRole(operatorPool, role), /SHOWME_OPERATOR_ROLE_INVALID/);
+    await h.pool.query(`REVOKE SELECT(instruction) ON guide_steps FROM "${role}"`);
+    await verifyOperatorRole(operatorPool, role);
+    for (const query of ["SELECT * FROM guides", "SELECT * FROM guide_steps", "SELECT * FROM guide_drafts", "SELECT payload FROM analysis_count_attempts", "SELECT payload FROM analysis_request_attempts", "DELETE FROM analysis_operations_reviews",
       "UPDATE analysis_operations_reviews SET action='revoke'", "DELETE FROM analysis_accounting_controls",
       "SELECT payload FROM analysis_runs", "DELETE FROM analysis_activation_events", "UPDATE analysis_activation_events SET action='deactivate'"]) {
       await assert.rejects(operatorPool.query(query), (error: { code?: string }) => error.code === "42501");
@@ -1550,6 +1566,15 @@ test("real PostgreSQL: operator entry authenticates a separate minimal-role logi
   } finally {
     await operatorPool?.end(); await h.pool.query(`DROP OWNED BY "${role}"`); await h.pool.query(`DROP ROLE "${role}"`);
   }
+});
+
+test("real PostgreSQL: failed operator credential persistence removes only its new role", async t => {
+  const h = await fixture(t); const url = new URL(h.connection);
+  const before = (await h.pool.query("SELECT rolname FROM pg_roles ORDER BY rolname")).rows;
+  await assert.rejects(createOperatorRole({ admin: h.pool,
+    target: { host: url.hostname, port: Number(url.port), database: url.pathname.slice(1), connectionTimeoutMillis: 3000 },
+    persist: async () => { throw new Error("fictional persistence failure"); } }), /SHOWME_OPERATOR_ROLE_SETUP_FAILED/);
+  assert.deepEqual((await h.pool.query("SELECT rolname FROM pg_roles ORDER BY rolname")).rows, before);
 });
 
 test("real PostgreSQL: activation is audited, replay cannot reopen a stop and old replicas cannot spend after reactivation", async t => {
