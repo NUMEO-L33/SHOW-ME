@@ -30,3 +30,16 @@ node --import tsx scripts/provision-operator.mjs --replit-development=67fdf570-6
 실제 PostgreSQL 16.15 통합 101개 통과, 실패·취소·생략 0. 생성된 계정으로 기존 운영 CLI의 저장/활성화/중지/철회, 잘못된 비밀번호 차단, 중복 생성 거절, 내용 접근 차단과 추가 열 권한 검출을 확인했다. 저장 실패 시 새 역할 정리도 확인했다. 임시 Docker 데이터는 검사 후 제거됐다. 외부 AI는 모의 응답만 사용했다.
 
 API 제품/테스트 타입 검사와 서버 빌드도 통과했다. 실제 Replit 적용 결과는 아래 후속 기록에 별도로 남긴다. 생성 성공만으로 AI 실행 승인 또는 외부 전송을 완료했다고 보지 않는다.
+
+## 실환경 적용 완료 — 2026-09-20
+
+사용자가 권한 범위를 설명받고 `진행해`로 생성에 동의했다. 브라우저 작업 스킬은 기존 Chrome의 `companynumeo/SHOW-ME` 탭에만 사용했다. 생성 전 운영자 0개/운영 기록 0개/활성화 이력 0개/AI off를 확인했고, 코드 `41d6585`를 fast-forward 반영한 뒤 생성했다.
+
+- 생성 역할: `showme_analysis_operator_dev_d10d4afd09a33e52`.
+- `SHOWME_OPERATOR_ROLE_READY`: created/authenticationChecked/permissionsChecked 모두 true, aiEnabled/credentialPrinted false.
+- 연결 파일을 별도 프로세스에서 안전하게 다시 읽어 인증 및 권한 검사를 통과했다. 원본·단계·초안 관계에 대한 내용 없는 `SELECT * ... LIMIT 0` 세 쿼리가 모두 권한 오류 `42501`로 차단됐다. 실제 내용은 읽지 않았다.
+- 기존 운영 CLI의 읽기 전용 `status` 성공: version 0, state missing, lastActivationVersion 0, authorizesAnalysis false. 승인/활성화 이력 모두 0이다. `halted:false`는 기존 전역 제어 값으로, AI 실행 승인 의미가 아니다. 기록/제어 값을 수정하지 않았다.
+- 실행 중 API 자식 1개는 기존 runtime 로그인/verify-only/AI off를 유지했고 AI 키·운영자 URL이 없었다. HTTP 200 health 정상. 기존 계정/비밀번호·영상/초안·Storage는 변경하지 않았다.
+- 일반 전체 850개(95+669+86)도 다시 통과했다. 실제 PG 101개와 별도 수치다.
+
+API를 재시작하거나 공개 배포하지 않았다. 따라서 Replit 작업 파일/운영자 CLI 반영과 실행 중 API 번들 반영을 구분한다. 다음 합성 시험에서 새 소스를 빌드하고 필요한 시작 조건을 적용해야 한다. 개인 영상 전송, 실제 Google 요청, 활성화 기록, 과금 변경은 이번 단계에 없다.
