@@ -10,7 +10,9 @@ E1의 문서 v2 확인 기록과 소유자 전용 GET/POST를 연결했다. 제�
 
 최종 일반 전체 **897개 통과**(이관 99 / 서버 699 / 클라이언트 99), 실패·취소·생략 0, 종료 코드 0. 서버/화면 제품·테스트 타입 검사와 양쪽 빌드 통과. 기존 화면 소스맵·578.53 kB 번들 경고는 남는다. v2 확인 후에도 가림이 많은 초안을 편집할 수 있도록 일반 초안 JSON 상한은 1 MiB로 확장했고, 확인 명령 자체는 8 KiB·기존 인증/빈도 제한을 유지했다.
 
-**남은 검증:** 실제 PostgreSQL 검사 2개를 추가했지만 Docker 엔진이 꺼져 실행 전 중단됐다. 사용자에게 Docker Desktop 실행을 요청했다. Docker 경로는 `C:/Users/fxxkm/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe`, 허용 로컬 호스트는 `npipe:////./pipe/dockerDesktopLinuxEngine`. 실행 도구는 기존 `artifacts/api-server/scripts/verify-postgres.mjs --local-docker`이며 .env/Replit DB를 쓰지 않는다. 이 검증 전 E1의 전체 완료/실환경 완료로 표시하지 않는다. 다음 제품 코드는 처리본 내구 저장·게시 확정(E2/E3)이며 현재 공개는 금지한다. Replit pull/재시작도 아직 하지 않았다.
+**추가 DB 검증 완료:** 사용자가 Docker 실행을 알려 기존 `artifacts/api-server/scripts/verify-postgres.mjs --local-docker`를 재개했다. 코드 `a0f4e01`에서 PostgreSQL 16.15 통합 검사 **103개 통과**, 실패·취소·생략 0, 종료 코드 0이다. 새 E1 검사 2개는 재접속 후 v2 확인 기록 복원·동시 수정 충돌·편집 시 해당 확인 취소·삭제 후 오래된 요청 거절과, 저장 실패 시 JSONB/보존 시각의 동시 롤백을 실제 DB에서 확인했다. 일반 897개는 직전 코드 검증 결과이며 이번에는 DB 검사만 추가 실행했다.
+
+기존 로컬 `postgres:16` 이미지의 loopback 전용 일회용 컨테이너 `showme-b5-5550f9c7fe884f7f855e2a155ab0b32e`를 사용했고, 실행 후 `postgres_fixture_removed`로 해당 컨테이너와 시험 데이터 제거를 확인했다. .env·Replit DB·개인 영상·실제 외부 AI는 사용하지 않았다. E1의 로컬 코드/UI/실제 DB 검증까지 완료했으며 Replit 실환경 반영 완료는 아니다. 다음 제품 코드는 처리본 내구 저장·게시 확정(E2/E3)이며 현재 공개는 금지한다. Replit pull/재시작도 아직 하지 않았다.
 
 ## 이전 구현 — 2026-09-20 수동 가림·비공개 처리본
 
