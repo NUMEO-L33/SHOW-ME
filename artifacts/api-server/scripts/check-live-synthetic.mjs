@@ -17,12 +17,12 @@ const check = value => { if (!value) fail(); };
 const report = (stage, extra = {}) => console.log(JSON.stringify({ check: "LIVE_SYNTHETIC_CHECK", stage, ...extra }));
 
 export function checkArguments(args, env) {
-  check(args.length === 2 && args[0] === "--run-synthetic" && args[1].startsWith("--evidence="));
+  check(args.length === 2 && args[0] === "--run-synthetic" && (args[1] === "--evidence-stdin" || args[1].startsWith("--evidence=")));
   check(env.REPL_ID && uuid.test(env.REPL_ID) && !["1", "true"].includes(env.REPLIT_DEPLOYMENT));
   check(!env.NODE_ENV || env.NODE_ENV === "development");
   check(!env.SHOWME_ANALYSIS_MODE || env.SHOWME_ANALYSIS_MODE === "off");
   check(/^[\x21-\x7e]{10,4096}$/.test(env.GEMINI_API_KEY ?? ""));
-  return resolve(args[1].slice(11));
+  return args[1] === "--evidence-stdin" ? null : resolve(args[1].slice(11));
 }
 
 export function singleSendTransport(transport, model, onResponse = () => {}) {
@@ -53,7 +53,8 @@ async function privateJson(path) {
 
 async function parent(args) {
   const evidencePath = checkArguments(args, process.env);
-  const evidence = await privateJson(evidencePath);
+  const { runAnalysisOperationsAdmin, readOperationsCommand } = await import("../src/processor/analysis-operations-admin.ts");
+  const evidence = evidencePath ? await privateJson(evidencePath) : await readOperationsCommand(process.stdin, AbortSignal.timeout(5000));
   check(evidence.replId === process.env.REPL_ID && evidence.keyBinding === "user-confirmed-rotation" && evidence.projectRef && evidence.credentialRef);
   const { readRuntimeBinding, runtimeEnvironment } = await import("./start.mjs");
   const runtime = await readRuntimeBinding();
@@ -61,7 +62,6 @@ async function parent(args) {
   check(operator.kind === "showme-development-operator-v1" && operator.replId === process.env.REPL_ID);
   const runtimeUrl = new URL(runtime.connectionString), operatorUrl = new URL(operator.connectionString);
   check(["protocol", "hostname", "port", "pathname"].every(name => runtimeUrl[name] === operatorUrl[name]));
-  const { runAnalysisOperationsAdmin } = await import("../src/processor/analysis-operations-admin.ts");
   const env = { REPL_ID: process.env.REPL_ID, REPLIT_DEPLOYMENT: "0", SHOWME_OPERATOR_DATABASE_URL: operator.connectionString };
   const deployment = evidence.deploymentRef;
   const admin = async (action, command) => {
@@ -287,7 +287,7 @@ async function childMain() {
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   try {
-    if (process.argv.length === 3 && process.argv[2] === "--help") console.log("Opt-in Replit fixed-synthetic acceptance: --run-synthetic --evidence=<private reviewed JSON>. One count, one generation; journal blocks reruns. No .env loading or key output.");
+    if (process.argv.length === 3 && process.argv[2] === "--help") console.log("Opt-in Replit fixed-synthetic acceptance: --run-synthetic --evidence-stdin (reviewed JSON, no credentials), or --evidence=<private JSON>. One count, one generation; journal blocks reruns. No .env loading or key output.");
     else if (process.argv.length === 3 && process.argv[2] === "--child" && process.send) await childMain();
     else await parent(process.argv.slice(2));
   } catch { report("FAILED_NO_SECRET_DETAILS"); process.exitCode = 1; }

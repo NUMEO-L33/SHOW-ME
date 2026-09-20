@@ -6,6 +6,7 @@ const env = { REPL_ID: "00000000-0000-4000-8000-000000000000", GEMINI_API_KEY: "
 const args = ["--run-synthetic", "--evidence=./fictional.json"];
 test("live synthetic check requires explicit opt-in, development, and a key without printing it", () => {
   assert.ok(checkArguments(args, env).endsWith("fictional.json"));
+  assert.equal(checkArguments(["--run-synthetic", "--evidence-stdin"], env), null);
   for (const changed of [{ REPLIT_DEPLOYMENT: "1" }, { NODE_ENV: "production" }, { REPL_ID: "wrong" },
     { GEMINI_API_KEY: "" }, { GEMINI_API_KEY: "key\nnotallowed" }, { SHOWME_ANALYSIS_MODE: "fixed-synthetic" }]) {
     assert.throws(() => checkArguments(args, { ...env, ...changed }), /^Error: LIVE_SYNTHETIC_CHECK_FAILED$/);
