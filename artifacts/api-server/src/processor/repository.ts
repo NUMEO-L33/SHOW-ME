@@ -606,7 +606,7 @@ export class JsonGuideRepository implements GuideRepository {
       const validated = parseAnalysisState(next);
       state.analysis = [...state.analysis.filter((entry) => entry.guideId !== guideId), { guideId, state: validated }];
       // Commit the retention fence with the draft, never on reads/conflicts/replays.
-      if (command.type === "save-editor-draft" && validated.draft &&
+      if ((command.type === "save-editor-draft" || command.type === "review-privacy") && validated.draft &&
           validated.draft.revision !== previous.draft?.revision) {
         guide.updatedAt = validated.draft.updatedAt;
       }
@@ -1361,7 +1361,7 @@ export class PostgresGuideRepository implements GuideRepository {
       await persistAnalysisRows(transaction, guideId, previous, validated);
       // Same parent lock and transaction as the draft: expiry cannot claim an old
       // snapshot after a new save, and a failed write cannot extend retention.
-      if (command.type === "save-editor-draft" && validated.draft &&
+      if ((command.type === "save-editor-draft" || command.type === "review-privacy") && validated.draft &&
           validated.draft.revision !== previous.draft?.revision) {
         await transaction.update(guides).set({ updatedAt: new Date(validated.draft.updatedAt) })
           .where(eq(guides.id, guideId));

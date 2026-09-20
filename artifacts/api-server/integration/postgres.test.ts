@@ -42,6 +42,8 @@ import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
 import { attemptFrameObjectKey } from "../src/processor/asset-lifecycle.js";
 import { testMediaPaths } from "../tests/helpers/media-binaries.js";
 import { Readable } from "node:stream";
+import { privacyAfterEdit, privacyReviewState } from "../src/processor/privacy-review.js";
+import type { PrivacyCommand } from "../src/processor/privacy-review-schema.js";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -121,6 +123,48 @@ async function waitForFixtureLocks(pool: Pool, count: number) {
   }
   assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
 }
+
+test("real PostgreSQL: privacy v2 confirmations survive reopen, use revision CAS, and editing revokes only changed checks", async t => {
+  const h = await fixture(t), { guide } = await h.seed(), manifest = analysisManifest(guide);
+  let state = (await h.repository.executeAnalysisCommand(guide.id, { type: "save-editor-draft", expectedRevision: 0,
+    expectedInputFingerprint: manifest.fingerprint, document: initialDraft(manifest) }))!;
+  const command = (action: PrivacyCommand["action"]): PrivacyCommand => ({ type: "review-privacy", expectedRevision: state.draft!.revision,
+    expectedInputFingerprint: manifest.fingerprint, expectedReviewFingerprint: privacyReviewState(guide, state)!.fingerprint,
+    mutationId: randomUUID(), action });
+  const first = command({ type: "title", confirmed: true });
+  const rivals = await Promise.all([first, command({ type: "text", stepId: guide.steps[0].id, confirmed: true })]
+    .map(c => h.repository.executeAnalysisCommand(guide.id, c)));
+  assert.equal(rivals.filter(Boolean).length, 1);
+  state = (await h.repository.getAnalysisState(guide.id))!;
+  const last = command({ type: "text", stepId: guide.steps[0].id, confirmed: true });
+  state = (await h.repository.executeAnalysisCommand(guide.id, last))!;
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.deepEqual(await reopened.getAnalysisState(guide.id), state);
+  assert.deepEqual(await reopened.executeAnalysisCommand(guide.id, last), state);
+  const edited = structuredClone(state.draft!.document); edited.steps[0].instruction = "합성 변경 문구";
+  edited.privacy = privacyAfterEdit(state.draft!.document, edited);
+  state = (await reopened.executeAnalysisCommand(guide.id, { type: "save-editor-draft", expectedRevision: state.draft!.revision,
+    expectedInputFingerprint: manifest.fingerprint, document: edited }))!;
+  assert.equal(privacyReviewState(guide, state)!.steps[0].textConfirmed, false);
+  assert.equal(privacyReviewState(guide, state)!.complete, false);
+  await reopened.deleteGuide(guide.id);
+  assert.equal(await reopened.executeAnalysisCommand(guide.id, last), null);
+  assert.equal(await reopened.getAnalysisState(guide.id), null);
+});
+
+test("real PostgreSQL: failed privacy acknowledgement rolls back both JSONB and retention timestamp", async t => {
+  const h = await fixture(t), { guide } = await h.seed(), manifest = analysisManifest(guide);
+  const state = (await h.repository.executeAnalysisCommand(guide.id, { type: "save-editor-draft", expectedRevision: 0,
+    expectedInputFingerprint: manifest.fingerprint, document: initialDraft(manifest) }))!;
+  const parentBefore = await h.rows("guides");
+  await h.pool.query(`CREATE FUNCTION reject_privacy_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$;
+    CREATE TRIGGER reject_privacy_fixture BEFORE UPDATE ON guides FOR EACH ROW EXECUTE FUNCTION reject_privacy_fixture()`);
+  await assert.rejects(h.repository.executeAnalysisCommand(guide.id, { type: "review-privacy", expectedRevision: state.draft!.revision,
+    expectedInputFingerprint: manifest.fingerprint, expectedReviewFingerprint: privacyReviewState(guide, state)!.fingerprint,
+    mutationId: randomUUID(), action: { type: "title", confirmed: true } }));
+  assert.deepEqual(await h.repository.getAnalysisState(guide.id), state);
+  assert.deepEqual(await h.rows("guides"), parentBefore);
+});
 
 function operatorStore(pool: Pool) { return new PostgresAnalysisOperationsStore({ pool, writerRoles: ["postgres"] }); }
 function operatorCommand() {

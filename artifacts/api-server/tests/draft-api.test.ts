@@ -102,7 +102,7 @@ test("draft requests reject non-JSON, broken JSON and large bodies without echoi
   await request(h.app).put(h.url).set("Authorization", h.auth).type("text").send("private-input").expect(415);
   const broken = await request(h.app).put(h.url).set("Authorization", h.auth).type("json").send('{"secret":"private-input"').expect(400);
   assert.ok(!broken.text.includes("private-input"));
-  await request(h.app).put(h.url).set("Authorization", h.auth).send({ x: "x".repeat(70_000) }).expect(413);
+  await request(h.app).put(h.url).set("Authorization", h.auth).send({ x: "x".repeat(1_100_000) }).expect(413);
   const preflight = await request(h.app).options(h.url).set("Origin", "http://localhost:3000").set("Access-Control-Request-Method", "PUT").expect(204);
   assert.ok(preflight.headers["access-control-allow-methods"].includes("PUT"));
 });

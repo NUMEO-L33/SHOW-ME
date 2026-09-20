@@ -7,11 +7,15 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import type { GuideStep } from "@/lib/showme-data";
 import type { DraftIdentity, DraftSnapshot, EditorStep } from "@/lib/draft-client";
 import { addMask, editMask, getPrivacyPreview, masksFor } from "@/lib/privacy-masks";
+import { PrivacyReviewPanel } from "./privacy-review-panel";
 
-export function PrivacyEditor({ step, onChange, disabled, previewDisabled, identity, base }: {
+export function PrivacyEditor({ step, onChange, disabled: editorDisabled, previewDisabled, identity, base, onPrivacySaved }: {
   step: GuideStep; onChange: (draft: EditorStep) => void; disabled: boolean; previewDisabled: boolean;
   identity?: DraftIdentity; base?: DraftSnapshot;
+  onPrivacySaved: (before: DraftSnapshot, saved: DraftSnapshot) => boolean;
 }) {
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const disabled = editorDisabled || reviewBusy;
   const [open, setOpen] = useState(false);
   const [selectedId, setSelectedId] = useState("");
   const [preview, setPreview] = useState<{ frame: string; thumbnail: string; key: string } | null>(null);
@@ -90,7 +94,7 @@ export function PrivacyEditor({ step, onChange, disabled, previewDisabled, ident
         }}><Plus className="size-4" />가림 영역 추가</Button>
         <p className="text-xs text-muted-foreground">최대 20개. 글자 가장자리까지 포함해 넉넉하게 지정하세요. 꺼진 영역과 선택하지 않은 내용은 그대로 남습니다.</p>
         {!masks.some(mask => mask.enabled) && <p className="text-sm text-amber-800">켜진 가림 영역이 없어 처리본에도 원본 내용이 그대로 보입니다.</p>}
-        <Button disabled={previewDisabled || !identity || !base || loading} onClick={() => { void showPreview(); }}>{loading ? "가림 이미지 만드는 중…" : "저장된 가림 이미지 확인"}</Button>
+        <Button disabled={disabled || previewDisabled || !identity || !base || loading} onClick={() => { void showPreview(); }}>{loading ? "가림 이미지 만드는 중…" : "저장된 가림 이미지 확인"}</Button>
         {previewDisabled && <p role="status" className="text-sm">자동 저장 완료 후 처리본을 확인할 수 있어요. 저장 실패나 충돌은 편집기에서 먼저 해결해 주세요.</p>}
         {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
         {shown && <section ref={resultView} className="space-y-3 rounded-xl border bg-slate-50 p-3" aria-label="픽셀에 가림을 반영한 처리본">
@@ -99,6 +103,8 @@ export function PrivacyEditor({ step, onChange, disabled, previewDisabled, ident
           <p className="text-xs">같은 처리본에서 만든 썸네일</p><img src={shown.thumbnail} alt="가림 처리된 썸네일" className="max-w-full" onError={imageFailed} />
           <p className="text-xs leading-5">이 이미지의 선택 영역은 원본과 무관한 픽셀 무늬로 대체됐습니다. 원본은 비공개 편집용으로 유지됩니다. 개인정보 검토 완료나 공개 승인을 뜻하지 않습니다.</p>
         </section>}
+        {open && identity && base && <PrivacyReviewPanel identity={identity} base={base} stepId={draft.id}
+          disabled={previewDisabled} previewVerified={Boolean(shown)} onSaved={onPrivacySaved} onBusy={setReviewBusy} />}
       </DialogContent>
     </Dialog>
   </>;

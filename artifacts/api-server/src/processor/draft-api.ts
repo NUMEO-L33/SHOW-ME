@@ -4,6 +4,8 @@ import { z } from "zod";
 import { AnalysisContractError, analysisManifest, initialDraft, parseDraftDocument } from "./analysis-contract.js";
 import type { AnalysisState } from "./analysis-state.js";
 import type { GuideRepository, GuideWithSteps } from "./domain.js";
+import { privacyCommandSchema } from "./privacy-review-schema.js";
+import { privacyReviewState } from "./privacy-review.js";
 
 const errors = {
   DRAFT_INVALID_REQUEST: [400, "저장할 제목·설명·목적·단계 형식을 확인해 주세요."],
@@ -46,6 +48,35 @@ export function createDraftRouter({ repository, authenticate }: {
   router.use(async (req, _res, next) => {
     try { snapshots.set(req, await authenticate(req)); next(); } catch (error) { next(error); }
   });
+  router.get("/privacy", async (req, res, next) => {
+    try {
+      if (Object.keys(req.query).length) throw new DraftError("DRAFT_INVALID_REQUEST");
+      const before = snapshots.get(req)!;
+      const state = await repository.getAnalysisState(before.id);
+      const current = await authenticate(req);
+      if (manifestFor(before).fingerprint !== manifestFor(current).fingerprint) throw new DraftError("DRAFT_MEDIA_CHANGED");
+      const review = state && privacyReviewState(current, state);
+      if (!review) throw new DraftError("DRAFT_CONFLICT");
+      res.json({ draft: serialize(current, state), review });
+    } catch (error) { next(error); }
+  });
+  router.post("/privacy", (req, _res, next) => {
+    next(req.is("application/json") ? undefined : new DraftError("DRAFT_JSON_REQUIRED"));
+  }, express.json({ limit: 8 * 1024, strict: true, inflate: false }), async (req, res, next) => {
+    try {
+      if (Object.keys(req.query).length) throw new DraftError("DRAFT_INVALID_REQUEST");
+      const command = privacyCommandSchema.safeParse(req.body);
+      if (!command.success) throw new DraftError("DRAFT_INVALID_REQUEST");
+      const before = snapshots.get(req)!;
+      const state = await repository.executeAnalysisCommand(before.id, command.data);
+      if (!state) throw new DraftError("DRAFT_CONFLICT");
+      const current = await authenticate(req);
+      if (manifestFor(before).fingerprint !== manifestFor(current).fingerprint) throw new DraftError("DRAFT_MEDIA_CHANGED");
+      const review = privacyReviewState(current, state);
+      if (!review) throw new DraftError("DRAFT_CONFLICT");
+      res.json({ draft: serialize(current, state), review });
+    } catch (error) { next(error); }
+  });
   router.get("/", async (req, res, next) => {
     try {
       const before = snapshots.get(req)!;
@@ -58,7 +89,7 @@ export function createDraftRouter({ repository, authenticate }: {
   });
   router.put("/", (req, _res, next) => {
     next(req.is("application/json") ? undefined : new DraftError("DRAFT_JSON_REQUIRED"));
-  }, express.json({ limit: 64 * 1024, strict: true, inflate: false }), async (req, res, next) => {
+  }, express.json({ limit: 1024 * 1024, strict: true, inflate: false }), async (req, res, next) => {
     try {
       const parsed = saveSchema.safeParse(req.body);
       if (!parsed.success || parsed.data.document === undefined) throw new DraftError("DRAFT_INVALID_REQUEST");

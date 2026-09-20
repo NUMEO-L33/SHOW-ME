@@ -2,6 +2,7 @@ import { z } from "zod";
 import { boundedRequest, ProcessorClientError, type ProcessorGuide } from "./processor-client.js";
 import type { GuideIntent } from "./guide-intent.js";
 import type { GuideStep } from "./showme-data.js";
+import { privacyLedgerSchema, privacyAfterEdit } from "./privacy-ledger.js";
 
 const text = (max: number) => z.string().trim().min(1).max(max).refine(v => !/[<>\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(v));
 const id = z.string().min(1).max(128);
@@ -18,13 +19,13 @@ const stepSchema = z.object({
   ])).max(21), privacyReview: z.literal("pending"),
 }).strict();
 export const editorDocumentSchema = z.object({
-  schemaVersion: z.literal(1), title: text(120),
+  schemaVersion: z.union([z.literal(1), z.literal(2)]), privacy: privacyLedgerSchema.optional(), title: text(120),
   intent: z.object({ goal: text(120), audience: z.string().trim().max(120), notes: z.string().trim().max(1000) }).strict().optional(),
   steps: z.array(stepSchema).min(1).max(24),
-}).strict();
+}).strict().refine(d => d.schemaVersion === 2 ? d.privacy !== undefined : d.privacy === undefined);
 export type EditorDocument = z.infer<typeof editorDocumentSchema>;
 export type EditorStep = z.infer<typeof stepSchema>;
-const snapshotSchema = z.object({
+export const snapshotSchema = z.object({
   guideId: id, revision: z.number().int().min(0).max(2_147_483_647), inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   document: editorDocumentSchema, persisted: z.boolean(), updatedAt: z.string().datetime().nullable(),
 }).strict();
@@ -80,8 +81,8 @@ export function draftSteps(document: EditorDocument, media: ProcessorGuide): Gui
   });
 }
 
-export function draftDocument(title: string, steps: GuideStep[], intent: GuideIntent): EditorDocument {
-  return editorDocumentSchema.parse({ schemaVersion: 1, title,
+export function draftDocument(title: string, steps: GuideStep[], intent: GuideIntent, base?: EditorDocument): EditorDocument {
+  const document: EditorDocument = { schemaVersion: base?.schemaVersion ?? 1, ...(base?.privacy ? { privacy: base.privacy } : {}), title,
     ...(intent.goal.trim() ? { intent } : {}),
     steps: steps.map(step => {
       if (!step.draft) throw new Error("SERVER_DRAFT_REQUIRED");
@@ -98,5 +99,8 @@ export function draftDocument(title: string, steps: GuideStep[], intent: GuideIn
         elements,
       };
     }),
-  });
+  };
+  const normalized = editorDocumentSchema.parse(document);
+  if (base?.privacy) normalized.privacy = privacyAfterEdit(base, normalized);
+  return normalized;
 }

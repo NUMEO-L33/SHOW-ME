@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 import type { GuideWithSteps } from "./domain.js";
+import { privacyCommandSchema, type PrivacyCommand } from "./privacy-review-schema.js";
+import { applyPrivacyCommand, validatePrivacyEdit } from "./privacy-review.js";
 import {
   ANALYSIS_CONSENT_VERSION, ANALYSIS_LIMITS, AnalysisContractError,
   analysisManifest, analysisOutputSchema, draftDocumentSchema, draftFromAnalysis, initialDraft, parseAnalysisOutput, parseDraftDocument,
@@ -39,6 +41,7 @@ export type AnalysisErrorCode = "AI_REFUSED" | "AI_INCOMPLETE" | "AI_INVALID_OUT
 
 type AttemptIdentity = { runId: string; attemptId: string; attemptCount: number };
 export type AnalysisCommand =
+  | PrivacyCommand
   | { type: "initialize" }
   | { type: "start"; runId: string; baseDraftRevision: number; consentVersion: string; provider: string; model: string; promptVersion: string }
   | { type: "request"; runId: string; baseDraftRevision: number; consentVersion: string; provider: string; model: string; promptVersion: string; expectedInputFingerprint: string }
@@ -55,6 +58,7 @@ const counter = z.number().int().nonnegative().safe();
 const errorCode = z.enum(["AI_REFUSED", "AI_INCOMPLETE", "AI_INVALID_OUTPUT", "AI_TIMEOUT", "AI_PROVIDER_FAILED"]);
 const attemptFields = { runId: opaque, attemptId: opaque, attemptCount: counter };
 const commandSchema = z.discriminatedUnion("type", [
+  privacyCommandSchema,
   z.object({ type: z.literal("initialize") }).strict(),
   z.object({
     type: z.literal("start"), runId: opaque, baseDraftRevision: revision,
@@ -136,6 +140,7 @@ export function transitionAnalysis(
   const manifest = analysisManifest(guide);
   const state = structuredClone(previous);
   const timestamp = now.toISOString();
+  if (command.type === "review-privacy") return applyPrivacyCommand(guide, state, command, now);
   if (command.type === "save-editor-draft") {
     if (command.expectedInputFingerprint !== manifest.fingerprint ||
         (state.draft && state.draft.inputFingerprint !== manifest.fingerprint)) return null;
@@ -146,6 +151,7 @@ export function transitionAnalysis(
     if (current && current.revision === command.expectedRevision + 1 &&
         JSON.stringify(current.document) === JSON.stringify(document)) return state;
     if ((current?.revision ?? 0) !== command.expectedRevision) return null;
+    if (!validatePrivacyEdit(current?.document, document)) throw new AnalysisContractError();
     state.draft = {
       revision: command.expectedRevision + 1, inputFingerprint: manifest.fingerprint, document,
       createdAt: current?.createdAt ?? timestamp, updatedAt: timestamp,
@@ -174,7 +180,9 @@ export function transitionAnalysis(
   if (command.type === "save-draft") {
     revision.parse(command.expectedRevision);
     if (draft.revision !== command.expectedRevision) return null;
-    draft.document = parseDraftDocument(command.document, manifest.frames);
+    const document = parseDraftDocument(command.document, manifest.frames);
+    if (!validatePrivacyEdit(draft.document, document)) throw new AnalysisContractError();
+    draft.document = document;
     draft.revision = revision.parse(draft.revision) + 1;
     draft.updatedAt = timestamp;
     return state;

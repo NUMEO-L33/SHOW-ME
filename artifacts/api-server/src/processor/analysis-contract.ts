@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import type { GuideWithSteps } from "./domain.js";
+import { privacyLedgerSchema } from "./privacy-review-schema.js";
 
 export const ANALYSIS_LIMITS = Object.freeze({
   maxFrames: 24,
@@ -141,7 +142,8 @@ const draftElementSchema = z.discriminatedUnion("type", [
   z.object({ ...elementBase, type: z.literal("privacy-mask"), bounds: rectSchema, enabled: z.boolean() }).strict(),
 ]);
 export const draftDocumentSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.union([z.literal(1), z.literal(2)]),
+  privacy: privacyLedgerSchema.optional(),
   title: plainText(120),
   // Optional for legacy drafts. This is human-authored context, not AI consent
   // or a provider prompt. Persisting it never starts an analysis run.
@@ -154,10 +156,10 @@ export const draftDocumentSchema = z.object({
     id, activeFrameStepId: id, sourceStepIds: z.array(id).min(1).max(ANALYSIS_LIMITS.maxFrames),
     shortLabel: plainText(60), instruction: plainText(500),
     elements: z.array(draftElementSchema).max(ANALYSIS_LIMITS.maxPrivacyRegions + 1),
-    // Gate 3A cannot approve privacy review or publish a draft.
+    // Legacy marker only. Effective v2 review is the server-owned privacy ledger.
     privacyReview: z.literal("pending"),
   }).strict()).min(1).max(ANALYSIS_LIMITS.maxFrames),
-}).strict();
+}).strict().refine(d => d.schemaVersion === 2 ? d.privacy !== undefined : d.privacy === undefined);
 export type DraftDocument = z.infer<typeof draftDocumentSchema>;
 
 export function parseDraftDocument(raw: unknown, frames: readonly FrameDescriptor[]): DraftDocument {

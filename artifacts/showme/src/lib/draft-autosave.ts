@@ -1,4 +1,5 @@
 import { draftFailure, type DraftSnapshot, type EditorDocument } from "./draft-client.js";
+import { editableContent } from "./privacy-ledger.js";
 
 export const DRAFT_AUTOSAVE_DELAY_MS = 1_000;
 export type DraftAutosaveStatus = { saving: boolean; error: string | null };
@@ -63,6 +64,18 @@ export class DraftAutosave {
   }
 
   get saving(): boolean { return this.request !== null; }
+
+  /** A separate owner review write may advance only an unchanged, acknowledged editor. */
+  acceptPrivacySave(before: DraftSnapshot, saved: DraftSnapshot): boolean {
+    if (this.disposed || this.request || this.error || this.failedWrite || this.validation || this.dirty() ||
+        this.base.revision !== before.revision || JSON.stringify(this.base) !== JSON.stringify(before) ||
+        saved.guideId !== before.guideId || saved.inputFingerprint !== before.inputFingerprint ||
+        !saved.persisted || saved.revision !== before.revision + 1 ||
+        editableContent(saved.document) !== editableContent(before.document)) return false;
+    this.clearTimer(); this.base = structuredClone(saved); this.document = structuredClone(saved.document);
+    this.signature = JSON.stringify(saved.document); this.options.onSaved(saved); this.publish();
+    return true;
+  }
 
   pause(error: unknown): void {
     this.clearTimer();

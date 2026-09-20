@@ -346,9 +346,10 @@ type ReviewScreenProps = {
   analysisReview?: React.ReactNode;
   privacyIdentity?: DraftIdentity;
   privacyBase?: DraftSnapshot;
+  onPrivacySaved: (before: DraftSnapshot, saved: DraftSnapshot) => boolean;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview, privacyIdentity, privacyBase }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview, privacyIdentity, privacyBase, onPrivacySaved }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -637,7 +638,7 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
             {isLiveDraft && activeStep.draft ? <PrivacyEditor key={activeStep.draft.id} step={activeStep}
               onChange={draft => updateActiveStep({ draft }, true)} disabled={draftLoading}
               previewDisabled={draftDirty || draftSaving || draftLoading || Boolean(draftError)}
-              identity={privacyIdentity} base={privacyBase} /> : <>
+              identity={privacyIdentity} base={privacyBase} onPrivacySaved={onPrivacySaved} /> : <>
             <div className="flex items-center justify-between"><div><p className="flex items-center gap-1.5 text-sm font-black"><LockKeyhole className="size-4 text-[#74539b]" />개인정보 가림</p><p className="mt-1 text-xs font-semibold text-[#8b94a6]">{isLiveDraft ? "개인정보 탐지·가림 준비 중" : `이 단계에서 ${activeStep.privacyCount}곳 발견`}</p></div>{!isLiveDraft && <span className={`rounded-full px-2.5 py-1 text-[11px] font-black ${activeStep.privacyEnabled ? "bg-[#ece8f5] text-[#6c4b91]" : "bg-[#fff0ed] text-[#bc503c]"}`}>{activeStep.privacyEnabled ? "적용 중" : "가림 해제"}</span>}</div>
             {isLiveDraft ? (
               <p className="mt-4 rounded-[14px] bg-[#fff8ed] p-3.5 text-sm font-semibold leading-6 text-[#84653e]">현재 화면에는 개인정보가 가려져 있지 않아요. 탐지와 영구 가림을 연결한 뒤 공개할 수 있어요.</p>
@@ -819,7 +820,7 @@ export default function Home() {
 
   const draftDirty = useMemo(() => {
     if (processingKind !== "video" || !activeJob || !draftSnapshot) return false;
-    try { return !draftSnapshot.persisted || JSON.stringify(draftDocument(title, steps, activeJob.intent)) !== JSON.stringify(draftSnapshot.document); }
+    try { return !draftSnapshot.persisted || JSON.stringify(draftDocument(title, steps, activeJob.intent, draftSnapshot.document)) !== JSON.stringify(draftSnapshot.document); }
     catch { return true; }
   }, [title, steps, activeJob, draftSnapshot, processingKind]);
 
@@ -844,7 +845,7 @@ export default function Home() {
     const autosave = draftAutosaveRef.current;
     if (!autosave || !activeJob || activeJob.phase === "deleting") return;
     autosave.suspend(draftComposing || draftLoading || (mode !== "review" && mode !== "viewer"));
-    try { autosave.update(draftDocument(title, steps, activeJob.intent)); }
+    try { autosave.update(draftDocument(title, steps, activeJob.intent, draftSnapshot?.document)); }
     catch { autosave.update(null, "자동 저장을 멈췄어요. 제목과 설명은 비워 둘 수 없으며 제목 120자·설명 500자 이내로 입력해 주세요. < > 같은 문자는 사용할 수 없습니다."); }
   }, [title, steps, activeJob, draftSnapshot, draftComposing, draftLoading, mode]);
 
@@ -1414,7 +1415,7 @@ export default function Home() {
         draftRequestRef.current || draftAutosaveRef.current?.saving || !draftAutosaveRef.current) {
       throw new ProcessorClientError("편집 상태가 바뀌었어요.", 409, "ANALYSIS_STATE_CHANGED");
     }
-    const next = applyAnalysisPreview(preview, draftSnapshot, draftDocument(title, steps, activeJob.intent), selectedIds);
+    const next = applyAnalysisPreview(preview, draftSnapshot, draftDocument(title, steps, activeJob.intent, draftSnapshot.document), selectedIds);
     setSteps(steps.map(step => {
       const draft = next.steps.find(candidate => candidate.id === String(step.id))!;
       const tap = draft.elements.find(element => element.type === "tap");
@@ -1470,6 +1471,8 @@ export default function Home() {
           onCompositionChange={onDraftCompositionChange}
           privacyIdentity={processingKind === "video" && activeJob ? activeJob : undefined}
           privacyBase={draftSnapshot ?? undefined}
+          onPrivacySaved={(before, saved) => Boolean(activeJobRef.current?.guideId === before.guideId && activeJobRef.current.phase !== "deleting" &&
+            draftAutosaveRef.current?.acceptPrivacySave(before, saved))}
           analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisWorkflow
             key={`${activeJob.guideId}:${draftSnapshot.inputFingerprint}`} identity={activeJob} base={draftSnapshot}
             disabled={draftDirty || draftSaving || draftLoading || Boolean(draftError) || draftComposing}
