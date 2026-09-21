@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { privacyAssetBatchSchema, transitionPrivacyAsset, type PrivacyAssetBatch, type PrivacyAssetCommand } from "./privacy-assets.js";
 
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -37,6 +38,7 @@ import {
   analysisRequestAttempts,
   analysisRuns,
   guideDrafts,
+  guideAssets,
   guideSteps,
   guides,
   type GuideRow,
@@ -73,7 +75,7 @@ import { AnalysisCountError, countRequestKey, parseCountCommand, parseCountRecor
   type AnalysisCountCommand, type AnalysisCountResult, type AnalysisCountLaunchCommand } from "./analysis-count-accounting.js";
 import { assertQuotaPermit, parseQuotaReceipt, prepareQuotaCharge, quotaCoverageStart, type AnalysisQuotaReceipt } from "./analysis-quota-charge.js";
 
-const JSON_REPOSITORY_VERSION = 5 as const;
+const JSON_REPOSITORY_VERSION = 6 as const;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 
@@ -83,6 +85,7 @@ type JsonRepositoryState = {
   steps: GuideStep[];
   analysis: Array<{ guideId: string; state: AnalysisState }>;
   funding: AnalysisFundingLedger;
+  privacyAssets: PrivacyAssetBatch[];
 };
 
 export type ProcessorDatabase = NodePgDatabase<typeof processorSchema>;
@@ -108,7 +111,7 @@ export class GuideNotFoundError extends Error {
 }
 
 function emptyJsonState(): JsonRepositoryState {
-  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [], funding: emptyFundingLedger() };
+  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [], funding: emptyFundingLedger(), privacyAssets: [] };
 }
 
 function clone<T>(value: T): T {
@@ -470,7 +473,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
-    ![1, 2, 3, 4, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
+    ![1, 2, 3, 4, 5, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
     !Array.isArray((parsed as { guides?: unknown }).guides) ||
     !Array.isArray((parsed as { steps?: unknown }).steps)
   ) {
@@ -478,6 +481,14 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   }
 
   const state = parsed as JsonRepositoryState;
+  if (state.version !== JSON_REPOSITORY_VERSION) {
+    if (state.privacyAssets !== undefined) throw new RepositoryDataError("Invalid legacy asset state.");
+    state.privacyAssets = [];
+  }
+  if (!Array.isArray(state.privacyAssets)) throw new RepositoryDataError("Missing private asset ledger.");
+  state.privacyAssets = state.privacyAssets.map(batch => privacyAssetBatchSchema.parse(batch));
+  if (new Set(state.privacyAssets.map(b => b.id)).size !== state.privacyAssets.length ||
+      state.privacyAssets.some(b => !state.guides.some(g => g.id === b.guideId))) throw new RepositoryDataError("Orphaned private asset ledger.");
   const legacyVersion = (parsed as { version: number }).version === 1;
   const fundingV2 = (parsed as { version: number }).version === 2;
   const fundingV3 = (parsed as { version: number }).version === 3;
@@ -589,6 +600,27 @@ export class JsonGuideRepository implements GuideRepository {
       const state = await this.readState();
       if (!state.guides.some((guide) => guide.id === guideId)) return null;
       return clone(state.analysis.find((entry) => entry.guideId === guideId)?.state ?? emptyAnalysisState());
+    });
+  }
+
+  async listPrivacyAssetBatches(guideId: string): Promise<PrivacyAssetBatch[]> {
+    return this.serialize(async () => clone((await this.readState()).privacyAssets.filter(b => b.guideId === guideId)));
+  }
+
+  async executePrivacyAssetCommand(guideId: string, command: PrivacyAssetCommand): Promise<PrivacyAssetBatch | null> {
+    command = structuredClone(command);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      const existing = state.privacyAssets.find(b => b.id === command.id);
+      if (existing && existing.guideId !== guideId) return null;
+      if (command.type === "reserve" && state.privacyAssets.filter(b => b.guideId === guideId).length >= 4) return null;
+      const next = transitionPrivacyAsset({ ...guide, steps: state.steps.filter(s => s.guideId === guideId) },
+        state.analysis.find(e => e.guideId === guideId)?.state ?? emptyAnalysisState(), existing, command, new Date());
+      if (!next) return null;
+      state.privacyAssets = state.privacyAssets.filter(b => b.id !== command.id);
+      if (!next.remove) state.privacyAssets.push(next.batch);
+      await this.writeState(state); return clone(next.batch);
     });
   }
 
@@ -1062,6 +1094,7 @@ export class JsonGuideRepository implements GuideRepository {
       if (!matchesExpectedErrorCode(guide, options?.expectedErrorCode)) return false;
       if (options?.expectedUpdatedAt !== undefined && guide.updatedAt !== options.expectedUpdatedAt) return false;
 
+      if (state.privacyAssets.some(b => b.guideId === guideId)) return false;
       state.guides = state.guides.filter((candidate) => candidate.id !== guideId);
       state.steps = state.steps.filter((step) => step.guideId !== guideId);
       state.analysis = state.analysis.filter((entry) => entry.guideId !== guideId);
@@ -1373,6 +1406,38 @@ export class PostgresGuideRepository implements GuideRepository {
   getAnalysisState(guideId: string): Promise<AnalysisState | null> { return this.analysisTransaction(guideId); }
   executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null> {
     return this.analysisTransaction(guideId, command);
+  }
+
+  async listPrivacyAssetBatches(guideId: string): Promise<PrivacyAssetBatch[]> {
+    const rows = await this.database.select().from(guideAssets).where(eq(guideAssets.guideId, guideId));
+    return rows.map(row => {
+      const batch = privacyAssetBatchSchema.parse(row.payload);
+      if (batch.guideId !== row.guideId || batch.id !== row.id) throw new RepositoryDataError("Invalid private asset identity.");
+      return batch;
+    });
+  }
+
+  async executePrivacyAssetCommand(guideId: string, command: PrivacyAssetCommand): Promise<PrivacyAssetBatch | null> {
+    command = structuredClone(command);
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      const rows = await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId));
+      if (command.type === "reserve" && rows.length >= 4) return null;
+      const existing = rows.find(row => row.id === command.id);
+      if (existing && (existing.payload.id !== existing.id || existing.payload.guideId !== guideId)) {
+        throw new RepositoryDataError("Invalid private asset identity.");
+      }
+      const steps = await tx.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const next = transitionPrivacyAsset({ ...guideFromRow(guide), steps: steps.map(stepFromRow) },
+        await loadAnalysisRows(tx, guideId), existing?.payload, command, await analysisWorkClock(tx));
+      if (!next) return null;
+      const where = and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, command.id));
+      if (next.remove) await tx.delete(guideAssets).where(where);
+      else if (existing) await tx.update(guideAssets).set({ payload: next.batch }).where(where);
+      else await tx.insert(guideAssets).values({ guideId, id: command.id, payload: next.batch });
+      return next.batch;
+    });
   }
 
   async listAnalysisClosures(limit = 20, now?: Date): Promise<AnalysisClosureCandidate[]> {
@@ -2201,6 +2266,7 @@ export class PostgresGuideRepository implements GuideRepository {
       if (!matchesExpectedErrorCode(guide, options?.expectedErrorCode)) return false;
       if (options?.expectedUpdatedAt !== undefined && guide.updatedAt !== options.expectedUpdatedAt) return false;
 
+      if ((await transaction.select({ id: guideAssets.id }).from(guideAssets).where(eq(guideAssets.guideId, guideId)).limit(1)).length) return false;
       await transaction.delete(guideSteps).where(eq(guideSteps.guideId, guideId));
       // Preserve maximum accounting + opaque IDs, remove consent/media/policy details.
       await transaction.update(analysisReservations).set({ details: null }).where(eq(analysisReservations.guideId, guideId));

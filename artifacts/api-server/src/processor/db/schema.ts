@@ -26,6 +26,7 @@ import type { AnalysisBudgetWindow, AnalysisReservation, AnalysisStoredBatch } f
 import type { AnalysisAccountingControl, AnalysisRequestAttempt } from "../analysis-accounting-contract.js";
 import type { AnalysisCountRecord } from "../analysis-count-accounting.js";
 import type { AnalysisOperationsReview } from "../analysis-operations-review.js";
+import type { PrivacyAssetBatch } from "../privacy-assets.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -110,6 +111,13 @@ export const guideDrafts = pgTable("guide_drafts", {
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).notNull(),
 });
+
+// RESTRICT is deliberate: object cleanup must commit before guide deletion.
+export const guideAssets = pgTable("guide_assets", {
+  guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "restrict" }),
+  id: uuid("id").primaryKey(),
+  payload: jsonb("payload").$type<PrivacyAssetBatch>().notNull(),
+}, table => [index("guide_assets_guide_idx").on(table.guideId)]);
 
 export const analysisRuns = pgTable("analysis_runs", {
   guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "cascade" }),

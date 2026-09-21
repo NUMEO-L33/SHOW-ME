@@ -329,6 +329,8 @@ export async function finalizeGuideDeletion(
   if (options.expectedProcessingAttemptId !== undefined && guide.processingAttemptId !== options.expectedProcessingAttemptId) return false;
   if (options.expectedProcessingAttemptCount !== undefined && guide.processingAttemptCount !== options.expectedProcessingAttemptCount) return false;
 
+  const { cleanupPrivateRedactions } = await import("./privacy-asset-cleanup.js");
+  if (!await cleanupPrivateRedactions(repository, storage, guideId, options)) return false;
   await cleanupStorageKeys(storage, guideAssetKeys(guide, maxSteps), options);
   return repository.deleteGuide(guide.id, {
     expectedUpdatedAt: options.expectedUpdatedAt,

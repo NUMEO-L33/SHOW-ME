@@ -152,10 +152,11 @@ test("lost closure acknowledgement reopens as a no-write replay with no double r
 test("v4 upgrades add only zero release fields, preserve reads, and reject corrupted v5 closure records", async (context) => {
   const h = await harness(context); await h.begin(); const current = await h.state();
   const old = structuredClone(current); old.version = 4;
+  delete old.privacyAssets;
   for (const r of old.funding.reservations) { delete r.released; delete r.closedAt; }
   await writeFile(h.repository.filePath, JSON.stringify(old));
   assert.equal((await new JsonGuideRepository(h.repository.filePath).getAnalysisFunding(h.guideId, identity.runId))?.reservation.closedAt, null);
-  assert.deepEqual(await h.state(), old); await h.close(nextDay); const saved = await h.state(); assert.equal(saved.version, 5);
+  assert.deepEqual(await h.state(), old); await h.close(nextDay); const saved = await h.state(); assert.equal(saved.version, 6);
   for (const mutate of [
     (s: typeof saved) => { delete s.funding.reservations[0].released; },
     (s: typeof saved) => { s.funding.reservations[0].released.requests++; },

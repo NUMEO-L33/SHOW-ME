@@ -44,6 +44,8 @@ import { testMediaPaths } from "../tests/helpers/media-binaries.js";
 import { Readable } from "node:stream";
 import { privacyAfterEdit, privacyReviewState } from "../src/processor/privacy-review.js";
 import type { PrivacyCommand } from "../src/processor/privacy-review-schema.js";
+import { reviewedAssetFixture } from "../tests/helpers/privacy-assets-fixture.js";
+import { privacyAssetKeys } from "../src/processor/privacy-assets.js";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -123,6 +125,70 @@ async function waitForFixtureLocks(pool: Pool, count: number) {
   }
   assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
 }
+
+test("real PostgreSQL: private asset ownership is bounded, single-writer, persistent and blocks deletion", async t => {
+  const h = await fixture(t), { guide } = await h.seed("asset-guide", 1, true);
+  const { request } = await reviewedAssetFixture(h.repository, guide);
+  const reservations = await Promise.all(Array.from({ length: 12 }, () => h.repository.executePrivacyAssetCommand(guide.id,
+    { type: "reserve", id: randomUUID(), ...request })));
+  assert.equal(reservations.filter(Boolean).length, 4);
+  const batch = reservations.find(Boolean)!;
+  const claims = await Promise.all(Array.from({ length: 12 }, () => h.repository.executePrivacyAssetCommand(guide.id,
+    { type: "claim", id: batch.id, version: batch.version, writerId: randomUUID() })));
+  assert.equal(claims.filter(Boolean).length, 1); const winner = claims.find(Boolean)!;
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.equal((await reopened.listPrivacyAssetBatches(guide.id)).length, 4);
+  assert.equal(await reopened.deleteGuide(guide.id), false);
+  assert.equal((await reopened.getGuideById(guide.id))!.steps.length, 1);
+  const cancelled = await reopened.executePrivacyAssetCommand(guide.id, { type: "cancel", id: batch.id });
+  assert.ok(cancelled);
+  assert.equal(await reopened.executePrivacyAssetCommand(guide.id, { type: "cleaned", id: batch.id, version: cancelled.version }), null);
+  const settled = await reopened.executePrivacyAssetCommand(guide.id, { type: "settle", id: batch.id, writerId: winner.writerId!, receipts: null });
+  assert.ok(settled?.writerSettled);
+  for (const record of await reopened.listPrivacyAssetBatches(guide.id)) {
+    const c = (await reopened.executePrivacyAssetCommand(guide.id, { type: "cancel", id: record.id }))!;
+    assert.ok(await reopened.executePrivacyAssetCommand(guide.id, { type: "cleaned", id: record.id, version: c.version }));
+  }
+  assert.equal(await reopened.deleteGuide(guide.id), true);
+  assert.equal(await reopened.executePrivacyAssetCommand(guide.id, { type: "reserve", id: randomUUID(), ...request }), null);
+});
+
+test("real PostgreSQL: redaction finalization fences edits and failed ledger writes roll back", async t => {
+  const h = await fixture(t), { guide } = await h.seed("asset-guide", 1, true);
+  const { request, state } = await reviewedAssetFixture(h.repository, guide);
+  const batch = (await h.repository.executePrivacyAssetCommand(guide.id, { type: "reserve", id: randomUUID(), ...request }))!;
+  const writerId = randomUUID();
+  await h.pool.query(`CREATE FUNCTION fail_asset_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$`);
+  await h.pool.query(`CREATE TRIGGER fail_asset_write BEFORE UPDATE ON guide_assets FOR EACH ROW EXECUTE FUNCTION fail_asset_write()`);
+  await assert.rejects(h.repository.executePrivacyAssetCommand(guide.id, { type: "claim", id: batch.id, version: batch.version, writerId }));
+  assert.deepEqual(await h.repository.listPrivacyAssetBatches(guide.id), [batch]);
+  await h.pool.query(`DROP TRIGGER fail_asset_write ON guide_assets`);
+  assert.ok(await h.repository.executePrivacyAssetCommand(guide.id, { type: "claim", id: batch.id, version: batch.version, writerId }));
+  const document = structuredClone(state.draft!.document); document.title = "edited";
+  document.privacy = privacyAfterEdit(state.draft!.document, document);
+  assert.ok(await h.repository.executeAnalysisCommand(guide.id, { type: "save-editor-draft", expectedRevision: request.revision,
+    expectedInputFingerprint: request.inputFingerprint, document }));
+  const settled = await h.repository.executePrivacyAssetCommand(guide.id, { type: "settle", id: batch.id, writerId,
+    receipts: privacyAssetKeys(batch).map(key => ({ key, sha256: "a".repeat(64), size: 100 })) });
+  assert.equal(settled?.status, "cleanup");
+  assert.equal((await h.repository.getAnalysisState(guide.id))!.draft!.document.title, "edited");
+  await assert.rejects(h.pool.query("DELETE FROM guides WHERE id=$1", [guide.id]), (e: unknown) => (e as {code:string}).code === "23503");
+});
+
+test("real PostgreSQL: private asset ready receipts survive reconnect without publishing or touching retention", async t => {
+  const h = await fixture(t), { guide } = await h.seed("asset-guide", 1, true);
+  const { request, state } = await reviewedAssetFixture(h.repository, guide);
+  const before = await h.repository.getGuideById(guide.id);
+  const batch = (await h.repository.executePrivacyAssetCommand(guide.id, { type: "reserve", id: randomUUID(), ...request }))!;
+  const writerId = randomUUID();
+  await h.repository.executePrivacyAssetCommand(guide.id, { type: "claim", id: batch.id, version: batch.version, writerId });
+  const ready = await h.repository.executePrivacyAssetCommand(guide.id, { type: "settle", id: batch.id, writerId,
+    receipts: privacyAssetKeys(batch).map(key => ({ key, sha256: "a".repeat(64), size: 100 })) });
+  assert.equal(ready?.status, "ready");
+  assert.deepEqual(await PostgresGuideRepository.fromPool(h.pool).listPrivacyAssetBatches(guide.id), [ready]);
+  assert.deepEqual(await h.repository.getGuideById(guide.id), before);
+  assert.deepEqual(await h.repository.getAnalysisState(guide.id), state);
+});
 
 test("real PostgreSQL: privacy v2 confirmations survive reopen, use revision CAS, and editing revokes only changed checks", async t => {
   const h = await fixture(t), { guide } = await h.seed(), manifest = analysisManifest(guide);
@@ -825,10 +891,10 @@ test("real PostgreSQL: twenty simultaneous editor saves commit one revision and 
   }
 });
 
-test("real PostgreSQL: all thirteen migrations apply and replay without resetting the halt or accounting", async (t) => {
+test("real PostgreSQL: all fourteen migrations apply and replay without resetting the halt or accounting", async (t) => {
   const h = await fixture(t);
-  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 13);
-  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0012`);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 14);
+  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0013`);
   await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":true}'::jsonb WHERE id='global'");
   await runDatabaseMigrations(h.connection);
   assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);

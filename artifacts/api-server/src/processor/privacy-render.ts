@@ -3,7 +3,7 @@ import { deflateSync } from "node:zlib";
 import { checkJpeg } from "./analysis-images.js";
 
 export type MaskBounds = { x: number; y: number; width: number; height: number };
-export const PRIVACY_RENDER_VERSION = "opaque-tiles-v1";
+export { PRIVACY_RENDER_VERSION } from "./privacy-render-version.js";
 const MAX_PIXELS = 4_194_304;
 const PALETTE = [[67, 49, 94], [115, 84, 151], [177, 152, 205], [231, 214, 243]] as const;
 export class PrivacyRenderError extends Error {

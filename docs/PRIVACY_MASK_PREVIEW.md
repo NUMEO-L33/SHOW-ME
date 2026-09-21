@@ -43,7 +43,7 @@
 
 ## 남은 순서
 
-후속 로컬 E1 구현과 실제 DB 검증 대기 상태는 `PRIVACY_REVIEW_CONTRACT.md`를 따른다. 아래는 이 미리보기 구현 당시의 다음 단계 목록이다.
+후속 E1 구현/실제 DB 검증은 `PRIVACY_REVIEW_CONTRACT.md`, E2 내부 저장 엔진은 `PRIVACY_ASSET_STORAGE.md`를 따른다. 아래는 이 미리보기 구현 당시의 다음 단계 목록이다.
 
 1. E1: 후보별 pending/masked/dismissed, 화면·문구 확인 지문과 변경 시 재확인 계약. 현재 문서 v1의 `privacyReview: pending`을 유지한다.
 2. E2/E3: 처리 자산의 내구 저장, 모든 자산 완료 후 불변 게시본 확정, 충돌/삭제/늦은 쓰기 정리, 철회·15일 만료.

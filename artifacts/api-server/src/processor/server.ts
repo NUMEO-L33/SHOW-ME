@@ -3,6 +3,7 @@ import { mkdir, rm, stat } from "node:fs/promises";
 import { pipeline as pipeStreams } from "node:stream/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
+import { cleanupPrivateRedactions } from "./privacy-asset-cleanup.js";
 
 import Busboy, { type FileInfo } from "busboy";
 import cors from "cors";
@@ -803,6 +804,10 @@ export function createProcessorApp({
 
       try {
         await cleanupStorageKeys(storage, guideAssetKeys(guide, config.maxSteps));
+        if (!await cleanupPrivateRedactions(repository, storage, guide.id)) {
+          response.status(202).json({ status: "deleting" });
+          return;
+        }
       } catch (error) {
         console.error(JSON.stringify({
           event: "guide_delete_asset_cleanup_failed",

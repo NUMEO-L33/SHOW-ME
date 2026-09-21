@@ -92,6 +92,13 @@
       "when": 1789822800000,
       "tag": "0012_analysis_activation_events",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790035200000,
+      "tag": "0013_private_redaction_assets",
+      "breakpoints": true
     }
   ]
 }
