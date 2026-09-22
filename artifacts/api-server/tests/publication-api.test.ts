@@ -201,18 +201,26 @@ test("wrong, truncated, excessive, and failing stored bytes are never served or 
   }
 });
 
-test("timed out storage retains bounded slots, destroys late streams, and can recover without new authority", async t => {
+test("timed out storage retains bounded slots, destroys late streams, and can recover without new authority", { timeout: 15_000 }, async t => {
   const h = await fixture(t), p = await h.publish(), app = express();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   app.use("/api/public/guides", createPublicPublicationRouter({ repository: h.repository, storage: h.storage, timeoutMs: 30 }));
   const view = await request(app).get(`/api/public/guides/${p.head.publicSlug}`).expect(200), path = view.body.guide.steps[0].frameUrl;
-  const gate = deferred<void>(), streams: Readable[] = [];
+  const gate = deferred<void>(), opened = deferred<void>(), streams: Readable[] = [];
+  let opening = 0;
   t.after(() => gate.resolve());
-  const mock = t.mock.method(h.storage, "openRead", async () => { await gate.promise; const stream = Readable.from([Buffer.from("late")]); streams.push(stream); return stream; });
-  await Promise.all(Array.from({ length: 4 }, () => request(app).get(path).expect(503)));
+  const mock = t.mock.method(h.storage, "openRead", async () => {
+    if (++opening === 4) opened.resolve();
+    await gate.promise; const stream = Readable.from([Buffer.from("late")]); streams.push(stream); return stream;
+  });
+  const pending = Array.from({ length: 4 }, () => request(app).get(path).expect(503).then(response => response));
+  // Expire only after all four reads entered storage, not after an assumed
+  // 30 ms of JSON repository/OS scheduling on a resource-constrained host.
+  await opened.promise; t.mock.timers.tick(31); await Promise.all(pending);
   assert.equal(mock.mock.callCount(), 4);
   await request(app).get(path).expect(503); assert.equal(mock.mock.callCount(), 4);
   gate.resolve(); for (let n = 0; n < 50 && streams.length < 4; n++) await delay(5);
-  await delay(5); assert.ok(streams.every(s => s.destroyed)); mock.mock.restore();
+  await delay(5); assert.equal(streams.length, 4); assert.ok(streams.every(s => s.destroyed)); mock.mock.restore();
   await request(app).get(path).expect(200);
 });
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import { testEnvironment, testGroups } from "../test-environment.mjs";
 
 test("tests drop live settings, cloud credentials and inherited Node options", () => {
@@ -35,4 +36,11 @@ test("unknown tests and injected node arguments fail closed", () => {
   for (const args of [["postgres"], ["integration"], ["--env-file=.env"], ["--send"], ["server", "--watch"]]) {
     assert.throws(() => testGroups(args), /PostgreSQL is opt-in/);
   }
+});
+
+test("file suites are serial without skipping explicit in-test concurrency checks", () => {
+  const source = readFileSync(new URL("../run-tests.mjs", import.meta.url), "utf8");
+  assert.match(source, /"--test-concurrency=1"/);
+  assert.match(source, /\.\.\.files/);
+  assert.doesNotMatch(source, /--test-skip-pattern|--test-name-pattern/);
 });

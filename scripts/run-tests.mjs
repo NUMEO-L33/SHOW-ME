@@ -24,9 +24,12 @@ try {
     const loader = group === "migration" ? [] : ["--import", pathToFileURL(
       createRequire(join(suite.cwd, "package.json")).resolve("tsx"),
     ).href];
-    console.log(`ShowMe ${group}: ${files.length} files; application environment excluded; no .env loaded.`);
+    console.log(`ShowMe ${group}: ${files.length} files; file concurrency 1; application environment excluded; no .env loaded.`);
     const code = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [...loader, "--test", "--test-concurrency=2", ...files], {
+      // Cold TS loaders and real media decoders share the same small Replit
+      // CPU quota. Keep file suites serial; each test still exercises its own
+      // explicit request/worker races, with production deadlines unchanged.
+      const child = spawn(process.execPath, [...loader, "--test", "--test-concurrency=1", ...files], {
         cwd: suite.cwd, env: testEnvironment(process.env), stdio: "inherit", windowsHide: true,
       });
       const interrupt = () => child.kill("SIGTERM");

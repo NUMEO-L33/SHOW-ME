@@ -4,9 +4,6 @@ import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Pool, type PoolConfig } from "pg";
 
-import { PostgresAnalysisDatabaseProbe } from "./analysis-database-probe.js";
-import { PostgresGuideRepository } from "./repository.js";
-
 const flags = ["--configured-database", "--read-only"];
 const replitFlag = "--replit-development=";
 const replIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -126,6 +123,11 @@ export async function runAnalysisDatabaseCheck(options: {
   let pool: Pool | undefined; let output = JSON.stringify(report("failed")); let exitCode = 1;
   const stopped = new AbortController();
   try {
+    // A no-argument/help invocation must not load the full repository graph.
+    // Cold TypeScript startup can dominate the CLI deadline on a small host.
+    const { PostgresAnalysisDatabaseProbe } = await import("./analysis-database-probe.js");
+    const { PostgresGuideRepository } = await import("./repository.js");
+    options.signal.throwIfAborted();
     pool = new Pool(config);
     // Idle connection errors must not become raw error events on stdout/stderr.
     pool.on("error", () => stopped.abort());
