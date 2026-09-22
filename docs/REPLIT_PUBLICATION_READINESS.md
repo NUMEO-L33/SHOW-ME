@@ -1,5 +1,29 @@
 # Replit 개발환경 게시 기반 반영 기록 — 2026-09-22
 
+## 합성 저장소 검사 완료 — 2026-09-22
+
+후속 승인 범위로 `a2ba9b8`의 검사 스크립트/회귀 테스트/문서 세 파일만 기존 개발 브랜치에 반영했다. 시작 전 Replit은 변경 없는 `ebcace4`, 정확한 개발 프로젝트, 운영 deployment 아님, AI off, 명시적 bucket 설정, 기존 health 정상임을 확인했다. 기존 API/web workflow를 중지하거나 재시작하지 않았다.
+
+실제 Replit Storage는 `showme/diagnostics/publication/<새 UUID>/`로 한정하고 기존 앱 DB 대신 일회용 JSON repository를 사용했다. 고정 합성 JPEG 하나로 두 원본 프레임 객체와 두 가림 PNG 객체만 생성했다. HTTP 서버는 `127.0.0.1` 임의 포트에만 바인딩했다. 첫 저장 전 비어 있는 prefix인지 확인하고, 기록된 새 가이드의 네 key 이외에는 쓰기/읽기/삭제를 거절하도록 제한했다.
+
+관측 결과:
+
+```text
+PUBLICATION_STORAGE_CHECK SOURCE_ROUNDTRIP_OK
+PUBLICATION_STORAGE_CHECK PROCESSED_PIXELS_AND_SOURCE_PRESERVATION_OK
+PUBLICATION_STORAGE_CHECK WITHDRAWAL_AND_PROCESSED_DELETION_OK
+PUBLICATION_STORAGE_CHECK PASS
+PUBLICATION_STORAGE_EXIT 0
+```
+
+실제 FFmpeg를 통한 가림 PNG/썸네일의 바이트 일치와 원본 보존, 인증 없는 게시/실행기 시작 전 게시 거부, 공유 중지 후 JSON 및 이전 이미지 URL의 404를 확인했다. 삭제는 단순 읽기 오류가 아니라 SDK `exists:false`와 해당 진단 prefix 목록이 비어 있음으로 검증했다. 최종 `remoteObjectsRemoved:true`, `localFixtureRemoved:true`, `pendingIO:false`, `applicationDatabaseUsed:false`, `externalAIUsed:false`, `publicListener:false`다. 원격 테스트 객체 네 개와 자체 임시 자료는 모두 정리됐다.
+
+후속 기존 health는 HTTP **200**이고 API 실행기는 **1개**다. 해당 프로세스 환경의 AI off, migration verify-only, Replit 저장소, Gemini 키와 별도 operator/migration DB URL 없음도 확인했다. 기존 서버는 재시작하지 않았고 git 작업본은 깨끗하다. 첫 프로세스 탐지의 상대 entrypoint 비교와 PID 전사 오류는 수정 후 실제 entrypoint 기반으로 재확인했으며 초기 0개/ENOENT를 서버 중단으로 해석하지 않는다.
+
+로컬 최종 집중 **67개**, 실패·취소·생략 0 및 API 제품/테스트 타입 검사가 통과했다. 검사 도구의 초기 key/함수명/metadata 기준 오류는 로컬에서 수정 후 실행했다. 제품 동작/제한시간을 변경하지 않았다. 일반 전체와 실제 PostgreSQL 검사는 이 단계에서 재실행하지 않았다.
+
+**이 결과는 Replit Storage 어댑터와 격리된 게시/철회 경로 검증이다.** 기존 앱 PostgreSQL과의 결합, bucket 전체 IAM/ACL, 미확정 원격 쓰기 운영 해소, 인터넷 공개 수신자/모바일 검증, 기본 공개 활성화는 별도다. 원래 개발 MD 목표·완료 조건은 바꾸지 않았고 개인 영상, 실제 외부 AI, .env/키/권한, 운영 Publish는 건드리지 않았다.
+
 ## 후속 반영 완료 — 2026-09-22
 
 사용자가 코드 커밋·푸시, 기존 Replit 개발환경 업데이트, migration 0013–0017, 기존 runtime 계정의 최소 테이블 권한 반영, API 재시작을 승인했다. 기능 작업을 `feb29ec`로 커밋·푸시하고 Replit을 fast-forward했다. 버전 혼합을 피하려고 기존 web/API workflow를 중지했으며 mockup workflow는 변경하지 않았다. 공개 활성화·운영 Publish·외부 AI 호출은 이 범위에 포함하지 않는다.

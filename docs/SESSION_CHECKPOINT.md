@@ -2,7 +2,21 @@
 
 사용자가 Docker 오류 확인 후 `저장해`라고 요청하여 진행 상황을 저장했고, 이후 `docker 실행 완료`를 알려 실제 DB 검사를 재개했다. 이 문서는 최신 인계 기록이다. 원래 개발 계획의 목표나 완료 조건은 바꾸지 않는다. 아래 결과는 저장 시점의 관측이며 재개 시 최신 상태를 확인한다.
 
-## 최신 반영 — 2026-09-22 Replit 개발 코드·DB·권한·재시작 완료
+## 최신 검증 — 2026-09-22 격리된 합성 Replit 저장소 게시·철회 통과
+
+사용자의 다음 단계 진행 승인에 따라 검사 도구 `a2ba9b8`을 기존 브랜치에 커밋·푸시하고 변경 없는 Replit `ebcace4`에서 fast-forward했다. 제품 코드·기존 API 프로세스·.env·키·권한·원래 개발 MD는 변경하지 않았다. 검사 도구 설명은 `PUBLICATION_STORAGE_CHECK.md`.
+
+합성 JPEG만 새 진단 prefix에 저장하고 재읽기/materialize 일치, 실제 FFmpeg 가림 PNG/썸네일의 예상 바이트, 원본 보존, 게시 후 공유 중지의 JSON/이미지 404를 확인했다. 처리본 정리와 마지막 네 객체의 `exists:false`/진단 prefix 비어 있음까지 확인하여 **`PUBLICATION_STORAGE_CHECK PASS`, `PUBLICATION_STORAGE_EXIT 0`**이다. `remoteObjectsRemoved:true`, `localFixtureRemoved:true`, `pendingIO:false`; 테스트 객체 네 개와 자체 임시 자료는 모두 정리됐다.
+
+metadata는 별도 임시 JSON repository, HTTP는 loopback 임의 포트만 사용했다. **실제 Replit 앱 DB와 저장소를 함께 쓰는 통합 게시 검사나 인터넷 공개 활성화가 아니다.** 개인 영상·기존 가이드·외부 AI·운영 Publish는 사용하지 않았다. 기존 앱의 공개 실행기는 계속 OFF다.
+
+검사 후 기존 health **200**, 정확한 API 작업 폴더/entrypoint의 실행기 **1개**, AI off, migration verify-only, Replit 저장소, AI 키/별도 관리자 DB 환경 없음과 변경 없는 git 상태를 확인했다. 최초 프로세스 탐지의 상대 경로 비교와 PID 전사 오류는 성공으로 취급하지 않고 실제 entrypoint 기준으로 다시 검증했다. 서버 재시작은 하지 않았다.
+
+로컬 최종 집중 검사 **67개**, 실패·취소·생략 0, API 제품/테스트 타입 검사 통과. 새 검사 도구의 canonical key/함수명/초안 검토 시각 기준 오류는 로컬에서 수정한 뒤 Replit에 반영했다. 이번 턴에 전체 1,044개나 PostgreSQL 135개를 다시 실행했다고 표기하지 않는다.
+
+**다음은 실제 DB+저장소 결합 검사와 공개 활성화 조건 확정이다.** 저장소 전체 IAM/ACL, 미확정 원격 쓰기 운영 해소, 실제 수신자/모바일 확인도 남는다. 원래 E3/F1 목표·완료 조건은 유지하며 전체 완료/출시 완료로 표시하지 않는다.
+
+## 이전 반영 — 2026-09-22 Replit 개발 코드·DB·권한·재시작 완료
 
 사용자가 직전 제안한 커밋·푸시 → Replit 개발환경 업데이트 → migration/기존 역할 최소 권한 → API 재시작 범위를 승인했다. 기능 작업 `feb29ec`와 검사 보완 `227a7ef`를 기존 `codex/replit-migration-hardening` 브랜치로 푸시·반영했다. 원래 개발 MD의 목표·완료 조건은 변경하지 않았다.
 
