@@ -20,9 +20,10 @@ type PublicGuideProps = {
   onExit?: () => void;
   title?: string;
   steps?: GuideStep[];
+  privatePreview?: boolean;
 };
 
-export function PublicGuide({ onExit, title: suppliedTitle, steps: suppliedSteps }: PublicGuideProps) {
+export function PublicGuide({ onExit, title: suppliedTitle, steps: suppliedSteps, privatePreview = false }: PublicGuideProps) {
   const [storedGuide, setStoredGuide] = useState<{ title: string; steps: GuideStep[] }>({
     title: GUIDE_TITLE,
     steps: INITIAL_GUIDE_STEPS,
@@ -153,6 +154,7 @@ export function PublicGuide({ onExit, title: suppliedTitle, steps: suppliedSteps
       </header>
 
       <section className="mx-auto flex min-h-0 w-full max-w-[760px] flex-1 flex-col px-5 pb-2 pt-4 sm:px-8 sm:pt-5">
+        {privatePreview && <p role="note" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm leading-6">비공개 편집용 원본 미리보기입니다. 실제 공유 화면과 다르며 가림 적용본이 아닙니다. 공유 결과는 ‘게시·공유 관리’의 확정된 링크에서 확인하세요.</p>}
         <div aria-live="polite">
           <p className="text-sm font-black text-[#4f6df5]">{stepIndex + 1}단계</p>
           <h2 className="mt-1.5 text-[clamp(1.35rem,4.5vw,1.75rem)] font-black leading-[1.38] tracking-[-0.04em]">{step.instruction}</h2>

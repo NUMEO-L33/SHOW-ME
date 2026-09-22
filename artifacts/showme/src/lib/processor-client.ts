@@ -1,5 +1,5 @@
 import type { GuideStep } from "@/lib/showme-data";
-import { privateApiDestination, privateProcessorOrigin } from "./private-destination.js";
+import { privateApiDestination, privateProcessorOrigin, privateDestination } from "./private-destination.js";
 
 export type ProcessorStatus =
   | "uploading"
@@ -151,6 +151,18 @@ function invalidResponse(): never {
 export async function boundedRequest<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>, timeoutMs = 15_000): Promise<T> {
   const destination = privateApiDestination(url);
   if (!destination) throw new ProcessorClientError("다른 주소로의 전송을 차단했어요. 이 앱과 같은 주소의 서버만 사용할 수 있습니다.", undefined, "PRIVATE_DESTINATION_BLOCKED");
+  return requestWithDeadline(destination, options, read, timeoutMs);
+}
+
+/** Public read-only transport cannot widen the private credential destination allowlist. */
+export async function boundedPublicRequest<T>(url: string, signal: AbortSignal | undefined, read: (response: Response) => Promise<T>, timeoutMs = 15_000): Promise<T> {
+  const target = privateDestination(url);
+  if (!target || target.search || !/^\/api\/public\/guides\/[A-Za-z0-9_-]{32}(?:\/assets\/[a-f0-9-]{36}\/step-[1-9][0-9]{0,2}\/(?:frame|thumbnail))?$/.test(target.pathname))
+    throw new ProcessorClientError("공개 서버 주소를 확인할 수 없어요.", undefined, "PUBLIC_DESTINATION_BLOCKED");
+  return requestWithDeadline(target.href, { method: "GET", signal }, read, timeoutMs);
+}
+
+async function requestWithDeadline<T>(destination: string, options: RequestInit, read: (response: Response) => Promise<T>, timeoutMs: number): Promise<T> {
   options.signal?.throwIfAborted();
   const abort = new AbortController();
   const cancel = () => abort.abort();

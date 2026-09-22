@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
@@ -36,16 +37,26 @@ import { createFixedSyntheticAnalysisRuntime, attachFixedSyntheticAnalysisRuntim
 import { bindAnalysisActivation } from "../src/processor/repository.js";
 import { runAnalysisOperationsAdmin } from "../src/processor/analysis-operations-admin.js";
 import { createAnalysisLifecycle } from "../src/processor/analysis-lifecycle.js";
-import { ReplitObjectStorage } from "../src/processor/storage.js";
+import { LocalStorage, ReplitObjectStorage } from "../src/processor/storage.js";
 import { type SyntheticInputGrant } from "../src/processor/analysis-synthetic-input.js";
 import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
-import { attemptFrameObjectKey } from "../src/processor/asset-lifecycle.js";
+import { attemptFrameObjectKey, DELETION_PENDING, finalizeGuideDeletion } from "../src/processor/asset-lifecycle.js";
 import { testMediaPaths } from "../tests/helpers/media-binaries.js";
 import { Readable } from "node:stream";
 import { privacyAfterEdit, privacyReviewState } from "../src/processor/privacy-review.js";
 import type { PrivacyCommand } from "../src/processor/privacy-review-schema.js";
 import { reviewedAssetFixture } from "../tests/helpers/privacy-assets-fixture.js";
-import { privacyAssetKeys } from "../src/processor/privacy-assets.js";
+import { privacyAssetDigest, privacyAssetKeys } from "../src/processor/privacy-assets.js";
+import { PUBLICATION_LEASE_MS, type PublicationRequest } from "../src/processor/publication-jobs.js";
+import { publicationPreparationFixture } from "../tests/helpers/publication-preparation-fixture.js";
+import { preparePublicationAssets, cleanupPublicationPreparation } from "../src/processor/publication-preparation.js";
+import { privateAssetWriterBusy } from "../src/processor/privacy-asset-session.js";
+import { PublicationRecoveryWorker } from "../src/processor/publication-recovery.js";
+import { PUBLICATION_LIFETIME_MS } from "../src/processor/publication-commit.js";
+import request from "supertest";
+import { createProcessorApp } from "../src/processor/server.js";
+import { DurablePublicationRuntime } from "../src/processor/publication-runtime.js";
+import { cleanupExpiredPrivateMedia, PRIVATE_MEDIA_EXPIRED, PRIVATE_RETENTION_MS } from "../src/processor/private-retention.js";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -84,9 +95,9 @@ async function fixture(t: TestContext, migrate = true) {
   if (migrate) await runDatabaseMigrations(connection.toString());
   const repository = PostgresGuideRepository.fromPool(pool);
   const now = () => new Date();
-  async function seed(id = "guide", frames = 2, canonicalKeys = false) {
-    await repository.createGuide({ id, slug: id, editToken: "synthetic-test-token", title: "synthetic guide", status: "queued",
-      originalObjectKey: `fixture/${id}/source.mp4`, sourceFilename: "fictional.mp4", sourceMimeType: "video/mp4", sourceSizeBytes: 1 });
+  async function seed(id = "guide", frames = 2, canonicalKeys = false, editToken = "synthetic-test-token") {
+    await repository.createGuide({ id, slug: id, editToken, title: "synthetic guide", status: "queued",
+      originalObjectKey: canonicalKeys ? `guides/${id}/source.mp4` : `fixture/${id}/source.mp4`, sourceFilename: "fictional.mp4", sourceMimeType: "video/mp4", sourceSizeBytes: 1 });
     await repository.claimProcessingAttempt(id, `media-${id}`); await repository.updateStatus(id, "extracting");
     const guide = await repository.completeProcessingAttempt(id, { attemptId: `media-${id}`, attemptCount: 1,
       steps: Array.from({ length: frames }, (_, i) => ({ id: `${id}-step-${i}`, position: i, shortLabel: "fixture", instruction: "fixture",
@@ -125,6 +136,633 @@ async function waitForFixtureLocks(pool: Pool, count: number) {
   }
   assert.fail(`Expected ${count} real PostgreSQL fixture lock waiters`);
 }
+
+async function publicationFixture(t: TestContext) {
+  const h = await fixture(t), { guide } = await h.seed("publication-guide", 1, true);
+  const reviewed = await reviewedAssetFixture(h.repository, guide);
+  const command: PublicationRequest = { type: "request", id: randomUUID(), expectedDraftRevision: reviewed.request.revision,
+    expectedInputFingerprint: reviewed.request.inputFingerprint, expectedReviewFingerprint: reviewed.request.reviewFingerprint,
+    originalSharingEnabled: false };
+  const execute = (c: Parameters<typeof h.repository.executePublicationCommand>[1], now?: Date) => h.repository.executePublicationCommand(guide.id, c, now);
+  return { ...h, ...reviewed, guide, command, execute };
+}
+
+async function preparationFixture(t: TestContext, id = "prepared-guide", editToken = "synthetic-test-token") {
+  const h = await fixture(t), { guide } = await h.seed(id, 1, true, editToken);
+  const root = await mkdtemp(join(tmpdir(), "showme-publication-pg-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return { ...h, guide, ...await publicationPreparationFixture(h.repository, guide, root) };
+}
+
+const commitOwner = (job: Awaited<ReturnType<typeof preparePublicationAssets>>) => ({
+  id: job.id, leaseId: job.leaseId!, expectedVersion: job.version,
+});
+
+test("real PostgreSQL: owner publication HTTP and public PNG authority survive reconnect and revoke before physical deletion", async t => {
+  const token = "a".repeat(43), h = await preparationFixture(t, randomUUID(), token), auth = `Bearer ${token}`, url = `/api/guides/${h.guide.id}`;
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  const app = createProcessorApp({ config: loadConfig({ NODE_ENV: "test", SHOWME_STORAGE: "local", DATA_DIR: h.storage.root }),
+    repository: reopened, storage: h.storage, pipeline: { async process() { assert.fail(); }, async processClaimed() { assert.fail(); } } });
+  const before = await reopened.getGuideById(h.guide.id);
+  await request(app).get(`${url}/publications`).expect(404);
+  const queued = await request(app).get(`${url}/publications/${h.job.id}`).set("Authorization", auth).expect(200);
+  assert.equal(queued.body.publication.pendingJobId, h.job.id); assert.equal(queued.body.publication.publicPath, null);
+  assert.deepEqual(await reopened.getGuideById(h.guide.id), before);
+  await request(app).post(`${url}/publish`).set("Authorization", auth).send({ publicationId: h.job.id, baseDraftRevision: h.request.revision,
+    inputFingerprint: h.request.inputFingerprint, reviewFingerprint: h.request.reviewFingerprint, publicSharing: true, originalSharingEnabled: false }).expect(202);
+  const ready = await preparePublicationAssets(h.options), p = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  const owner = await request(app).get(`${url}/publications`).set("Authorization", auth).expect(200);
+  assert.equal(owner.body.publication.headVersion, 1); assert.equal(owner.body.publication.publicPath, `/g/${p.head.publicSlug}`);
+  const publicUrl = `/api/public/guides/${p.head.publicSlug}`, view = await request(app).get(publicUrl).expect(200);
+  assert.ok(!view.text.includes(h.guide.id)); assert.ok(!view.text.includes(h.guide.originalObjectKey));
+  const image = view.body.guide.steps[0].frameUrl;
+  await request(app).get(image).expect(200).expect("Content-Type", /image\/png/).expect("Cache-Control", "no-store");
+  await request(app).post(`${url}/unpublish`).set("Authorization", auth).send({ expectedHeadVersion: 1, expectedJobId: null }).expect(200);
+  await request(app).get(publicUrl).expect(404); await request(app).get(image).expect(404);
+  const retained = await h.storage.openRead(p.publication.images[0].frame.key); retained.destroy();
+  assert.equal((await reopened.getPublicationOwnerStatus(h.guide.id))!.active, false);
+  assert.deepEqual(await reopened.getGuideById(h.guide.id), before);
+});
+async function nextPreparedPublication(h: Awaited<ReturnType<typeof preparationFixture>>) {
+  const job = (await h.repository.executePublicationCommand(h.guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: h.request.revision, expectedInputFingerprint: h.request.inputFingerprint,
+    expectedReviewFingerprint: h.request.reviewFingerprint, originalSharingEnabled: false }))!;
+  return preparePublicationAssets({ ...h.options, jobId: job.id, expectedVersion: job.version, render: h.fastRender });
+}
+
+test("real PostgreSQL: restarted publication executors discover queued work and commit one actual processed snapshot", async t => {
+  const h = await preparationFixture(t, randomUUID(), "a".repeat(43)), before = await h.repository.getGuideById(h.guide.id);
+  const config = { ...loadConfig({ NODE_ENV: "test", SHOWME_STORAGE: "local", DATA_DIR: h.options.workDir }), ...testMediaPaths() };
+  const reopened = PostgresGuideRepository.fromPool(h.pool), make = () => new DurablePublicationRuntime({ repository: reopened, storage: h.storage, config });
+  const first = await reopened.listPublicationRecovery({ kind: "queued", limit: 1 });
+  assert.deepEqual(first, [{ guideId: h.guide.id, id: h.job.id, version: 1, batchId: h.job.batchId }]);
+  assert.deepEqual(await reopened.listPublicationRecovery({ kind: "queued", after: first[0].batchId }), []);
+  const a = make(), b = make(), put = t.mock.method(h.storage, "putFile", h.storage.putFile.bind(h.storage));
+  await Promise.all([a.tick(), b.tick()]);
+  const state = (await PostgresGuideRepository.fromPool(h.pool).getPublicationState(h.guide.id))!;
+  assert.equal(state.publications.length, 1); assert.equal(state.head!.version, 1); assert.equal(put.mock.callCount(), 2);
+  assert.ok(await reopened.getAccessiblePublication({ slug: state.head!.publicSlug }));
+  assert.deepEqual(await reopened.listPublicationRecovery({ kind: "queued" }), []);
+  assert.deepEqual(await reopened.getGuideById(h.guide.id), before);
+  assert.deepEqual(await a.stop(), { pendingIO: false }); await b.stop();
+});
+
+test("real PostgreSQL: executor commit failure rolls back the replacement, retains the current link and cleans failed output", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  const first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  const job = (await h.repository.executePublicationCommand(h.guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: h.request.revision, expectedInputFingerprint: h.request.inputFingerprint,
+    expectedReviewFingerprint: h.request.reviewFingerprint, originalSharingEnabled: false }))!;
+  await h.pool.query("CREATE FUNCTION reject_publication_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic commit failure'; END $$");
+  await h.pool.query("CREATE TRIGGER reject_publication_insert BEFORE INSERT ON guide_publications FOR EACH ROW EXECUTE FUNCTION reject_publication_insert()");
+  const runtime = new DurablePublicationRuntime({ repository: PostgresGuideRepository.fromPool(h.pool), storage: h.storage,
+    config: { ...loadConfig({ NODE_ENV: "test", SHOWME_STORAGE: "local", DATA_DIR: h.options.workDir }), ...testMediaPaths() } }, { render: h.fastRender });
+  assert.equal((await runtime.tick()).published, 0);
+  assert.deepEqual((await h.repository.getPublicationState(h.guide.id))!.head, first.head);
+  assert.equal((await h.repository.getPublicationJob(h.guide.id, job.id))!.status, "failed");
+  assert.ok(await h.repository.getAccessiblePublication({ slug: first.head.publicSlug }));
+  assert.deepEqual((await h.repository.listPrivacyAssetBatches(h.guide.id)).map(a => a.id), [first.publication.batchId]);
+  await runtime.stop();
+});
+
+async function retainedFixture(t: TestContext) {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  const published = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  const guide = (await h.repository.getGuideById(h.guide.id))!;
+  const command = { expectedUpdatedAt: guide.updatedAt, updatedBefore: guide.updatedAt };
+  const at = new Date(Date.parse(guide.updatedAt) + PRIVATE_RETENTION_MS);
+  const expire = () => h.repository.expirePrivateDraft(guide.id, command, at);
+  return { ...h, guide, ready, published, command, at, expire };
+}
+
+test("real PostgreSQL: private expiry preserves the fifteen-day snapshot, purges private analysis, and retries raw cleanup after reconnect", async t => {
+  const h = await retainedFixture(t);
+  assert.ok(await h.repository.reserveAnalysisRequest(h.guide.id, { type: "request", runId: "private-run",
+    baseDraftRevision: h.state.draft!.revision, consentVersion: ANALYSIS_CONSENT_VERSION, provider: "gemini", model: GEMINI_TEST_MODEL,
+    promptVersion: GEMINI_PROMPT_VERSION, expectedInputFingerprint: h.manifest.fingerprint }, policy));
+  const beforeAccounting = await h.rows("analysis_budget_windows");
+  const expired = (await h.expire())!; assert.equal(expired.errorCode, PRIVATE_MEDIA_EXPIRED); assert.equal(expired.updatedAt, h.guide.updatedAt);
+  assert.deepEqual((await h.repository.getGuideById(h.guide.id))!.steps, []);
+  const state = (await h.repository.getAnalysisState(h.guide.id))!; assert.equal(state.draft, null); assert.deepEqual(state.runs, []);
+  assert.equal((await h.rows("analysis_reservations"))[0].details, null);
+  assert.deepEqual(await h.rows("analysis_budget_windows"), beforeAccounting);
+  const row = (await h.repository.getPrivateCleanup(h.guide.id))!; assert.ok(row.keys.includes(h.guide.originalObjectKey));
+  await assert.rejects(h.pool.query("DELETE FROM guides WHERE id=$1", [h.guide.id]), (e: unknown) => (e as { code: string }).code === "23503");
+  t.mock.method(h.storage, "delete", async () => { throw new Error("synthetic delete failure"); });
+  await assert.rejects(cleanupExpiredPrivateMedia(h.repository, h.storage, h.guide.id)); t.mock.restoreAll();
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.deepEqual(await reopened.getPrivateCleanup(h.guide.id), row);
+  assert.equal(await reopened.completePrivateCleanup(h.guide.id, randomUUID()), false);
+  assert.equal(await cleanupExpiredPrivateMedia(reopened, h.storage, h.guide.id), true);
+  assert.equal(await reopened.getPrivateCleanup(h.guide.id), null);
+  await assert.rejects(h.storage.openRead(h.guide.steps[0].representativeFrameKey!));
+  const stream = await h.storage.openRead(h.published.publication.images[0].frame.key); stream.destroy();
+  assert.ok(await reopened.getAccessiblePublication({ slug: h.published.head.publicSlug }, h.at));
+  const expiry = new Date(h.published.head.expiresAt);
+  assert.equal(await reopened.getAccessiblePublication({ slug: h.published.head.publicSlug }, expiry), null);
+  assert.deepEqual(await reopened.listExpiredRetainedGuides(1, h.at), []);
+  assert.equal((await reopened.listExpiredRetainedGuides(1, expiry)).length, 1);
+  assert.ok(await reopened.expirePrivateDraft(h.guide.id, h.command, expiry));
+  assert.equal(await finalizeGuideDeletion(reopened, h.storage, h.guide.id, 1), true);
+  assert.equal(await reopened.getGuideById(h.guide.id), null);
+});
+
+test("real PostgreSQL: every private expiry write is acknowledged or the complete transaction rolls back", async t => {
+  const h = await retainedFixture(t), pending = await nextPreparedPublication(h);
+  assert.ok(await h.repository.reserveAnalysisRequest(h.guide.id, { type: "request", runId: "private-run",
+    baseDraftRevision: h.state.draft!.revision, consentVersion: ANALYSIS_CONSENT_VERSION, provider: "gemini", model: GEMINI_TEST_MODEL,
+    promptVersion: GEMINI_PROMPT_VERSION, expectedInputFingerprint: h.manifest.fingerprint }, policy));
+  const tables = ["guides", "guide_steps", "guide_drafts", "analysis_runs", "analysis_reservations", "publication_jobs", "guide_assets", "private_media_cleanup"];
+  const snapshot = async () => Promise.all(tables.map(async name => (await h.pool.query(`SELECT to_jsonb(t) AS value FROM "${name}" t ORDER BY to_jsonb(t)::text`)).rows));
+  const before = await snapshot();
+  for (const mode of ["exception", "skip"] as const) {
+    await h.pool.query(`CREATE FUNCTION reject_private_expiry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${mode === "exception" ? "RAISE EXCEPTION 'synthetic failure';" : "RETURN NULL;"} END $$`);
+    for (const table of tables) {
+      const event = table === "private_media_cleanup" ? "INSERT" : ["guide_steps", "guide_drafts", "analysis_runs"].includes(table) ? "DELETE" : "UPDATE";
+      await h.pool.query(`CREATE TRIGGER reject_private_expiry BEFORE ${event} ON "${table}" FOR EACH ROW EXECUTE FUNCTION reject_private_expiry()`);
+      await assert.rejects(h.expire(), table); assert.deepEqual(await snapshot(), before, table);
+      await h.pool.query(`DROP TRIGGER reject_private_expiry ON "${table}"`);
+    }
+    await h.pool.query("DROP FUNCTION reject_private_expiry()");
+  }
+  assert.ok(await h.expire());
+  const cancelled = (await h.repository.getPublicationJob(h.guide.id, pending.id))!;
+  assert.equal(cancelled.status, "cancelled"); assert.notDeepEqual(cancelled.content, pending.content);
+  assert.equal(await h.repository.commitPublication(h.guide.id, commitOwner(pending), h.at), null);
+  assert.equal(await cleanupExpiredPrivateMedia(h.repository, h.storage, h.guide.id), true);
+  assert.deepEqual((await h.repository.listPrivacyAssetBatches(h.guide.id)).map(b => b.id), [h.ready.batchId]);
+});
+
+for (const first of ["save", "expiry"] as const)
+test(`real PostgreSQL: ${first} obtains the private/public retention parent lock first`, async t => {
+  const h = await retainedFixture(t), blocker = await h.pool.connect();
+  await blocker.query("BEGIN"); await blocker.query("SELECT id FROM guides WHERE id=$1 FOR UPDATE", [h.guide.id]);
+  const document = { ...h.state.draft!.document, title: "fresh synthetic private title" };
+  document.privacy = privacyAfterEdit(h.state.draft!.document, document);
+  const save = () => h.repository.executeAnalysisCommand(h.guide.id, { type: "save-editor-draft", expectedRevision: h.state.draft!.revision,
+    expectedInputFingerprint: h.manifest.fingerprint, document });
+  let earlier: ReturnType<typeof save> | ReturnType<typeof h.expire>, later: typeof earlier;
+  try {
+    earlier = first === "save" ? save() : h.expire(); await waitForFixtureLocks(h.pool, 1);
+    later = first === "save" ? h.expire() : save(); await waitForFixtureLocks(h.pool, 2);
+  } finally { await blocker.query("COMMIT"); blocker.release(); }
+  assert.ok(await earlier!); assert.equal(await later!, null);
+  assert.equal((await h.repository.getGuideById(h.guide.id))!.status, first === "save" ? "ready" : "failed");
+  assert.ok(await h.repository.getAccessiblePublication({ slug: h.published.head.publicSlug }, h.at));
+});
+
+test("real PostgreSQL: unknown replacement writers retain evidence but cannot block withdrawal after private expiry", async t => {
+  const h = await retainedFixture(t), job = (await h.repository.executePublicationCommand(h.guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: h.request.revision, expectedInputFingerprint: h.request.inputFingerprint,
+    expectedReviewFingerprint: h.request.reviewFingerprint, originalSharingEnabled: false }))!;
+  const leaseId = randomUUID(); await h.repository.executePublicationCommand(h.guide.id, { type: "claim", id: job.id, expectedVersion: 1, leaseId });
+  await h.expire(); assert.equal(await cleanupExpiredPrivateMedia(h.repository, h.storage, h.guide.id), false);
+  const batch = (await h.repository.listPrivacyAssetBatches(h.guide.id)).find(b => b.id === job.batchId)!;
+  assert.equal(batch.writerSettled, false);
+  assert.equal(await h.repository.updateStatus(h.guide.id, "ready", { errorCode: null }), null);
+  assert.equal(await h.repository.claimProcessingAttempt(h.guide.id, "late", { expectedStatuses: ["failed"] }), null);
+  await assert.rejects(h.repository.replaceSteps(h.guide.id, h.guide.steps));
+  assert.equal(await h.repository.executeAnalysisCommand(h.guide.id, { type: "initialize" }), null);
+  assert.ok(await h.repository.stopPublication(h.guide.id, { type: "withdraw", expectedHeadVersion: 1, expectedJobId: null }, h.at));
+  assert.equal(await h.repository.getAccessiblePublication({ slug: h.published.head.publicSlug }, h.at), null);
+  assert.ok(await h.repository.expirePrivateDraft(h.guide.id, h.command, h.at));
+  assert.equal(await finalizeGuideDeletion(h.repository, h.storage, h.guide.id, 1), false);
+  assert.ok(await h.repository.executePrivacyAssetCommand(h.guide.id, { type: "settle", id: batch.id, writerId: leaseId, receipts: null }));
+  assert.equal(await finalizeGuideDeletion(h.repository, h.storage, h.guide.id, 1), true);
+});
+
+test("real PostgreSQL: real image preparation commits immutable snapshots with a protected active head and fixed lifetime", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets(h.options);
+  const first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.equal(first.active, true); assert.equal(first.replayed, false);
+  assert.equal(Date.parse(first.head.expiresAt) - Date.parse(first.head.firstPublishedAt), PUBLICATION_LIFETIME_MS);
+  assert.notEqual(first.head.publicSlug, h.guide.slug);
+  assert.deepEqual(await reopened.getPublicationState(h.guide.id), { head: first.head, publications: [first.publication] });
+  assert.equal(await reopened.executePrivacyAssetCommand(h.guide.id, { type: "cancel", id: ready.batchId }), null);
+  await assert.rejects(h.pool.query("UPDATE guide_publications SET payload=payload WHERE guide_id=$1", [h.guide.id]), /immutable/);
+  await assert.rejects(h.pool.query("UPDATE publication_heads SET first_published_at=first_published_at+interval '1 hour', expires_at=expires_at+interval '1 hour' WHERE guide_id=$1", [h.guide.id]), /immutable/);
+  await assert.rejects(h.pool.query("UPDATE publication_heads SET active_publication_id=$2 WHERE guide_id=$1", [h.guide.id, randomUUID()]),
+    (e: unknown) => (e as { code: string }).code === "23503");
+  const next = await nextPreparedPublication(h), second = (await reopened.commitPublication(h.guide.id, commitOwner(next)))!;
+  assert.equal(second.head.publicSlug, first.head.publicSlug); assert.equal(second.head.expiresAt, first.head.expiresAt);
+  assert.equal((await reopened.getPublicationState(h.guide.id))!.publications.length, 2);
+  const worker = new PublicationRecoveryWorker({ repository: reopened, storage: h.storage });
+  assert.equal((await worker.tick()).cleaned, 1);
+  assert.deepEqual((await reopened.listPrivacyAssetBatches(h.guide.id)).map(a => a.id), [next.batchId]);
+  assert.deepEqual(await reopened.getAnalysisState(h.guide.id), h.state);
+  const replay = (await reopened.commitPublication(h.guide.id, commitOwner(ready)))!;
+  assert.equal(replay.replayed, true); assert.equal(replay.active, false); assert.deepEqual(replay.publication, first.publication);
+});
+
+test("real PostgreSQL: exceptions or skipped writes at every commit boundary preserve the entire old publication", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  await h.repository.commitPublication(h.guide.id, commitOwner(ready));
+  const next = await nextPreparedPublication(h), before = await h.repository.getPublicationState(h.guide.id);
+  const assets = await h.repository.listPrivacyAssetBatches(h.guide.id);
+  await h.pool.query("CREATE FUNCTION reject_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$");
+  await h.pool.query("CREATE FUNCTION skip_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
+  for (const action of ["reject_commit", "skip_commit"]) for (const [table, event] of [
+    ["guide_assets", "UPDATE"], ["guide_publications", "INSERT"], ["publication_jobs", "UPDATE"], ["publication_heads", "UPDATE"],
+  ]) {
+    await h.pool.query(`CREATE TRIGGER guard_commit BEFORE ${event} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${action}()`);
+    await assert.rejects(h.repository.commitPublication(h.guide.id, commitOwner(next)));
+    assert.deepEqual(await PostgresGuideRepository.fromPool(h.pool).getPublicationState(h.guide.id), before);
+    const after = await h.repository.listPrivacyAssetBatches(h.guide.id);
+    assert.deepEqual(after.sort((a, b) => a.id.localeCompare(b.id)), [...assets].sort((a, b) => a.id.localeCompare(b.id)));
+    assert.deepEqual(await h.repository.getPublicationJob(h.guide.id, next.id), next);
+    await h.pool.query(`DROP TRIGGER guard_commit ON ${table}`);
+  }
+  assert.equal((await h.repository.commitPublication(h.guide.id, commitOwner(next)))!.active, true);
+});
+
+test("real PostgreSQL: concurrent commits acknowledge one snapshot and take the first-publication clock after lock wait", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  const blocker = await h.pool.connect();
+  let first;
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM guides WHERE id=$1 FOR UPDATE", [h.guide.id]);
+    const pending = h.repository.commitPublication(h.guide.id, commitOwner(ready));
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    await waitForFixtureLocks(h.pool, 1);
+    const releasedAt = (await blocker.query("SELECT clock_timestamp() AS at")).rows[0].at as Date;
+    await blocker.query("COMMIT"); const result = await outcome; if ("error" in result) throw result.error;
+    first = result.value; assert.ok(first); assert.ok(Date.parse(first.head.firstPublishedAt) >= releasedAt.getTime());
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); }
+  const results = await Promise.all(Array.from({ length: 12 }, () => PostgresGuideRepository.fromPool(h.pool).commitPublication(h.guide.id, commitOwner(ready))));
+  assert.ok(results.every(r => r?.replayed && r.head.version === 1 && r.publication.id === first!.publication.id));
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM guide_publications")).rows[0].n, 1);
+});
+
+test("real PostgreSQL: whole deletion fences a prepared replacement and cascades head/history only after image cleanup", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  await h.repository.commitPublication(h.guide.id, commitOwner(ready)); const next = await nextPreparedPublication(h);
+  assert.equal(await h.repository.deleteGuide(h.guide.id), false);
+  await h.repository.updateStatus(h.guide.id, "failed", { errorCode: DELETION_PENDING });
+  assert.equal(await h.repository.commitPublication(h.guide.id, commitOwner(next)), null);
+  assert.equal(await finalizeGuideDeletion(h.repository, h.storage, h.guide.id, 1), true);
+  assert.equal(await h.repository.getPublicationState(h.guide.id), null);
+  assert.equal(await h.repository.commitPublication(h.guide.id, commitOwner(ready)), null);
+  for (const table of ["publication_heads", "guide_publications", "publication_jobs"])
+    assert.equal((await h.pool.query(`SELECT count(*)::int AS n FROM ${table}`)).rows[0].n, 0);
+});
+
+test("real PostgreSQL: withdrawal persists before cleanup and a fresh republish never extends or revives old image authority", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets(h.options);
+  const first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  const query = { slug: first.head.publicSlug, publicationId: first.publication.id };
+  const stop = { type: "withdraw" as const, expectedHeadVersion: 1, expectedJobId: null };
+  assert.ok(await h.repository.getAccessiblePublication(query));
+  assert.equal((await h.repository.stopPublication(h.guide.id, stop))!.head!.activePublicationId, null);
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.equal(await reopened.getAccessiblePublication(query), null);
+  const image = await h.storage.openRead(first.publication.images[0].frame.key); image.destroy();
+  assert.equal((await new PublicationRecoveryWorker({ repository: reopened, storage: h.storage }).tick()).cleaned, 1);
+  await assert.rejects(h.storage.openRead(first.publication.images[0].frame.key));
+  const next = await nextPreparedPublication(h), second = (await reopened.commitPublication(h.guide.id, commitOwner(next)))!;
+  assert.equal(second.head.expiresAt, first.head.expiresAt); assert.equal(second.head.publicSlug, first.head.publicSlug);
+  assert.equal(await reopened.stopPublication(h.guide.id, stop), null);
+  assert.equal(await reopened.getAccessiblePublication(query), null);
+  assert.ok(await reopened.getAccessiblePublication({ slug: query.slug, publicationId: next.id }));
+  assert.equal((await reopened.commitPublication(h.guide.id, commitOwner(ready)))!.active, false);
+  assert.deepEqual(await reopened.getAnalysisState(h.guide.id), h.state);
+});
+
+test("real PostgreSQL: all withdrawal writes roll back together on exceptions and silently skipped updates", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  await h.repository.commitPublication(h.guide.id, commitOwner(ready)); const next = await nextPreparedPublication(h);
+  const command = { type: "withdraw" as const, expectedHeadVersion: 1, expectedJobId: next.id };
+  const before = await h.repository.getPublicationState(h.guide.id), assets = await h.repository.listPrivacyAssetBatches(h.guide.id);
+  await h.pool.query("CREATE FUNCTION reject_stop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$");
+  await h.pool.query("CREATE FUNCTION skip_stop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
+  for (const action of ["reject_stop", "skip_stop"]) for (const table of ["publication_heads", "publication_jobs", "guide_assets"]) {
+    await h.pool.query(`CREATE TRIGGER guard_stop BEFORE UPDATE ON ${table} FOR EACH ROW EXECUTE FUNCTION ${action}()`);
+    await assert.rejects(h.repository.stopPublication(h.guide.id, command));
+    assert.deepEqual(await PostgresGuideRepository.fromPool(h.pool).getPublicationState(h.guide.id), before);
+    assert.deepEqual(await h.repository.getPublicationJob(h.guide.id, next.id), next);
+    assert.deepEqual((await h.repository.listPrivacyAssetBatches(h.guide.id)).sort((a, b) => a.id.localeCompare(b.id)),
+      [...assets].sort((a, b) => a.id.localeCompare(b.id)));
+    await h.pool.query(`DROP TRIGGER guard_stop ON ${table}`);
+  }
+  assert.equal((await h.repository.stopPublication(h.guide.id, command))!.changed, true);
+});
+
+test("real PostgreSQL: withdrawal wins its lock race against a late commit and a pre-lock image lookup", async t => {
+  const h = await preparationFixture(t), ready = await preparePublicationAssets({ ...h.options, render: h.fastRender });
+  const first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!, next = await nextPreparedPublication(h);
+  const blocker = await h.pool.connect(), pending: Promise<unknown>[] = [];
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM guides WHERE id=$1 FOR UPDATE", [h.guide.id]);
+    const stopped = h.repository.stopPublication(h.guide.id, { type: "withdraw", expectedHeadVersion: 1, expectedJobId: next.id }); pending.push(stopped);
+    await waitForFixtureLocks(h.pool, 1);
+    const read = PostgresGuideRepository.fromPool(h.pool).getAccessiblePublication({ slug: first.head.publicSlug }); pending.push(read);
+    await waitForFixtureLocks(h.pool, 2);
+    const commit = PostgresGuideRepository.fromPool(h.pool).commitPublication(h.guide.id, commitOwner(next)); pending.push(commit);
+    await waitForFixtureLocks(h.pool, 3); await blocker.query("COMMIT");
+    assert.equal((await stopped)!.changed, true); assert.equal(await read, null); assert.equal(await commit, null);
+    assert.equal((await h.repository.getPublicationJob(h.guide.id, next.id))!.status, "cancelled");
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); await Promise.allSettled(pending); }
+});
+
+test("real PostgreSQL: first-publication withdrawal fences work and expiry of a withdrawn head finds pending work without settling the writer", async t => {
+  const h = await preparationFixture(t), original = h.job;
+  const command = { type: "withdraw" as const, expectedHeadVersion: 0, expectedJobId: original.id };
+  assert.equal((await h.repository.stopPublication(h.guide.id, command))!.head, null);
+  assert.equal((await h.repository.stopPublication(h.guide.id, command))!.changed, false);
+  const ready = await nextPreparedPublication(h), first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready)))!;
+  assert.equal(await h.repository.stopPublication(h.guide.id, command), null);
+  await h.repository.stopPublication(h.guide.id, { type: "withdraw", expectedHeadVersion: 1, expectedJobId: null });
+  await new PublicationRecoveryWorker({ repository: h.repository, storage: h.storage }).tick();
+  const at = new Date(Date.parse(first.head.expiresAt) - 1);
+  const job = (await h.repository.executePublicationCommand(h.guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: h.request.revision, expectedInputFingerprint: h.request.inputFingerprint,
+    expectedReviewFingerprint: h.request.reviewFingerprint, originalSharingEnabled: false }, at))!;
+  await h.repository.executePublicationCommand(h.guide.id, { type: "claim", id: job.id, expectedVersion: 1, leaseId: randomUUID() }, at);
+  const expiry = new Date(first.head.expiresAt), page = await h.repository.listExpiredPublications({ limit: 1 }, expiry);
+  assert.equal(page.length, 1);
+  assert.deepEqual(await h.repository.listExpiredPublications({ after: { expiresAt: page[0].expiresAt, publicSlug: page[0].publicSlug } }, expiry), []);
+  const result = await new PublicationRecoveryWorker({ repository: h.repository, storage: h.storage, clock: () => expiry }).tick();
+  assert.equal(result.publicationsExpired, 1); assert.equal(result.pending, 1);
+  assert.equal((await h.repository.listPrivacyAssetBatches(h.guide.id))[0].writerSettled, false);
+  assert.equal(await h.repository.getAccessiblePublication({ slug: first.head.publicSlug }, expiry), null);
+});
+
+test("real PostgreSQL: publication access takes a fresh clock after waiting past the expiry boundary", async t => {
+  const h = await preparationFixture(t);
+  await h.repository.executePublicationCommand(h.guide.id, { type: "cancel", id: h.job.id });
+  // Metadata-only clock fixture: actual PNG storage is exercised in other tests.
+  const base = new Date(Date.now() - PUBLICATION_LIFETIME_MS + 1000);
+  const job = (await h.repository.executePublicationCommand(h.guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: h.request.revision, expectedInputFingerprint: h.request.inputFingerprint,
+    expectedReviewFingerprint: h.request.reviewFingerprint, originalSharingEnabled: false }, base))!;
+  const running = (await h.repository.executePublicationCommand(h.guide.id, { type: "claim", id: job.id, expectedVersion: 1, leaseId: randomUUID() }, base))!;
+  const batch = (await h.repository.listPrivacyAssetBatches(h.guide.id)).find(a => a.id === job.batchId)!;
+  const ready = (await h.repository.executePublicationCommand(h.guide.id, { type: "complete-assets", ...commitOwner(running),
+    receipts: privacyAssetKeys(batch).map(key => ({ key, sha256: "a".repeat(64), size: 100 })) }, base))!;
+  const first = (await h.repository.commitPublication(h.guide.id, commitOwner(ready), base))!;
+  const blocker = await h.pool.connect(); let pending: Promise<unknown> | undefined;
+  let pendingOwner: ReturnType<typeof h.repository.getPublicationOwnerStatus> | undefined;
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM guides WHERE id=$1 FOR UPDATE", [h.guide.id]);
+    pending = h.repository.getAccessiblePublication({ slug: first.head.publicSlug });
+    pendingOwner = h.repository.getPublicationOwnerStatus(h.guide.id);
+    await waitForFixtureLocks(h.pool, 2);
+    await blocker.query("SELECT pg_sleep(GREATEST(0, extract(epoch from ($1::timestamptz - clock_timestamp()))) + 0.02)", [first.head.expiresAt]);
+    await blocker.query("COMMIT"); assert.equal(await pending, null);
+    const ownerStatus = await pendingOwner;
+    assert.equal(ownerStatus!.expired, true); assert.equal(ownerStatus!.active, false);
+    const result = (await h.repository.stopPublication(h.guide.id, { type: "expire", expectedHeadVersion: 1 }))!;
+    assert.equal(result.changed, true); assert.equal(result.head!.activePublicationId, null);
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); await Promise.allSettled([pending, pendingOwner]); }
+});
+
+test("real PostgreSQL: recovery uses bounded UUID cursors, finds persisted expiry and leaves queued/live/unknown writers intact", async t => {
+  const h = await publicationFixture(t), old = new Date(Date.now() - PUBLICATION_LEASE_MS - 1000);
+  const expired = (await h.execute(h.command, old))!;
+  await h.execute({ type: "claim", id: expired.id, expectedVersion: 1, leaseId: randomUUID() }, old);
+  const jobs = [];
+  for (const id of ["cleanup-a", "cleanup-b", "queued-c", "live-d"]) {
+    const { guide } = await h.seed(id, 1, true), { request } = await reviewedAssetFixture(h.repository, guide);
+    const job = (await h.repository.executePublicationCommand(id, { type: "request", id: randomUUID(),
+      expectedDraftRevision: request.revision, expectedInputFingerprint: request.inputFingerprint,
+      expectedReviewFingerprint: request.reviewFingerprint, originalSharingEnabled: false }))!;
+    jobs.push(job);
+    if (id.startsWith("cleanup")) await h.repository.executePublicationCommand(id, { type: "cancel", id: job.id });
+    if (id.startsWith("live")) await h.repository.executePublicationCommand(id, { type: "claim", id: job.id,
+      expectedVersion: 1, leaseId: randomUUID() });
+  }
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  const due = await reopened.listPublicationRecovery({ kind: "expired", limit: 1 });
+  assert.equal(due.length, 1); assert.equal(due[0].id, expired.id);
+  const a = await reopened.listPublicationRecovery({ kind: "cleanup", limit: 1 });
+  const b = await reopened.listPublicationRecovery({ kind: "cleanup", limit: 1, after: a[0].batchId });
+  assert.equal(a.length, 1); assert.equal(b.length, 1); assert.ok(a[0].batchId < b[0].batchId);
+  assert.deepEqual(await reopened.listPublicationRecovery({ kind: "cleanup", after: b[0].batchId }), []);
+  assert.deepEqual(Object.keys(a[0]).sort(), ["batchId", "guideId", "id", "version"]);
+  const root = await mkdtemp(join(tmpdir(), "showme-recovery-pg-")); t.after(() => rm(root, { recursive: true, force: true }));
+  const worker = new PublicationRecoveryWorker({ repository: reopened, storage: new LocalStorage(root) });
+  const result = await worker.tick(); assert.equal(result.recovered, 1); assert.equal(result.cleaned, 2); assert.equal(result.pending, 1);
+  assert.equal((await reopened.listPrivacyAssetBatches(h.guide.id))[0].writerSettled, false);
+  assert.equal(await reopened.deleteGuide(h.guide.id), false);
+  assert.equal((await reopened.getPublicationJob("queued-c", jobs[2].id))!.status, "queued");
+  assert.equal((await reopened.getPublicationJob("live-d", jobs[3].id))!.phase, "rendering");
+  await assert.rejects(reopened.listPublicationRecovery({ kind: "cleanup", limit: 21 }));
+});
+
+test("real PostgreSQL: silently skipped asset update/delete never reports cleanup complete and survives reconnection for retry", async t => {
+  const h = await preparationFixture(t);
+  await h.repository.executePublicationCommand(h.guide.id, { type: "cancel", id: h.job.id });
+  await h.pool.query("CREATE FUNCTION skip_asset_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
+  const remove = t.mock.method(h.storage, "delete", h.storage.delete.bind(h.storage));
+  for (const operation of ["UPDATE", "DELETE"]) {
+    await h.pool.query(`CREATE TRIGGER skip_asset_cleanup BEFORE ${operation} ON guide_assets FOR EACH ROW EXECUTE FUNCTION skip_asset_cleanup()`);
+    const reopened = PostgresGuideRepository.fromPool(h.pool);
+    const worker = new PublicationRecoveryWorker({ repository: reopened, storage: h.storage });
+    const result = await worker.tick(); assert.equal(result.failed, 1); assert.equal(result.cleaned, 0);
+    assert.equal((await reopened.listPrivacyAssetBatches(h.guide.id)).length, 1);
+    if (operation === "UPDATE") assert.equal(remove.mock.callCount(), 0);
+    assert.equal(await reopened.deleteGuide(h.guide.id), false);
+    await h.pool.query("DROP TRIGGER skip_asset_cleanup ON guide_assets");
+  }
+  const worker = new PublicationRecoveryWorker({ repository: PostgresGuideRepository.fromPool(h.pool), storage: h.storage });
+  assert.equal((await worker.tick()).cleaned, 1);
+  assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guide.id), []);
+  assert.deepEqual(await h.repository.getAnalysisState(h.guide.id), h.state);
+});
+
+test("real PostgreSQL: independent recovery workers converge on exact cancelled output keys and retain the private guide", async t => {
+  const h = await preparationFixture(t); await preparePublicationAssets(h.options);
+  const [batch] = await h.repository.listPrivacyAssetBatches(h.guide.id);
+  await h.repository.executePublicationCommand(h.guide.id, { type: "cancel", id: h.job.id });
+  const workers = Array.from({ length: 2 }, () => new PublicationRecoveryWorker({
+    repository: PostgresGuideRepository.fromPool(h.pool), storage: new LocalStorage(h.storage.root) }));
+  await Promise.all(workers.map(worker => worker.tick()));
+  assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guide.id), []);
+  for (const key of privacyAssetKeys(batch)) await assert.rejects(h.storage.openRead(key));
+  assert.equal((await h.repository.getPublicationJob(h.guide.id, h.job.id))!.status, "cancelled");
+  assert.deepEqual(await h.repository.getAnalysisState(h.guide.id), h.state);
+  const stream = await h.storage.openRead(h.guide.steps[0].representativeFrameKey!); stream.destroy();
+});
+
+test("real PostgreSQL: actual redacted PNG preparation reuses its reservation and persists private receipts across connections", async t => {
+  const h = await preparationFixture(t), before = await h.repository.getGuideById(h.guide.id);
+  const put = t.mock.method(h.storage, "putFile", h.storage.putFile.bind(h.storage));
+  const ready = await preparePublicationAssets(h.options), reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.equal(ready.status, "running"); assert.equal(ready.phase, "assets-ready"); assert.equal(ready.batchId, h.job.batchId);
+  assert.deepEqual(await reopened.getPublicationJob(h.guide.id, h.job.id), ready);
+  const batches = await reopened.listPrivacyAssetBatches(h.guide.id); assert.equal(batches.length, 1);
+  const [batch] = batches; assert.equal(batch.status, "ready"); assert.equal(batch.writerSettled, true);
+  assert.equal(batch.writerId, ready.leaseId); assert.equal(put.mock.callCount(), 2);
+  for (const [i, key] of privacyAssetKeys(batch).entries()) {
+    const chunks: Buffer[] = []; for await (const chunk of await h.storage.openRead(key)) chunks.push(chunk);
+    const png = Buffer.concat(chunks);
+    assert.deepEqual(png.subarray(0, 8), Buffer.from([137,80,78,71,13,10,26,10]));
+    assert.equal(png.length, batch.receipts[i].size); assert.equal(privacyAssetDigest(png), batch.receipts[i].sha256);
+  }
+  assert.deepEqual(await readdir(h.options.workDir), []);
+  assert.deepEqual(await reopened.getGuideById(h.guide.id), before);
+  assert.deepEqual(await reopened.getAnalysisState(h.guide.id), h.state);
+  await assert.rejects(preparePublicationAssets({ ...h.options, repository: reopened }));
+  assert.equal(put.mock.callCount(), 2);
+});
+
+for (const failure of ["throw", "skip"] as const)
+test(`real PostgreSQL: ${failure} on final publication preparation rolls back both ready states and cleans written images`, async t => {
+  const h = await preparationFixture(t);
+  await h.pool.query(`CREATE FUNCTION reject_preparation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.payload->>'phase'='assets-ready' THEN ${failure === "throw" ? "RAISE EXCEPTION 'fixture';" : "RETURN NULL;"} END IF;
+    RETURN NEW; END $$`);
+  await h.pool.query("CREATE TRIGGER reject_preparation BEFORE UPDATE ON publication_jobs FOR EACH ROW EXECUTE FUNCTION reject_preparation()");
+  const execute = h.repository.executePublicationCommand.bind(h.repository);
+  let verifiedRollback = false;
+  t.mock.method(h.repository, "executePublicationCommand", async (...args: Parameters<typeof execute>) => {
+    try { return await execute(...args); }
+    catch (error) {
+      if (args[1].type === "complete-assets") {
+        const reopened = PostgresGuideRepository.fromPool(h.pool);
+        assert.equal((await reopened.getPublicationJob(h.guide.id, h.job.id))!.phase, "rendering");
+        const [asset] = await reopened.listPrivacyAssetBatches(h.guide.id);
+        assert.equal(asset.status, "writing"); assert.equal(asset.writerSettled, false); assert.deepEqual(asset.receipts, []);
+        verifiedRollback = true;
+      }
+      throw error;
+    }
+  });
+  const keys: string[] = [], put = h.storage.putFile.bind(h.storage);
+  t.mock.method(h.storage, "putFile", async (key: string, file: string) => { keys.push(key); await put(key, file); });
+  await assert.rejects(preparePublicationAssets({ ...h.options, render: h.fastRender }), /PRIVACY_ASSET_WRITE_UNAVAILABLE/);
+  assert.equal(verifiedRollback, true); assert.equal(keys.length, 2);
+  assert.equal((await h.repository.getPublicationJob(h.guide.id, h.job.id))!.status, "failed");
+  assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guide.id), []);
+  for (const key of keys) await assert.rejects(h.storage.openRead(key));
+  assert.deepEqual(await h.repository.getAnalysisState(h.guide.id), h.state);
+});
+
+test("real PostgreSQL: cancellation on another connection fences a pending put without falsely finishing cleanup", async t => {
+  const h = await preparationFixture(t), reopened = PostgresGuideRepository.fromPool(h.pool);
+  let begin!: () => void, release!: () => void;
+  const begun = new Promise<void>(r => { begin = r; }), held = new Promise<void>(r => { release = r; });
+  const keys: string[] = [], put = h.storage.putFile.bind(h.storage);
+  t.mock.method(h.storage, "putFile", async (key: string, file: string) => { keys.push(key); begin(); await held; await put(key, file); });
+  const pending = preparePublicationAssets({ ...h.options, render: h.fastRender }), rejected = assert.rejects(pending);
+  try {
+    await begun;
+    await reopened.executePublicationCommand(h.guide.id, { type: "cancel", id: h.job.id });
+    await rejected;
+    const [asset] = await reopened.listPrivacyAssetBatches(h.guide.id);
+    assert.equal(asset.status, "cleanup"); assert.equal(asset.writerSettled, false); assert.equal(privateAssetWriterBusy(), true);
+    assert.equal(await cleanupPublicationPreparation(reopened, h.storage, h.guide.id, h.job.id), false);
+    assert.equal(await reopened.deleteGuide(h.guide.id), false);
+  } finally {
+    release();
+    for (let i = 0; i < 500 && privateAssetWriterBusy(); i++) await delay(10);
+  }
+  assert.equal(privateAssetWriterBusy(), false); assert.equal(keys.length, 1);
+  for (const key of keys) await assert.rejects(h.storage.openRead(key));
+  assert.deepEqual(await reopened.listPrivacyAssetBatches(h.guide.id), []);
+  assert.equal((await reopened.getPublicationJob(h.guide.id, h.job.id))!.status, "cancelled");
+  assert.equal(await reopened.deleteGuide(h.guide.id), true);
+});
+
+test("real PostgreSQL: publication request replay and single writer are durable under independent connections", async t => {
+  const h = await publicationFixture(t);
+  const before = await h.repository.getGuideById(h.guide.id);
+  const replicas = Array.from({ length: 12 }, () => PostgresGuideRepository.fromPool(h.pool));
+  const jobs = await Promise.all(replicas.map(r => r.executePublicationCommand(h.guide.id, h.command)));
+  const job = jobs[0]!;
+  assert.ok(jobs.every(j => j?.batchId === job.batchId));
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM publication_jobs")).rows[0].n, 1);
+  assert.equal((await h.repository.listPrivacyAssetBatches(h.guide.id)).length, 1);
+  const claims = await Promise.all(replicas.map(r => r.executePublicationCommand(h.guide.id,
+    { type: "claim", id: job.id, expectedVersion: job.version, leaseId: randomUUID() })));
+  assert.equal(claims.filter(Boolean).length, 1); const running = claims.find(Boolean)!;
+  assert.equal((await h.repository.listPrivacyAssetBatches(h.guide.id))[0].writerId, running.leaseId);
+  assert.deepEqual(await PostgresGuideRepository.fromPool(h.pool).getPublicationJob(h.guide.id, job.id), running);
+  assert.deepEqual(await h.execute(h.command), running);
+  assert.deepEqual(await h.repository.getGuideById(h.guide.id), before);
+  assert.deepEqual(await h.repository.getAnalysisState(h.guide.id), h.state);
+  await assert.rejects(h.execute({ ...h.command, originalSharingEnabled: true }), /PUBLICATION_CONFLICT/);
+  await assert.rejects(h.execute({ ...h.command, id: randomUUID() }), /PUBLICATION_CAPACITY/);
+  assert.equal(await h.repository.getPublicationJob("other-guide", job.id), null);
+});
+
+test("real PostgreSQL: publication and asset writes roll back together on errors and silently skipped writes", async t => {
+  const h = await publicationFixture(t);
+  await h.pool.query("CREATE FUNCTION reject_publication() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$");
+  await h.pool.query("CREATE TRIGGER reject_publication BEFORE INSERT ON publication_jobs FOR EACH ROW EXECUTE FUNCTION reject_publication()");
+  await assert.rejects(h.execute(h.command));
+  assert.equal(await h.repository.getPublicationJob(h.guide.id, h.command.id), null);
+  assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guide.id), []);
+  await h.pool.query("DROP TRIGGER reject_publication ON publication_jobs");
+  const job = (await h.execute(h.command))!, [reserved] = await h.repository.listPrivacyAssetBatches(h.guide.id);
+  await h.pool.query("CREATE FUNCTION skip_publication_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$");
+  for (const table of ["guide_assets", "publication_jobs"] as const) {
+    await h.pool.query(`CREATE TRIGGER skip_publication_write BEFORE UPDATE ON ${table} FOR EACH ROW EXECUTE FUNCTION skip_publication_write()`);
+    await assert.rejects(h.execute({ type: "claim", id: job.id, expectedVersion: job.version, leaseId: randomUUID() }), /not acknowledged/);
+    assert.deepEqual(await h.repository.getPublicationJob(h.guide.id, job.id), job);
+    assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guide.id), [reserved]);
+    await h.pool.query(`DROP TRIGGER skip_publication_write ON ${table}`);
+  }
+});
+
+test("real PostgreSQL: prepared snapshot is private, edit-fenced and cancellation never releases unknown writes", async t => {
+  const h = await publicationFixture(t), job = (await h.execute(h.command))!;
+  const running = (await h.execute({ type: "claim", id: job.id, expectedVersion: job.version, leaseId: randomUUID() }))!;
+  const [batch] = await h.repository.listPrivacyAssetBatches(h.guide.id);
+  await h.repository.executePrivacyAssetCommand(h.guide.id, { type: "settle", id: batch.id, writerId: running.leaseId!,
+    receipts: privacyAssetKeys(batch).map(key => ({ key, sha256: "a".repeat(64), size: 100 })) });
+  const prepared = (await h.execute({ type: "assets-ready", id: job.id, expectedVersion: running.version, leaseId: running.leaseId! }))!;
+  assert.equal(prepared.phase, "assets-ready"); assert.equal(prepared.status, "running");
+  const document = structuredClone(h.state.draft!.document); document.title = "new private title";
+  document.privacy = privacyAfterEdit(h.state.draft!.document, document);
+  await h.repository.executeAnalysisCommand(h.guide.id, { type: "save-editor-draft", expectedRevision: h.request.revision,
+    expectedInputFingerprint: h.request.inputFingerprint, document });
+  const failed = (await h.execute({ type: "assets-ready", id: job.id, expectedVersion: prepared.version, leaseId: running.leaseId! }))!;
+  assert.equal(failed.errorCode, "INPUT_CHANGED"); assert.equal(failed.content.title, job.content.title);
+  assert.equal((await h.repository.listPrivacyAssetBatches(h.guide.id))[0].status, "cleanup");
+  assert.equal(await h.repository.deleteGuide(h.guide.id), false);
+  const cleaned = (await h.repository.listPrivacyAssetBatches(h.guide.id))[0];
+  await h.repository.executePrivacyAssetCommand(h.guide.id, { type: "cleaned", id: cleaned.id, version: cleaned.version });
+  assert.equal(await h.repository.deleteGuide(h.guide.id), true);
+  assert.equal(await h.repository.getPublicationJob(h.guide.id, job.id), null);
+  assert.equal(await h.execute(h.command), null);
+});
+
+test("real PostgreSQL: expired publication discovery survives restart, cancels without replay and preserves unresolved ownership", async t => {
+  const h = await publicationFixture(t), at = new Date(Date.now() - PUBLICATION_LEASE_MS - 1000);
+  const job = (await h.execute(h.command, at))!;
+  const running = (await h.execute({ type: "claim", id: job.id, expectedVersion: job.version, leaseId: randomUUID() }, at))!;
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  assert.deepEqual(await reopened.listPublicationWork(), [{ guideId: h.guide.id, id: job.id, version: running.version }]);
+  const failed = (await reopened.executePublicationCommand(h.guide.id, { type: "recover", id: job.id, expectedVersion: running.version }))!;
+  assert.equal(failed.errorCode, "LEASE_EXPIRED");
+  const [asset] = await reopened.listPrivacyAssetBatches(h.guide.id);
+  assert.equal(asset.status, "cleanup"); assert.equal(asset.writerSettled, false);
+  assert.equal(await reopened.executePrivacyAssetCommand(h.guide.id, { type: "cleaned", id: asset.id, version: asset.version }), null);
+  assert.equal(await reopened.deleteGuide(h.guide.id), false);
+  assert.deepEqual(await reopened.listPublicationWork(), []);
+  assert.deepEqual(await reopened.executePublicationCommand(h.guide.id, h.command), failed);
+  await assert.rejects(h.pool.query("UPDATE publication_jobs SET status='queued' WHERE guide_id=$1", [h.guide.id]),
+    (e: unknown) => (e as { code: string }).code === "23514");
+});
+
+test("real PostgreSQL: publication lease clock is taken after the parent lock wait", async t => {
+  const h = await publicationFixture(t), job = (await h.execute(h.command))!;
+  const blocker = await h.pool.connect();
+  try {
+    await blocker.query("BEGIN"); await blocker.query("SELECT id FROM guides WHERE id=$1 FOR UPDATE", [h.guide.id]);
+    const pending = h.execute({ type: "claim", id: job.id, expectedVersion: job.version, leaseId: randomUUID() });
+    const outcome = pending.then(value => ({ value }), error => ({ error }));
+    await waitForFixtureLocks(h.pool, 1);
+    const releasedAt = (await blocker.query("SELECT clock_timestamp() AS at")).rows[0].at as Date;
+    await blocker.query("COMMIT");
+    const result = await outcome;
+    if ("error" in result) throw result.error;
+    assert.ok(result.value);
+    assert.ok(Date.parse(result.value.updatedAt) >= releasedAt.getTime());
+    assert.equal(Date.parse(result.value.leaseExpiresAt!) - Date.parse(result.value.updatedAt), PUBLICATION_LEASE_MS);
+  } finally { await blocker.query("ROLLBACK"); blocker.release(); }
+});
 
 test("real PostgreSQL: private asset ownership is bounded, single-writer, persistent and blocks deletion", async t => {
   const h = await fixture(t), { guide } = await h.seed("asset-guide", 1, true);
@@ -891,10 +1529,10 @@ test("real PostgreSQL: twenty simultaneous editor saves commit one revision and 
   }
 });
 
-test("real PostgreSQL: all fourteen migrations apply and replay without resetting the halt or accounting", async (t) => {
+test("real PostgreSQL: all eighteen migrations apply and replay without resetting the halt or accounting", async (t) => {
   const h = await fixture(t);
-  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 14);
-  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0013`);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM drizzle.__drizzle_migrations")).rows[0].n, 18);
+  t.diagnostic(`PostgreSQL ${(await h.pool.query("SHOW server_version")).rows[0].server_version}; migrations 0000–0017`);
   await h.pool.query("UPDATE analysis_accounting_controls SET payload = '{\"halted\":true}'::jsonb WHERE id='global'");
   await runDatabaseMigrations(h.connection);
   assert.equal((await h.repository.getAnalysisAccountingControl()).halted, true);

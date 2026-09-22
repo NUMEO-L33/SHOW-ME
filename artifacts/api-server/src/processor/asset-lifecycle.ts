@@ -11,6 +11,8 @@ const MAX_DURABLE_ATTEMPT_STEPS = 100;
 const STORAGE_DELETE_BATCH_SIZE = 20;
 const DEFAULT_PRIVATE_STORAGE_TIMEOUT_MS = 30_000;
 const inFlightDeletes = new WeakMap<Storage, Map<string, Promise<void>>>();
+/** No keys exposed. A caller timeout is not settlement of the SDK delete. */
+export const privateStorageDeletesPending = (storage: Storage): boolean => Boolean(inFlightDeletes.get(storage)?.size);
 const inFlightMaterializations = new WeakMap<Storage, Set<string>>();
 
 export class PrivateAssetWriteInterruptedError extends Error {
@@ -227,11 +229,13 @@ export async function cleanupStorageKeys(
   keys: readonly string[],
   options: InterruptibleOperationOptions = {},
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   const failures: unknown[] = [];
   const uniqueKeys = [...new Set(keys)];
   const timeoutMs = options.timeoutMs ?? DEFAULT_PRIVATE_STORAGE_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   for (let offset = 0; offset < uniqueKeys.length; offset += STORAGE_DELETE_BATCH_SIZE) {
+    options.signal?.throwIfAborted();
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       failures.push(new PrivateAssetDeleteInterruptedError(`Private asset deletion timed out after ${timeoutMs}ms.`));
@@ -239,6 +243,7 @@ export async function cleanupStorageKeys(
     }
     await Promise.all(uniqueKeys.slice(offset, offset + STORAGE_DELETE_BATCH_SIZE).map(async (key) => {
       try {
+        options.signal?.throwIfAborted();
         await waitForPrivateOperation(
           coalescedStorageDelete(storage, key),
           { signal: options.signal, timeoutMs: remainingMs },
@@ -329,6 +334,8 @@ export async function finalizeGuideDeletion(
   if (options.expectedProcessingAttemptId !== undefined && guide.processingAttemptId !== options.expectedProcessingAttemptId) return false;
   if (options.expectedProcessingAttemptCount !== undefined && guide.processingAttemptCount !== options.expectedProcessingAttemptCount) return false;
 
+  const { cleanupExpiredPrivateMedia } = await import("./private-retention.js");
+  if (!await cleanupExpiredPrivateMedia(repository, storage, guideId, options)) return false;
   const { cleanupPrivateRedactions } = await import("./privacy-asset-cleanup.js");
   if (!await cleanupPrivateRedactions(repository, storage, guideId, options)) return false;
   await cleanupStorageKeys(storage, guideAssetKeys(guide, maxSteps), options);

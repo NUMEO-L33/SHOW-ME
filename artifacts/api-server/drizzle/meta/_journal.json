@@ -99,6 +99,34 @@
       "when": 1790035200000,
       "tag": "0013_private_redaction_assets",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790038800000,
+      "tag": "0014_publication_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790042400000,
+      "tag": "0015_publication_commit",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790046000000,
+      "tag": "0016_publication_expiry_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790049600000,
+      "tag": "0017_private_media_cleanup",
+      "breakpoints": true
     }
   ]
 }

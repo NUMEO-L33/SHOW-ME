@@ -7,6 +7,10 @@ import type { AnalysisBatchCompletionRepository } from "./analysis-batch-complet
 import type { AnalysisSendRepository } from "./analysis-send.js";
 import type { AnalysisClosureRepository } from "./analysis-closure.js";
 import type { PrivacyAssetRepository } from "./privacy-assets.js";
+import type { PrivateRetentionRepository } from "./private-retention.js";
+import type { PublicationJobRepository } from "./publication-jobs.js";
+import type { PublicationRepository } from "./publication-commit.js";
+import type { PublicationLifecycleRepository } from "./publication-lifecycle.js";
 
 export const GUIDE_STATUSES = [
   "uploading",
@@ -240,7 +244,7 @@ export type CompleteProcessingAttemptInput = {
   statusMessage?: string;
 };
 
-export interface GuideRepository extends AnalysisFundingRepository, AnalysisAccountingRepository, AnalysisWorkRepository, AnalysisBatchCompletionRepository, AnalysisSendRepository, AnalysisClosureRepository, PrivacyAssetRepository {
+export interface GuideRepository extends AnalysisFundingRepository, AnalysisAccountingRepository, AnalysisWorkRepository, AnalysisBatchCompletionRepository, AnalysisSendRepository, AnalysisClosureRepository, PrivacyAssetRepository, PrivateRetentionRepository, PublicationJobRepository, PublicationRepository, PublicationLifecycleRepository {
   /** Internal-only Gate 3A commands; callers must authenticate before exposing an API. */
   executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null>;
   getAnalysisState(guideId: string): Promise<AnalysisState | null>;

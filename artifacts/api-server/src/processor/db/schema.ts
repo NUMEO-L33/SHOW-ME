@@ -27,6 +27,9 @@ import type { AnalysisAccountingControl, AnalysisRequestAttempt } from "../analy
 import type { AnalysisCountRecord } from "../analysis-count-accounting.js";
 import type { AnalysisOperationsReview } from "../analysis-operations-review.js";
 import type { PrivacyAssetBatch } from "../privacy-assets.js";
+import type { PublicationJob } from "../publication-jobs.js";
+import type { GuidePublication } from "../publication-commit.js";
+import type { PrivateCleanup } from "../private-retention.js";
 
 export const guideStatusEnum = pgEnum("guide_status", GUIDE_STATUSES);
 
@@ -118,6 +121,57 @@ export const guideAssets = pgTable("guide_assets", {
   id: uuid("id").primaryKey(),
   payload: jsonb("payload").$type<PrivacyAssetBatch>().notNull(),
 }, table => [index("guide_assets_guide_idx").on(table.guideId)]);
+
+// Assets have their own RESTRICT cleanup ledger; terminal request history can
+// cascade only after all of those assets have been removed.
+export const publicationJobs = pgTable("publication_jobs", {
+  guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "cascade" }),
+  id: uuid("id").notNull(), batchId: uuid("batch_id").notNull(),
+  status: text("status").$type<PublicationJob["status"]>().notNull(),
+  availableAt: timestamp("available_at", { withTimezone: true, mode: "date" }),
+  payload: jsonb("payload").$type<PublicationJob>().notNull(),
+}, table => [primaryKey({ columns: [table.guideId, table.id] }),
+  uniqueIndex("publication_jobs_batch_unique").on(table.batchId),
+  index("publication_jobs_due_idx").on(table.availableAt, table.guideId, table.id),
+  check("publication_jobs_projection_check", sql`(${table.guideId} = ${table.payload}->>'guideId'
+    AND ${table.id}::text = ${table.payload}->>'id' AND ${table.batchId}::text = ${table.payload}->>'batchId'
+    AND ${table.status} = ${table.payload}->>'status' AND ${table.status} IN ('queued', 'running', 'failed', 'cancelled', 'succeeded')
+    AND ${table.availableAt} IS NOT DISTINCT FROM CASE
+      WHEN ${table.status} = 'queued' THEN (${table.payload}->>'createdAt')::timestamptz
+      WHEN ${table.status} = 'running' THEN (${table.payload}->>'leaseExpiresAt')::timestamptz
+      ELSE NULL::timestamptz END
+    AND (${table.status} <> 'running' OR ${table.availableAt} IS NOT NULL)
+    AND (${table.status} <> 'succeeded' OR (${table.payload}->>'phase' = 'committed' AND ${table.payload}->>'leaseExpiresAt' IS NULL))) IS TRUE`),
+]);
+
+// SQL migration also makes snapshots and first-publication lifetime immutable.
+export const guidePublications = pgTable("guide_publications", {
+  guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "cascade" }),
+  id: uuid("id").notNull(), batchId: uuid("batch_id").notNull().unique(),
+  payload: jsonb("payload").$type<GuidePublication>().notNull(),
+}, table => [primaryKey({ columns: [table.guideId, table.id] }),
+  check("guide_publications_projection_check", sql`(${table.guideId} = ${table.payload}->>'guideId'
+    AND ${table.id}::text = ${table.payload}->>'id' AND ${table.batchId}::text = ${table.payload}->>'batchId') IS TRUE`)]);
+export const privateMediaCleanup = pgTable("private_media_cleanup", {
+  guideId: text("guide_id").primaryKey().references(() => guides.id, { onDelete: "restrict" }),
+  id: uuid("id").notNull().unique(), payload: jsonb("payload").$type<PrivateCleanup>().notNull(),
+}, table => [check("private_media_cleanup_projection_check", sql`(${table.guideId} = ${table.payload}->>'guideId'
+  AND ${table.id}::text = ${table.payload}->>'id') IS TRUE`)]);
+export const publicationHeads = pgTable("publication_heads", {
+  guideId: text("guide_id").primaryKey().references(() => guides.id, { onDelete: "cascade" }),
+  version: integer("version").notNull(), publicSlug: text("public_slug").notNull().unique(),
+  activePublicationId: uuid("active_publication_id"),
+  firstPublishedAt: timestamp("first_published_at", { withTimezone: true, mode: "date" }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true, mode: "date" }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).notNull(),
+}, table => [
+  // Migration installs this FK DEFERRABLE INITIALLY DEFERRED for parent cascade deletion.
+  index("publication_heads_expiry_idx").on(table.expiresAt, sql`${table.publicSlug} collate "C"`),
+  foreignKey({ name: "publication_head_snapshot_fk", columns: [table.guideId, table.activePublicationId],
+    foreignColumns: [guidePublications.guideId, guidePublications.id] }),
+  check("publication_head_lifetime_check", sql`${table.expiresAt} = ${table.firstPublishedAt} + interval '360 hours'
+    AND ${table.updatedAt} >= ${table.firstPublishedAt}`),
+]);
 
 export const analysisRuns = pgTable("analysis_runs", {
   guideId: text("guide_id").notNull().references(() => guides.id, { onDelete: "cascade" }),

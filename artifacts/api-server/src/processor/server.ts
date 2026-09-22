@@ -4,6 +4,8 @@ import { pipeline as pipeStreams } from "node:stream/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { cleanupPrivateRedactions } from "./privacy-asset-cleanup.js";
+import { cleanupExpiredPrivateMedia, privateMediaExpired } from "./private-retention.js";
+import { privateLogError } from "./private-log.js";
 
 import Busboy, { type FileInfo } from "busboy";
 import cors from "cors";
@@ -14,6 +16,8 @@ import { createAssetTicket, verifyAssetTicket } from "./asset-token.js";
 import { AnalysisApiError, createAnalysisRouter, type AnalysisAdmission } from "./analysis-api.js";
 import { createDraftRouter } from "./draft-api.js";
 import { createPrivacyPreviewRouter } from "./privacy-preview-api.js";
+import { createPublicationRouter, type PublicationAdmission } from "./publication-api.js";
+import { createPublicPublicationRouter } from "./publication-public-api.js";
 import { DurableAnalysisAdmission } from "./analysis-admission.js";
 import {
   cleanupStorageKeys,
@@ -65,6 +69,8 @@ export type ProcessorAppDependencies = {
   readiness?: { ready: boolean };
   /** Trusted composition override. Default admission has no readiness verifier and rejects new runs. */
   analysisAdmission?: AnalysisAdmission;
+  /** Supplied only by a running publication executor; default rejects new publications. */
+  publicationAdmission?: PublicationAdmission;
 };
 
 function cleanFilename(filename: string) {
@@ -354,6 +360,7 @@ export function createProcessorApp({
   queue = new ProcessingQueue(1, config.queueCapacity),
   readiness = { ready: true },
   analysisAdmission,
+  publicationAdmission,
 }: ProcessorAppDependencies): Application {
   const app = express();
   const assetTicketSecret = config.assetTicketSecret
@@ -427,6 +434,10 @@ export function createProcessorApp({
   app.use("/api/guides/:guideId/draft", createDraftRouter({
     repository, authenticate: (request) => requireGuideAccess(request, repository),
   }));
+
+  app.use("/api/guides/:guideId", createPublicationRouter({ repository, admission: publicationAdmission,
+    authenticate: (request) => requireGuideAccess(request, repository) }));
+  app.use("/api/public/guides", createPublicPublicationRouter({ repository, storage }));
 
   app.use("/api/guides/:guideId/privacy-preview", createPrivacyPreviewRouter({
     repository, storage, ffmpegPath: config.ffmpegPath,
@@ -803,6 +814,9 @@ export function createProcessorApp({
       }
 
       try {
+        if (!await cleanupExpiredPrivateMedia(repository, storage, guide.id)) {
+          response.status(202).json({ status: "deleting" }); return;
+        }
         await cleanupStorageKeys(storage, guideAssetKeys(guide, config.maxSteps));
         if (!await cleanupPrivateRedactions(repository, storage, guide.id)) {
           response.status(202).json({ status: "deleting" });
@@ -812,7 +826,7 @@ export function createProcessorApp({
         console.error(JSON.stringify({
           event: "guide_delete_asset_cleanup_failed",
           guideId: guide.id,
-          message: error instanceof Error ? error.message : String(error),
+          message: privateLogError(error),
         }));
         throw new HttpError(503, "개인 영상 삭제를 마치지 못했어요. 잠시 뒤 다시 시도해 주세요.", "PRIVATE_ASSET_CLEANUP_FAILED");
       }
@@ -848,7 +862,7 @@ export function createProcessorApp({
       const guide = hasAssetTicket
         ? await repository.getGuideById(guideId)
         : await requireGuideAccess(request, repository);
-      if (!guide) throw new HttpError(404, "화면 이미지를 찾을 수 없어요.", "ASSET_NOT_FOUND");
+      if (!guide || privateMediaExpired(guide) || isDeletionPending(guide)) throw new HttpError(404, "화면 이미지를 찾을 수 없어요.", "ASSET_NOT_FOUND");
       const rawStepId = request.params.stepId;
       const stepId = Array.isArray(rawStepId) ? rawStepId[0] : rawStepId;
       const step = guide.steps.find((candidate) => candidate.id === stepId);

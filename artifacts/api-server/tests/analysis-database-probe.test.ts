@@ -176,14 +176,20 @@ test("migration history must match every trusted local hash and timestamp, not j
   }
 });
 
-test("caller timeout and cancellation retain the slot until a stalled database operation really settles", async () => {
+test("caller timeout and cancellation retain the slot until a stalled database operation really settles", async (t) => {
+  // Exercise an already-started query, not whether migration file reads happen
+  // to fit inside 30 ms on a busy machine. Product deadlines stay unchanged.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let elapsed = 0; t.mock.method(performance, "now", () => elapsed);
   for (const abort of [false, true]) {
-    const f = fixture(abort ? 4000 : 30); let finish!: () => void;
-    f.handler.execute = () => new Promise((resolve) => { finish = () => resolve({ rows: [] }); });
+    const f = fixture(abort ? 4000 : 30); let finish!: () => void, begin!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    f.handler.execute = () => new Promise((resolve) => { finish = () => resolve({ rows: [] }); begin(); });
     const controller = new AbortController();
     const pending = f.probe.inspect(controller.signal); const rejection = assert.rejects(pending, denied);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await started;
     if (abort) controller.abort(new Error("private-reason"));
+    else { elapsed += 30; t.mock.timers.tick(30); }
     await rejection; assert.equal(f.active(), 1);
     await assert.rejects(f.probe.inspect(signal()), denied); assert.equal(f.configs.length, 1);
     finish(); await new Promise<void>((resolve) => setImmediate(resolve));
@@ -191,6 +197,13 @@ test("caller timeout and cancellation retain the slot until a stalled database o
     f.handler.execute = async () => ({ rows: [] });
     await assert.rejects(f.probe.inspect(signal()), denied); assert.equal(f.configs.length, 2);
   }
+});
+
+test("deadline before a DB operation begins releases the slot without claiming an active query", async (t) => {
+  let calls = 0; t.mock.method(performance, "now", () => calls++ === 0 ? 0 : 30);
+  const f = fixture(30);
+  await assert.rejects(f.probe.inspect(signal()), denied);
+  assert.equal(f.active(), 0); assert.equal(f.calls.length, 0); assert.equal(f.configs.length, 0);
 });
 
 test("late pool acquisition after abort cannot start inspection queries", async () => {

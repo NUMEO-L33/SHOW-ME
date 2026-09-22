@@ -254,10 +254,11 @@ test("v2 funding upgrades without repricing and malformed current attempts or co
   const h = await harness(context);
   const legacy = await h.state(); legacy.version = 2; delete legacy.funding.attempts; delete legacy.funding.control;
   delete legacy.privacyAssets;
+  delete legacy.publicationJobs; delete legacy.publications; delete legacy.publicationHeads; delete legacy.privateCleanup;
   for (const r of legacy.funding.reservations) { delete r.released; delete r.closedAt; }
   await writeFile(h.repository.filePath, JSON.stringify(legacy));
   await h.begin(); await h.settle();
-  const saved = await h.state(); assert.equal(saved.version, 6);
+  const saved = await h.state(); assert.equal(saved.version, 9);
   assert.deepEqual(saved.funding.reservations.map(({ released, closedAt, ...r }: Record<string, unknown>) => {
     void released; void closedAt; return r;
   }), legacy.funding.reservations);

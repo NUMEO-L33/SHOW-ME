@@ -1,4 +1,5 @@
 import { privateLogError } from "./private-log.js";
+import { PRIVATE_MEDIA_EXPIRED, sweepExpiredPrivateMedia } from "./private-retention.js";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Server } from "node:http";
@@ -22,6 +23,7 @@ import { createProcessorApp } from "./server.js";
 import { createStorage, type Storage } from "./storage.js";
 import { createAnalysisLifecycle, type ProcessorAnalysisFactory } from "./analysis-lifecycle.js";
 import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "./analysis-bootstrap.js";
+import { createPublicationLifecycle, type ProcessorPublicationFactory } from "./publication-runtime.js";
 
 const STORAGE_PROBE_PAYLOAD = Buffer.from("showme-storage-ready", "utf8");
 const STARTUP_CHECK_TIMEOUT_MS = 15_000;
@@ -32,7 +34,9 @@ const LIFECYCLE_STORAGE_OPERATION_TIMEOUT_MS = 5_000;
 const UPLOAD_CANCELLATION_RETENTION_MS = 24 * 60 * 60_000;
 const UNPUBLISHED_DRAFT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
-export async function startProcessor(config: ProcessorConfig = CONFIG, options: { createAnalysis?: ProcessorAnalysisFactory } = {}) {
+export async function startProcessor(config: ProcessorConfig = CONFIG, options: {
+  createAnalysis?: ProcessorAnalysisFactory; createPublication?: ProcessorPublicationFactory;
+} = {}) {
   await mkdir(config.dataDir, { recursive: true });
   const repository = createGuideRepository({
     databaseUrl: config.databaseUrl,
@@ -49,10 +53,12 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
   let lifecycleTimer: NodeJS.Timeout | undefined;
   let lifecycleSweepPromise: Promise<void> | undefined;
   let analysis: Awaited<ReturnType<typeof createAnalysisLifecycle>>;
+  let publication: Awaited<ReturnType<typeof createPublicationLifecycle>>;
 
   try {
     const storage = createStorage(config);
     analysis = await createAnalysisLifecycle({ repository, storage }, options.createAnalysis);
+    publication = await createPublicationLifecycle({ repository, storage, config }, options.createPublication);
     const pipeline = createGuidePipeline({ config, repository, storage });
     const queue = new ProcessingQueue(1, config.queueCapacity);
     startupQueue = queue;
@@ -65,6 +71,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
       queue,
       readiness,
       analysisAdmission: analysis?.admission,
+      publicationAdmission: publication?.admission,
     });
 
     server = await new Promise<Server>((resolve, reject) => {
@@ -133,6 +140,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
     lifecycleTimer = setInterval(() => { void runLifecycleSweep(); }, LIFECYCLE_SWEEP_INTERVAL_MS);
     lifecycleTimer.unref();
     analysis?.start();
+    publication?.start();
     readiness.ready = true;
     // Durable cleanup starts immediately, but it is intentionally outside the
     // readiness critical path and bounded so a large backlog cannot block boot.
@@ -149,7 +157,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
       if (!closing) {
         readiness.ready = false;
         if (lifecycleTimer) clearInterval(lifecycleTimer);
-        closing = closeResources(activeServer, repository, queue, dispatcher, lifecycleSweepPromise, analysis);
+        closing = closeResources(activeServer, repository, queue, dispatcher, lifecycleSweepPromise, analysis, publication);
       }
       return closing;
     };
@@ -163,6 +171,7 @@ export async function startProcessor(config: ProcessorConfig = CONFIG, options: 
       startupDispatcher,
       lifecycleSweepPromise,
       analysis,
+      publication,
     ).catch(() => undefined);
     throw error;
   }
@@ -225,27 +234,26 @@ export async function cleanupPrivateAssetLifecycle(
       DELETION_PENDING,
       DELETION_PENDING_ACTIVE,
       UPLOAD_CANCELLATION_TOMBSTONE,
+      PRIVATE_MEDIA_EXPIRED,
     ];
     const expiredDrafts = await repository.listExpiredDrafts(
       new Date(abandonedBefore).toISOString(), lifecycleErrorCodes, batchLimit,
     );
     for (const guide of expiredDrafts) {
       try {
-        await repository.updateStatus(guide.id, "failed", {
-          expectedStatuses: [guide.status],
-          expectedUpdatedAt: guide.updatedAt,
-          expectedProcessingAttemptId: guide.processingAttemptId,
-          expectedProcessingAttemptCount: guide.processingAttemptCount,
-          expectedErrorCode: guide.errorCode,
-          progress: 100,
-          statusMessage: "보관 기간이 지난 미공개 초안을 삭제하고 있어요.",
-          errorCode: DELETION_PENDING,
-          errorMessage: "미공개 초안의 보관 기간이 끝났어요.",
-        });
+        await repository.expirePrivateDraft(guide.id, { expectedUpdatedAt: guide.updatedAt,
+          updatedBefore: new Date(abandonedBefore).toISOString() }, new Date(now));
       } catch (error) {
         failures.push(error);
       }
     }
+  }
+
+  try { await sweepExpiredPrivateMedia(repository, storage, { deadline: sweepDeadline, timeoutMs: storageOperationTimeoutMs }); }
+  catch (error) { failures.push(error); }
+  for (const guide of await repository.listExpiredRetainedGuides(batchLimit, new Date(now))) {
+    try { await repository.expirePrivateDraft(guide.id, { expectedUpdatedAt: guide.updatedAt, updatedBefore: guide.updatedAt }, new Date(now)); }
+    catch (error) { failures.push(error); }
   }
 
   // Query each lifecycle class independently so a large set of fresh,
@@ -324,11 +332,13 @@ async function closeResources(
   dispatcher?: DurableProcessingDispatcher,
   lifecycleSweep?: Promise<void>,
   analysis?: Awaited<ReturnType<typeof createAnalysisLifecycle>>,
+  publication?: Awaited<ReturnType<typeof createPublicationLifecycle>>,
 ): Promise<void> {
   const failures: unknown[] = [];
-  if (analysis) {
-    try { await analysis.stop(); } catch (error) { failures.push(error); }
-  }
+  // Close both admission gates immediately, before waiting for either worker.
+  const publicationStop = publication?.stop().catch(error => { failures.push(error); });
+  const analysisStop = analysis?.stop().catch(error => { failures.push(error); });
+  await Promise.all([publicationStop, analysisStop]);
   if (server) {
     try {
       await closeServer(server);

@@ -2,9 +2,11 @@
 
 원래 개발 계획의 E2 저장 엔진 체크포인트다. 기존 MD의 목표·완료 조건은 변경하지 않았다. **내부 저장 함수와 삭제 연결을 구현했으며 게시 접수/자동 worker/공개 HTTP/화면 버튼은 활성화하지 않았다. E2/E3 전체 또는 실환경 완료가 아니다.** 원본 보기, 개인 영상 AI 전송, Replit/Google 설정도 변경하지 않았다.
 
+후속 `PUBLICATION_COMMIT.md`의 내부 게시 확정에서 활성 처리본을 일반 정리로부터 보호한다. 새 게시 확정 성공 후 이전 처리본만 cleanup으로 넘기며, 전체 삭제 표시가 저장되면 활성 보호도 해제해 기존 삭제 순서를 따른다. 제품 공개/보존 lifecycle 연결은 여전히 남아 있다.
+
 ## 구현 범위
 
-- `writePrivateRedactions`는 서버 내부 함수다. 소유자 인증을 대신하지 않으며 이후 E3의 인증된 게시 접수기가 호출해야 한다. 현재 HTTP 경로/제품 시작 경로에서 호출하지 않는다.
+- `writePrivateRedactions`는 단독 E2 서버 내부 함수다. 소유자 인증을 대신하지 않는다. E3 게시 준비는 중복 예약을 막기 위해 기존 job 묶음을 쓰는 `preparePublicationAssets`로 연결했다. 어느 함수도 현재 HTTP 경로/제품 시작 경로에서 호출하지 않는다.
 - 현재 저장 revision·미디어 지문·개인정보 확인 지문이 모두 일치하고, 제목/모든 단계의 문구/화면 확인이 완료돼야 작업을 예약한다. 처리 계획은 서버의 초안/정규 원본 프레임 키에서만 만든다. 켜진 가림은 visible/zIndex와 무관하게 적용한다.
 - 새 `guide_assets` 행에 모든 출력 키의 정리 소유권을 먼저 기록한다. 가이드당 최대 4개 묶음, 각 24단계/48개 PNG다. 묶음 UUID별 독립된 `guides/<id>/private-redactions/<batch>/<index>-<variant>.png` 키를 쓰고 원본 키를 덮어쓰지 않는다.
 - 작업 상태는 reserved → writing → ready 또는 cleanup이다. claim은 revision과 단일 writer를 비교해 한 번만 성공한다. 모호한 응답을 받았다고 같은 쓰기를 재전송하지 않는다. ready는 내부 자산 준비 상태일 뿐 게시 허가가 아니다.
@@ -37,4 +39,6 @@
 
 ## 다음
 
-E3의 인증된 게시 접수·내구 작업 큐/재시작 복구·불변 snapshot·모든 자산 완료 후 참조 교체·철회·첫 게시 후 15일 만료를 연결한다. 이후 공개 API/뷰어와 Replit migration/권한/실제 Storage 검증을 진행한다. 이 단계의 내부 ready receipt만으로 공유 URL을 발급하면 안 된다.
+추가 구현: `PUBLICATION_JOB_LEDGER.md`에 E3 내부 요청 원장을, `PUBLICATION_PREPARATION.md`에 기존 job 묶음과 실제 이미지 엔진의 연결을 기록했다. 단독 `writePrivateRedactions`를 이미 claim한 job에 호출하면 별도 묶음이 생기므로 쓰지 않는다. 전용 연결 함수가 공통 세션/렌더러를 사용한다. 앞 절의 v6/106개는 당시 검증 이력이며 현재 저장 형식은 후속 job 원장의 v7이다.
+
+이후 자동 worker/복구, 인증된 게시 접수·불변 게시본·모든 자산 완료 후 참조 교체·철회·첫 게시 후 15일 만료를 연결한다. 이어 공개 API/뷰어와 Replit migration/권한/실제 Storage 검증을 진행한다. 이 단계의 내부 ready receipt만으로 공유 URL을 발급하면 안 된다.

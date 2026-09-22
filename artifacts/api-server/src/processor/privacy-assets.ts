@@ -49,13 +49,13 @@ export interface PrivacyAssetRepository {
   executePrivacyAssetCommand(guideId: string, command: PrivacyAssetCommand): Promise<PrivacyAssetBatch | null>;
   listPrivacyAssetBatches(guideId: string): Promise<PrivacyAssetBatch[]>;
 }
-export function privacyAssetKeys(batch: Pick<PrivacyAssetBatch, "guideId" | "id" | "frames">): string[] {
+export function privacyAssetKeys(batch: Pick<PrivacyAssetBatch, "guideId" | "id"> & { frames: readonly unknown[] }): string[] {
   return batch.frames.flatMap((_f, i) => ["frame", "thumbnail"].map(v =>
     `guides/${batch.guideId}/private-redactions/${batch.id}/${i}-${v}.png`));
 }
 export const privacyAssetDigest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function matches(guide: GuideWithSteps, state: AnalysisState, batch: Pick<PrivacyAssetBatch,
+export function matchesPrivacyAssetInput(guide: GuideWithSteps, state: AnalysisState, batch: Pick<PrivacyAssetBatch,
   "revision" | "inputFingerprint" | "reviewFingerprint"> & Partial<Pick<PrivacyAssetBatch, "frames">>) {
   if (guide.status !== "ready") return false;
   try {
@@ -81,7 +81,7 @@ export function transitionPrivacyAsset(guide: GuideWithSteps, state: AnalysisSta
   command: PrivacyAssetCommand, now: Date): { batch: PrivacyAssetBatch; remove?: boolean } | null {
   id.parse(guide.id); z.string().uuid().parse(command.id);
   if (command.type === "reserve") {
-    if (previous || !matches(guide, state, command)) return null;
+    if (previous || !matchesPrivacyAssetInput(guide, state, command)) return null;
     const document = parseDraftDocument(state.draft!.document, analysisManifest(guide).frames);
     const frames = document.steps.map(step => {
       const source = guide.steps.find(f => f.id === step.activeFrameStepId)!;
@@ -101,13 +101,13 @@ export function transitionPrivacyAsset(guide: GuideWithSteps, state: AnalysisSta
   switch (command.type) {
     case "claim":
       z.string().uuid().parse(command.writerId);
-      if (batch.version !== command.version || batch.status !== "reserved" || !matches(guide, state, batch)) return null;
+      if (batch.version !== command.version || batch.status !== "reserved" || !matchesPrivacyAssetInput(guide, state, batch)) return null;
       batch.status = "writing"; batch.writerId = command.writerId; batch.writerSettled = false; break;
     case "settle":
       if (batch.writerId !== command.writerId || batch.writerSettled) return null;
       batch.writerSettled = true;
       batch.receipts = z.array(privacyAssetReceiptSchema).max(48).parse(command.receipts ?? []);
-      batch.status = batch.status === "writing" && command.receipts && matches(guide, state, batch) ? "ready" : "cleanup";
+      batch.status = batch.status === "writing" && command.receipts && matchesPrivacyAssetInput(guide, state, batch) ? "ready" : "cleanup";
       break;
     case "cancel": batch.status = "cleanup"; break;
     case "cleaned":

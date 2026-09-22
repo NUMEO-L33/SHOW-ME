@@ -22,7 +22,8 @@ export async function createRuntimeRole(options: { admin: Pool; target: PoolConf
     await connection.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
     await connection.query(`GRANT USAGE ON SCHEMA public, drizzle TO "${role}"`);
     await connection.query(`GRANT SELECT ON drizzle.__drizzle_migrations, analysis_operations_reviews, analysis_activation_events TO "${role}"`);
-    await connection.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON guides, guide_steps, guide_drafts, guide_assets, analysis_runs,
+    await connection.query(`GRANT SELECT, INSERT, DELETE ON guide_publications TO "${role}"`);
+    await connection.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON guides, guide_steps, guide_drafts, guide_assets, private_media_cleanup, publication_jobs, publication_heads, analysis_runs,
       analysis_budget_windows, analysis_reservations, analysis_batches, analysis_accounting_controls,
       analysis_request_attempts, analysis_provider_quota_charges, analysis_count_attempts TO "${role}"`);
     await connection.query("COMMIT"); committed = true;

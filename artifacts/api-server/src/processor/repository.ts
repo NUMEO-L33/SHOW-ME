@@ -1,7 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { privacyAssetBatchSchema, transitionPrivacyAsset, type PrivacyAssetBatch, type PrivacyAssetCommand } from "./privacy-assets.js";
+import { publicationAvailableAt, publicationCommandSchema, publicationJobSchema, publicationTime, publicationWorkLimit,
+  publicationRecoveryQuerySchema, type PublicationRecoveryQuery,
+  transitionPublicationJob, type PublicationCommand, type PublicationJob, type PublicationJobRepository } from "./publication-jobs.js";
+import { guidePublicationSchema, publicationHeadSchema, publicationCommitSchema, preparePublicationCommit,
+  publicationProtectsAsset, validatePublicationState, type GuidePublication, type PublicationHead,
+  type PublicationCommit, type PublicationState, type PublicationRepository } from "./publication-commit.js";
+import { publicationAccessSchema, publicationStopSchema, publicationExpiryQuerySchema, preparePublicationStop,
+  selectAccessiblePublication, selectPublicationOwnerStatus, publicationPreparationAllowed, publicationExpiryCandidate, comparePublicationExpiry,
+  type PublicationAccess, type PublicationStop, type PublicationExpiryQuery, type PublicationLifecycleRepository } from "./publication-lifecycle.js";
+import { PRIVATE_MEDIA_EXPIRED, privateMediaExpired, privateExpirySchema, privateCleanupSchema, privateCleanupQuerySchema,
+  preparePrivateExpiry, retainedPublicationLive, type PrivateCleanup, type PrivateCleanupQuery, type PrivateExpiry } from "./private-retention.js";
 
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -39,6 +50,10 @@ import {
   analysisRuns,
   guideDrafts,
   guideAssets,
+  publicationJobs,
+  guidePublications,
+  publicationHeads,
+  privateMediaCleanup,
   guideSteps,
   guides,
   type GuideRow,
@@ -75,7 +90,7 @@ import { AnalysisCountError, countRequestKey, parseCountCommand, parseCountRecor
   type AnalysisCountCommand, type AnalysisCountResult, type AnalysisCountLaunchCommand } from "./analysis-count-accounting.js";
 import { assertQuotaPermit, parseQuotaReceipt, prepareQuotaCharge, quotaCoverageStart, type AnalysisQuotaReceipt } from "./analysis-quota-charge.js";
 
-const JSON_REPOSITORY_VERSION = 6 as const;
+const JSON_REPOSITORY_VERSION = 9 as const;
 const DEFAULT_LIST_LIMIT = 100;
 const MAX_LIST_LIMIT = 1_000;
 
@@ -86,6 +101,10 @@ type JsonRepositoryState = {
   analysis: Array<{ guideId: string; state: AnalysisState }>;
   funding: AnalysisFundingLedger;
   privacyAssets: PrivacyAssetBatch[];
+  publicationJobs: PublicationJob[];
+  publications: GuidePublication[];
+  publicationHeads: PublicationHead[];
+  privateCleanup: PrivateCleanup[];
 };
 
 export type ProcessorDatabase = NodePgDatabase<typeof processorSchema>;
@@ -111,7 +130,7 @@ export class GuideNotFoundError extends Error {
 }
 
 function emptyJsonState(): JsonRepositoryState {
-  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [], funding: emptyFundingLedger(), privacyAssets: [] };
+  return { version: JSON_REPOSITORY_VERSION, guides: [], steps: [], analysis: [], funding: emptyFundingLedger(), privacyAssets: [], publicationJobs: [], publications: [], publicationHeads: [], privateCleanup: [] };
 }
 
 function clone<T>(value: T): T {
@@ -473,7 +492,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
-    ![1, 2, 3, 4, 5, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
+    ![1, 2, 3, 4, 5, 6, 7, 8, JSON_REPOSITORY_VERSION].includes((parsed as { version: number }).version) ||
     !Array.isArray((parsed as { guides?: unknown }).guides) ||
     !Array.isArray((parsed as { steps?: unknown }).steps)
   ) {
@@ -481,7 +500,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   }
 
   const state = parsed as JsonRepositoryState;
-  if (state.version !== JSON_REPOSITORY_VERSION) {
+  if ((state.version as number) < 6) {
     if (state.privacyAssets !== undefined) throw new RepositoryDataError("Invalid legacy asset state.");
     state.privacyAssets = [];
   }
@@ -489,6 +508,40 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   state.privacyAssets = state.privacyAssets.map(batch => privacyAssetBatchSchema.parse(batch));
   if (new Set(state.privacyAssets.map(b => b.id)).size !== state.privacyAssets.length ||
       state.privacyAssets.some(b => !state.guides.some(g => g.id === b.guideId))) throw new RepositoryDataError("Orphaned private asset ledger.");
+  if ((state.version as number) < 7) {
+    if (state.publicationJobs !== undefined) throw new RepositoryDataError("Invalid legacy publication state.");
+    state.publicationJobs = [];
+  }
+  if (!Array.isArray(state.publicationJobs)) throw new RepositoryDataError("Missing publication ledger.");
+  state.publicationJobs = state.publicationJobs.map(job => publicationJobSchema.parse(job));
+  if (new Set(state.publicationJobs.map(j => `${j.guideId}/${j.id}`)).size !== state.publicationJobs.length ||
+      new Set(state.publicationJobs.map(j => j.batchId)).size !== state.publicationJobs.length ||
+      state.publicationJobs.some(j => !state.guides.some(g => g.id === j.guideId))) throw new RepositoryDataError("Orphaned publication ledger.");
+  if ((state.version as number) < 8) {
+    if (state.publications !== undefined || state.publicationHeads !== undefined) throw new RepositoryDataError("Invalid legacy committed publications.");
+    state.publications = []; state.publicationHeads = [];
+  }
+  if (!Array.isArray(state.publications) || !Array.isArray(state.publicationHeads)) throw new RepositoryDataError("Missing committed publication state.");
+  state.publications = state.publications.map(p => guidePublicationSchema.parse(p));
+  state.publicationHeads = state.publicationHeads.map(h => publicationHeadSchema.parse(h));
+  if (new Set(state.publicationHeads.map(h => h.guideId)).size !== state.publicationHeads.length ||
+    new Set(state.publicationHeads.map(h => h.publicSlug)).size !== state.publicationHeads.length ||
+    new Set(state.publications.map(p => p.batchId)).size !== state.publications.length ||
+    [...state.publicationHeads, ...state.publications].some(p => !state.guides.some(g => g.id === p.guideId)))
+    throw new RepositoryDataError("Invalid committed publication identities.");
+  for (const guide of state.guides) validatePublicationState({ head: state.publicationHeads.find(h => h.guideId === guide.id) ?? null,
+    publications: state.publications.filter(p => p.guideId === guide.id) }, state.publicationJobs.filter(j => j.guideId === guide.id));
+  if ((state.version as number) < 9) {
+    if (state.privateCleanup !== undefined) throw new RepositoryDataError("Invalid legacy private cleanup state.");
+    state.privateCleanup = [];
+  }
+  if (!Array.isArray(state.privateCleanup)) throw new RepositoryDataError("Missing private cleanup state.");
+  state.privateCleanup = state.privateCleanup.map(row => privateCleanupSchema.parse(row));
+  if (new Set(state.privateCleanup.map(r => r.id)).size !== state.privateCleanup.length ||
+    new Set(state.privateCleanup.map(r => r.guideId)).size !== state.privateCleanup.length ||
+    state.privateCleanup.some(r => !state.guides.some(g => g.id === r.guideId && g.status === "failed" &&
+      [PRIVATE_MEDIA_EXPIRED, "DELETION_PENDING", "DELETION_PENDING_ACTIVE"].includes(g.errorCode ?? ""))))
+    throw new RepositoryDataError("Orphaned private cleanup state.");
   const legacyVersion = (parsed as { version: number }).version === 1;
   const fundingV2 = (parsed as { version: number }).version === 2;
   const fundingV3 = (parsed as { version: number }).version === 3;
@@ -547,7 +600,7 @@ function parseJsonState(raw: string, filePath: string): JsonRepositoryState {
   return state;
 }
 
-export class JsonGuideRepository implements GuideRepository {
+export class JsonGuideRepository implements GuideRepository, PublicationJobRepository, PublicationRepository, PublicationLifecycleRepository {
   readonly filePath: string;
   private pending: Promise<void> = Promise.resolve();
 
@@ -607,6 +660,199 @@ export class JsonGuideRepository implements GuideRepository {
     return this.serialize(async () => clone((await this.readState()).privacyAssets.filter(b => b.guideId === guideId)));
   }
 
+  async expirePrivateDraft(guideId: string, raw: PrivateExpiry, now?: Date) {
+    const command = privateExpirySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      const next = preparePrivateExpiry({ ...guide, steps: state.steps.filter(s => s.guideId === guideId) },
+        state.analysis.find(a => a.guideId === guideId)?.state ?? emptyAnalysisState(), state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+        state.publicationJobs.filter(j => j.guideId === guideId), state.privacyAssets.filter(a => a.guideId === guideId), command, publicationTime(fixed), randomUUID());
+      if (!next) return null;
+      const { steps: _steps, ...updated } = next.guide;
+      state.guides = state.guides.map(g => g.id === guideId ? updated : g);
+      if (next.cleanup) {
+        if (state.privateCleanup.some(r => r.guideId === guideId)) throw new RepositoryDataError("Private cleanup already exists.");
+        state.privateCleanup.push(next.cleanup);
+        state.steps = state.steps.filter(s => s.guideId !== guideId);
+        state.analysis = state.analysis.filter(a => a.guideId !== guideId);
+        state.funding.batches = state.funding.batches.filter(b => b.guideId !== guideId);
+        state.funding.reservations = state.funding.reservations.map(r => r.guideId === guideId ? { ...r, details: null } : r);
+        state.publicationJobs = state.publicationJobs.map(j => j.guideId === guideId ? next.jobs.find(n => n.id === j.id) ?? j : j);
+        state.privacyAssets = state.privacyAssets.map(a => next.assets.find(n => n.id === a.id) ?? a);
+      }
+      await this.writeState(state); return clone(updated);
+    });
+  }
+
+  async getPrivateCleanup(guideId: string) {
+    return this.serialize(async () => clone((await this.readState()).privateCleanup.find(r => r.guideId === guideId) ?? null));
+  }
+  async listPrivateCleanup(raw: PrivateCleanupQuery) {
+    const query = privateCleanupQuerySchema.parse(raw);
+    return this.serialize(async () => clone((await this.readState()).privateCleanup.filter(r => !query.after || r.id > query.after)
+      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).slice(0, query.limit)));
+  }
+  async completePrivateCleanup(guideId: string, cleanupId: string) {
+    return this.serialize(async () => {
+      const state = await this.readState(), row = state.privateCleanup.find(r => r.guideId === guideId);
+      if (!row) return true;
+      if (row.id !== cleanupId) return false;
+      state.privateCleanup = state.privateCleanup.filter(r => r.id !== cleanupId);
+      await this.writeState(state); return true;
+    });
+  }
+  async listExpiredRetainedGuides(limit?: number, now?: Date) {
+    const safeLimit = normalizedLimit(limit), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), at = publicationTime(fixed);
+      return clone(state.guides.filter(g => privateMediaExpired(g) &&
+        !retainedPublicationLive(state.publicationHeads.find(h => h.guideId === g.id) ?? null, at))
+        .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).slice(0, safeLimit));
+    });
+  }
+
+  async getPublicationJob(guideId: string, jobId: string): Promise<PublicationJob | null> {
+    return this.serialize(async () => clone((await this.readState()).publicationJobs.find(j => j.guideId === guideId && j.id === jobId) ?? null));
+  }
+
+  async getPublicationOwnerStatus(guideId: string, jobId?: string, now?: Date) {
+    if (jobId !== undefined) publicationCommitSchema.shape.id.parse(jobId);
+    const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      return clone(selectPublicationOwnerStatus({ ...guide, steps: [] }, {
+        head: state.publicationHeads.find(h => h.guideId === guideId) ?? null, publications: state.publications.filter(p => p.guideId === guideId) },
+      state.publicationJobs.filter(j => j.guideId === guideId), state.privacyAssets.filter(a => a.guideId === guideId), jobId, publicationTime(fixed)));
+    });
+  }
+
+  async getPublicationState(guideId: string): Promise<PublicationState | null> {
+    return this.serialize(async () => {
+      const state = await this.readState();
+      if (!state.guides.some(g => g.id === guideId)) return null;
+      return clone({ head: state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+        publications: state.publications.filter(p => p.guideId === guideId) });
+    });
+  }
+
+  async commitPublication(guideId: string, raw: PublicationCommit, now?: Date) {
+    const command = publicationCommitSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      const next = preparePublicationCommit({ ...guide, steps: state.steps.filter(s => s.guideId === guideId) },
+        state.analysis.find(a => a.guideId === guideId)?.state ?? emptyAnalysisState(), state.publicationJobs.filter(j => j.guideId === guideId),
+        state.privacyAssets.filter(a => a.guideId === guideId), { head: state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+          publications: state.publications.filter(p => p.guideId === guideId) }, command, publicationTime(fixed), randomBytes(24).toString("base64url"));
+      if (!next) return null;
+      if (next.changed) {
+        if (state.publicationHeads.some(h => h.guideId !== guideId && h.publicSlug === next.result.head.publicSlug))
+          throw new RepositoryDataError("Publication identity conflict.");
+        state.publications.push(next.result.publication);
+        state.publicationHeads = [...state.publicationHeads.filter(h => h.guideId !== guideId), next.result.head];
+        state.publicationJobs = state.publicationJobs.map(j => j.guideId === guideId && j.id === next.job.id ? next.job : j);
+        if (next.oldAsset) state.privacyAssets = state.privacyAssets.map(a => a.id === next.oldAsset!.id ? next.oldAsset! : a);
+        await this.writeState(state);
+      }
+      return clone(next.result);
+    });
+  }
+
+  async stopPublication(guideId: string, raw: PublicationStop, now?: Date) {
+    const command = publicationStopSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      const next = preparePublicationStop({ ...guide, steps: [] }, {
+        head: state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+        publications: state.publications.filter(p => p.guideId === guideId),
+      }, state.publicationJobs.filter(j => j.guideId === guideId), state.privacyAssets.filter(a => a.guideId === guideId), command, publicationTime(fixed));
+      if (!next) return null;
+      if (next.result.changed) {
+        if (next.result.head) state.publicationHeads = state.publicationHeads.map(h => h.guideId === guideId ? next.result.head! : h);
+        state.publicationJobs = state.publicationJobs.map(j => j.guideId === guideId ? next.jobs.find(n => n.id === j.id) ?? j : j);
+        state.privacyAssets = state.privacyAssets.map(a => next.assets.find(n => n.id === a.id) ?? a);
+        await this.writeState(state);
+      }
+      return clone(next.result);
+    });
+  }
+
+  async getAccessiblePublication(raw: PublicationAccess, now?: Date) {
+    const query = publicationAccessSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), head = state.publicationHeads.find(h => h.publicSlug === query.slug);
+      const guide = head && state.guides.find(g => g.id === head.guideId);
+      if (!head || !guide) return null;
+      return clone(selectAccessiblePublication({ ...guide, steps: [] }, { head,
+        publications: state.publications.filter(p => p.guideId === guide.id) }, state.privacyAssets.filter(a => a.guideId === guide.id), query, publicationTime(fixed)));
+    });
+  }
+
+  async listExpiredPublications(raw: PublicationExpiryQuery, now?: Date) {
+    const query = publicationExpiryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), at = publicationTime(fixed);
+      return state.publicationHeads.filter(h => (!query.after || comparePublicationExpiry(h, query.after) > 0) &&
+        publicationExpiryCandidate(h, state.publicationJobs, at)).sort(comparePublicationExpiry).slice(0, query.limit)
+        .map(({ guideId, version, expiresAt, publicSlug }) => ({ guideId, version, expiresAt, publicSlug }));
+    });
+  }
+
+  async listPublicationWork(limit = 20, now?: Date) {
+    limit = publicationWorkLimit(limit); const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const at = publicationTime(fixed), state = await this.readState();
+      return state.publicationJobs.filter(j => {
+        const available = publicationAvailableAt(j); return available !== null && Date.parse(available) <= at.getTime();
+      }).sort((a, b) => publicationAvailableAt(a)!.localeCompare(publicationAvailableAt(b)!) ||
+        a.guideId.localeCompare(b.guideId) || a.id.localeCompare(b.id))
+        .slice(0, limit).map(({ guideId, id, version }) => ({ guideId, id, version }));
+    });
+  }
+
+  async executePublicationCommand(guideId: string, command: PublicationCommand, now?: Date): Promise<PublicationJob | null> {
+    command = publicationCommandSchema.parse(command);
+    const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const state = await this.readState(), guide = state.guides.find(g => g.id === guideId);
+      if (!guide) return null;
+      const at = publicationTime(fixed);
+      if (!publicationPreparationAllowed(state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+        state.publicationJobs.filter(j => j.guideId === guideId), command, at)) return null;
+      const next = transitionPublicationJob({ ...guide, steps: state.steps.filter(s => s.guideId === guideId) },
+        state.analysis.find(e => e.guideId === guideId)?.state ?? emptyAnalysisState(),
+        state.publicationJobs.filter(j => j.guideId === guideId), state.privacyAssets.filter(b => b.guideId === guideId),
+        command, at, randomUUID());
+      if (!next) return null;
+      if (next.changed) {
+        state.publicationJobs = state.publicationJobs.filter(j => j.guideId !== guideId || j.id !== next.job.id);
+        state.publicationJobs.push(next.job);
+        if (next.asset) {
+          state.privacyAssets = state.privacyAssets.filter(b => b.id !== next.asset!.id);
+          state.privacyAssets.push(next.asset);
+        }
+        await this.writeState(state);
+      }
+      return clone(next.job);
+    });
+  }
+
+  async listPublicationRecovery(raw: PublicationRecoveryQuery, now?: Date) {
+    const query = publicationRecoveryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.serialize(async () => {
+      const at = publicationTime(fixed), state = await this.readState();
+      return state.publicationJobs.filter(j => (!query.after || j.batchId > query.after) && (query.kind === "queued" ? j.status === "queued" : query.kind === "expired"
+        ? j.status === "running" && Date.parse(j.leaseExpiresAt!) <= at.getTime()
+        : state.privacyAssets.some(b => b.guideId === j.guideId && b.id === j.batchId &&
+          (["failed", "cancelled"].includes(j.status) || (j.status === "succeeded" && b.status === "cleanup")))))
+        .sort((a, b) => a.batchId < b.batchId ? -1 : a.batchId > b.batchId ? 1 : 0).slice(0, query.limit)
+        .map(({ guideId, id, version, batchId }) => ({ guideId, id, version, batchId }));
+    });
+  }
+
   async executePrivacyAssetCommand(guideId: string, command: PrivacyAssetCommand): Promise<PrivacyAssetBatch | null> {
     command = structuredClone(command);
     return this.serialize(async () => {
@@ -614,6 +860,8 @@ export class JsonGuideRepository implements GuideRepository {
       if (!guide) return null;
       const existing = state.privacyAssets.find(b => b.id === command.id);
       if (existing && existing.guideId !== guideId) return null;
+      if (publicationProtectsAsset({ ...guide, steps: [] }, { head: state.publicationHeads.find(h => h.guideId === guideId) ?? null,
+        publications: state.publications.filter(p => p.guideId === guideId) }, command.id)) return null;
       if (command.type === "reserve" && state.privacyAssets.filter(b => b.guideId === guideId).length >= 4) return null;
       const next = transitionPrivacyAsset({ ...guide, steps: state.steps.filter(s => s.guideId === guideId) },
         state.analysis.find(e => e.guideId === guideId)?.state ?? emptyAnalysisState(), existing, command, new Date());
@@ -956,6 +1204,7 @@ export class JsonGuideRepository implements GuideRepository {
       const index = state.guides.findIndex((candidate) => candidate.id === guideId);
       if (index < 0) return null;
       const current = state.guides[index];
+      if (privateMediaExpired(current) && !(status === "failed" && ["DELETION_PENDING", "DELETION_PENDING_ACTIVE"].includes(update?.errorCode ?? ""))) return null;
       if (update?.expectedStatuses && !update.expectedStatuses.includes(current.status)) return null;
       if (
         !matchesExpectedAttempt(
@@ -1020,7 +1269,7 @@ export class JsonGuideRepository implements GuideRepository {
       const index = state.guides.findIndex((candidate) => candidate.id === guideId);
       if (index < 0) return null;
       const current = state.guides[index];
-      if (!options.expectedStatuses.includes(current.status)) return null;
+      if (privateMediaExpired(current) || !options.expectedStatuses.includes(current.status)) return null;
       if (
         !matchesExpectedAttempt(
           current,
@@ -1094,10 +1343,13 @@ export class JsonGuideRepository implements GuideRepository {
       if (!matchesExpectedErrorCode(guide, options?.expectedErrorCode)) return false;
       if (options?.expectedUpdatedAt !== undefined && guide.updatedAt !== options.expectedUpdatedAt) return false;
 
-      if (state.privacyAssets.some(b => b.guideId === guideId)) return false;
+      if (state.privacyAssets.some(b => b.guideId === guideId) || state.privateCleanup.some(r => r.guideId === guideId)) return false;
       state.guides = state.guides.filter((candidate) => candidate.id !== guideId);
       state.steps = state.steps.filter((step) => step.guideId !== guideId);
       state.analysis = state.analysis.filter((entry) => entry.guideId !== guideId);
+      state.publicationJobs = state.publicationJobs.filter(job => job.guideId !== guideId);
+      state.publications = state.publications.filter(p => p.guideId !== guideId);
+      state.publicationHeads = state.publicationHeads.filter(h => h.guideId !== guideId);
       state.funding.batches = state.funding.batches.filter((entry) => entry.guideId !== guideId);
       state.funding.reservations = state.funding.reservations.map((entry) => entry.guideId === guideId ? { ...entry, details: null } : entry);
       await this.writeState(state);
@@ -1192,6 +1444,7 @@ export class JsonGuideRepository implements GuideRepository {
       const state = await this.readState();
       const guideIndex = state.guides.findIndex((guide) => guide.id === guideId);
       if (guideIndex < 0) throw new GuideNotFoundError(guideId);
+      if (privateMediaExpired(state.guides[guideIndex])) throw new GuideNotFoundError(guideId);
 
       state.steps = [
         ...state.steps.filter((step) => step.guideId !== guideId),
@@ -1335,6 +1588,15 @@ export function bindAnalysisActivation(repository: PostgresGuideRepository, raw:
   if (old && JSON.stringify(old) !== JSON.stringify(activation)) throw new AnalysisAccountingError("ANALYSIS_ACCOUNTING_HALTED");
   analysisActivations.set(repository, Object.freeze(activation));
 }
+
+function publicationJobFromRow(row: typeof publicationJobs.$inferSelect): PublicationJob {
+  const job = publicationJobSchema.parse(row.payload);
+  if (job.guideId !== row.guideId || job.id !== row.id || job.batchId !== row.batchId || job.status !== row.status ||
+      publicationAvailableAt(job) !== (row.availableAt?.toISOString() ?? null)) {
+    throw new RepositoryDataError("Invalid publication job projection.");
+  }
+  return job;
+}
 async function checkLockedActivation(transaction: ProcessorTransaction, repository: PostgresGuideRepository,
   control: ReturnType<typeof parseAccountingControl>, guideId: string) {
   const expected = analysisActivations.get(repository);
@@ -1346,7 +1608,21 @@ async function checkLockedActivation(transaction: ProcessorTransaction, reposito
 /** Trusted composition only: recover the exact pool used by a factory-created repository. */
 export function analysisPoolForRepository(repository: PostgresGuideRepository): Pool | undefined { return analysisPools.get(repository); }
 
-export class PostgresGuideRepository implements GuideRepository {
+async function loadPublicationState(tx: ProcessorTransaction, guideId: string, jobs: PublicationJob[]): Promise<PublicationState> {
+  const [row] = await tx.select().from(publicationHeads).where(eq(publicationHeads.guideId, guideId));
+  const head = row ? publicationHeadSchema.parse({ ...row, firstPublishedAt: row.firstPublishedAt.toISOString(),
+    expiresAt: row.expiresAt.toISOString(), updatedAt: row.updatedAt.toISOString() }) : null;
+  const publications = (await tx.select().from(guidePublications).where(eq(guidePublications.guideId, guideId)))
+    .map(row => {
+      const publication = guidePublicationSchema.parse(row.payload);
+      if (publication.guideId !== guideId || publication.id !== row.id || publication.batchId !== row.batchId)
+        throw new RepositoryDataError("Invalid publication snapshot identity.");
+      return publication;
+    });
+  return validatePublicationState({ head, publications }, jobs);
+}
+
+export class PostgresGuideRepository implements GuideRepository, PublicationJobRepository, PublicationRepository, PublicationLifecycleRepository {
   readonly countDispatchContract = "postgres-count-0010" as const;
   // Only a successfully acknowledged, irreversible claim creates a local capability.
   // Serialized/reconstructed tickets, another repository and a restart cannot reuse it.
@@ -1404,8 +1680,258 @@ export class PostgresGuideRepository implements GuideRepository {
   }
 
   getAnalysisState(guideId: string): Promise<AnalysisState | null> { return this.analysisTransaction(guideId); }
+
+  async expirePrivateDraft(guideId: string, raw: PrivateExpiry, now?: Date) {
+    const command = privateExpirySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [row] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!row) return null;
+      const steps = (await tx.select().from(guideSteps).where(eq(guideSteps.guideId, guideId))).map(stepFromRow);
+      const analysis = await loadAnalysisRows(tx, guideId);
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      const state = await loadPublicationState(tx, guideId, jobs);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId))).map(r => {
+        const asset = privacyAssetBatchSchema.parse(r.payload);
+        if (asset.id !== r.id || asset.guideId !== guideId) throw new RepositoryDataError("Invalid private asset identity.");
+        return asset;
+      });
+      const next = preparePrivateExpiry({ ...guideFromRow(row), steps }, analysis, state.head, jobs, assets, command, await analysisWorkClock(tx, fixed), randomUUID());
+      if (!next) return null;
+      const acknowledged = (rows: unknown[], expected = 1) => { if (rows.length !== expected) throw new RepositoryDataError("Private expiry was not acknowledged."); };
+      if (next.cleanup) {
+        acknowledged(await tx.insert(privateMediaCleanup).values({ guideId, id: next.cleanup.id, payload: next.cleanup }).returning());
+        const reservations = await tx.select({ id: analysisReservations.runId }).from(analysisReservations).where(eq(analysisReservations.guideId, guideId));
+        acknowledged(await tx.update(analysisReservations).set({ details: null }).where(eq(analysisReservations.guideId, guideId)).returning(), reservations.length);
+        acknowledged(await tx.delete(guideSteps).where(eq(guideSteps.guideId, guideId)).returning(), steps.length);
+        acknowledged(await tx.delete(guideDrafts).where(eq(guideDrafts.guideId, guideId)).returning(), analysis.draft ? 1 : 0);
+        acknowledged(await tx.delete(analysisRuns).where(eq(analysisRuns.guideId, guideId)).returning(), analysis.runs.length);
+        for (const job of next.jobs) acknowledged(await tx.update(publicationJobs).set({ payload: job, status: job.status, availableAt: null })
+          .where(and(eq(publicationJobs.guideId, guideId), eq(publicationJobs.id, job.id))).returning());
+        for (const asset of next.assets) acknowledged(await tx.update(guideAssets).set({ payload: asset })
+          .where(and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, asset.id))).returning());
+      }
+      const { steps: _steps, ...guide } = next.guide;
+      acknowledged(await tx.update(guides).set(guideToInsert(guide)).where(eq(guides.id, guideId)).returning());
+      return guide;
+    });
+  }
+  async getPrivateCleanup(guideId: string) {
+    const [row] = await this.database.select().from(privateMediaCleanup).where(eq(privateMediaCleanup.guideId, guideId)).limit(1);
+    if (!row) return null;
+    const payload = privateCleanupSchema.parse(row.payload);
+    if (payload.guideId !== guideId || payload.id !== row.id) throw new RepositoryDataError("Invalid private cleanup identity.");
+    return payload;
+  }
+  async listPrivateCleanup(raw: PrivateCleanupQuery) {
+    const query = privateCleanupQuerySchema.parse(raw);
+    const rows = await this.database.select().from(privateMediaCleanup)
+      .where(query.after ? gt(privateMediaCleanup.id, query.after) : undefined).orderBy(asc(privateMediaCleanup.id)).limit(query.limit);
+    return rows.map(row => {
+      const payload = privateCleanupSchema.parse(row.payload);
+      if (payload.guideId !== row.guideId || payload.id !== row.id) throw new RepositoryDataError("Invalid private cleanup identity.");
+      return payload;
+    });
+  }
+  async completePrivateCleanup(guideId: string, cleanupId: string) {
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select({ id: guides.id }).from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return true;
+      const [row] = await tx.select().from(privateMediaCleanup).where(eq(privateMediaCleanup.guideId, guideId));
+      if (!row) return true;
+      if (row.id !== cleanupId) return false;
+      const removed = await tx.delete(privateMediaCleanup).where(and(eq(privateMediaCleanup.guideId, guideId), eq(privateMediaCleanup.id, cleanupId))).returning();
+      if (removed.length !== 1) throw new RepositoryDataError("Private cleanup was not acknowledged.");
+      return true;
+    });
+  }
+  async listExpiredRetainedGuides(limit?: number, now?: Date) {
+    const safeLimit = normalizedLimit(limit), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const at = await analysisWorkClock(tx, fixed);
+      const rows = await tx.select().from(guides).where(and(eq(guides.status, "failed"), eq(guides.errorCode, PRIVATE_MEDIA_EXPIRED),
+        sql`not exists (select 1 from ${publicationHeads} where ${publicationHeads.guideId} = ${guides.id}
+          and ${publicationHeads.activePublicationId} is not null and ${publicationHeads.expiresAt} > ${at})`))
+        .orderBy(asc(guides.updatedAt)).limit(safeLimit);
+      return rows.map(guideFromRow);
+    });
+  }
   executeAnalysisCommand(guideId: string, command: AnalysisCommand): Promise<AnalysisState | null> {
     return this.analysisTransaction(guideId, command);
+  }
+
+  async getPublicationJob(guideId: string, jobId: string): Promise<PublicationJob | null> {
+    const [row] = await this.database.select().from(publicationJobs)
+      .where(and(eq(publicationJobs.guideId, guideId), eq(publicationJobs.id, jobId))).limit(1);
+    return row ? publicationJobFromRow(row) : null;
+  }
+
+  async listPublicationWork(limit = 20, now?: Date) {
+    limit = publicationWorkLimit(limit); const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const at = await analysisWorkClock(tx, fixed);
+      const rows = await tx.select().from(publicationJobs).where(lte(publicationJobs.availableAt, at))
+        .orderBy(asc(publicationJobs.availableAt), asc(publicationJobs.guideId), asc(publicationJobs.id)).limit(limit);
+      return rows.map(row => { const { guideId, id, version } = publicationJobFromRow(row); return { guideId, id, version }; });
+    });
+  }
+
+  async getPublicationState(guideId: string): Promise<PublicationState | null> {
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("share");
+      if (!guide) return null;
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      return loadPublicationState(tx, guideId, jobs);
+    });
+  }
+
+  async getPublicationOwnerStatus(guideId: string, jobId?: string, now?: Date) {
+    if (jobId !== undefined) publicationCommitSchema.shape.id.parse(jobId);
+    const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("share");
+      if (!guide) return null;
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      const state = await loadPublicationState(tx, guideId, jobs);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId))).map(row => {
+        const batch = privacyAssetBatchSchema.parse(row.payload);
+        if (batch.guideId !== guideId || batch.id !== row.id) throw new RepositoryDataError("Invalid private asset identity.");
+        return batch;
+      });
+      return selectPublicationOwnerStatus({ ...guideFromRow(guide), steps: [] }, state, jobs, assets, jobId, await analysisWorkClock(tx, fixed));
+    });
+  }
+
+  async commitPublication(guideId: string, raw: PublicationCommit, now?: Date) {
+    const command = publicationCommitSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      const state = await loadPublicationState(tx, guideId, jobs);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId))).map(row => {
+        const asset = privacyAssetBatchSchema.parse(row.payload);
+        if (asset.id !== row.id || asset.guideId !== guideId) throw new RepositoryDataError("Invalid private asset identity.");
+        return asset;
+      });
+      const steps = (await tx.select().from(guideSteps).where(eq(guideSteps.guideId, guideId))).map(stepFromRow);
+      const next = preparePublicationCommit({ ...guideFromRow(guide), steps }, await loadAnalysisRows(tx, guideId), jobs, assets, state,
+        command, await analysisWorkClock(tx, fixed), randomBytes(24).toString("base64url"));
+      if (!next) return null;
+      if (next.changed) {
+        const acknowledged = (rows: unknown[]) => { if (rows.length !== 1) throw new RepositoryDataError("Publication commit was not acknowledged."); };
+        if (next.oldAsset) acknowledged(await tx.update(guideAssets).set({ payload: next.oldAsset })
+          .where(and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, next.oldAsset.id))).returning());
+        const publication = next.result.publication;
+        acknowledged(await tx.insert(guidePublications).values({ guideId, id: publication.id, batchId: publication.batchId, payload: publication }).returning());
+        acknowledged(await tx.update(publicationJobs).set({ status: next.job.status, payload: next.job, availableAt: null })
+          .where(and(eq(publicationJobs.guideId, guideId), eq(publicationJobs.id, next.job.id))).returning());
+        const head = next.result.head, values = { ...head, firstPublishedAt: new Date(head.firstPublishedAt),
+          expiresAt: new Date(head.expiresAt), updatedAt: new Date(head.updatedAt) };
+        acknowledged(state.head ? await tx.update(publicationHeads).set(values).where(eq(publicationHeads.guideId, guideId)).returning()
+          : await tx.insert(publicationHeads).values(values).returning());
+      }
+      return next.result;
+    });
+  }
+
+  async executePublicationCommand(guideId: string, command: PublicationCommand, now?: Date): Promise<PublicationJob | null> {
+    command = publicationCommandSchema.parse(command);
+    const fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId))).map(row => {
+        const batch = privacyAssetBatchSchema.parse(row.payload);
+        if (batch.guideId !== guideId || batch.id !== row.id) throw new RepositoryDataError("Invalid private asset identity.");
+        return batch;
+      });
+      const steps = await tx.select().from(guideSteps).where(eq(guideSteps.guideId, guideId));
+      const state = await loadPublicationState(tx, guideId, jobs), analysis = await loadAnalysisRows(tx, guideId);
+      const at = await analysisWorkClock(tx, fixed);
+      if (!publicationPreparationAllowed(state.head, jobs, command, at)) return null;
+      const next = transitionPublicationJob({ ...guideFromRow(guide), steps: steps.map(stepFromRow) },
+        analysis, jobs, assets, command, at, randomUUID());
+      if (!next) return null;
+      if (next.changed) {
+        if (next.asset) {
+          const asset = next.asset;
+          const written = assets.some(b => b.id === asset.id)
+            ? await tx.update(guideAssets).set({ payload: asset }).where(and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, asset.id))).returning()
+            : await tx.insert(guideAssets).values({ guideId, id: asset.id, payload: asset }).returning();
+          if (written.length !== 1) throw new RepositoryDataError("Publication asset write was not acknowledged.");
+        }
+        const job = next.job, available = publicationAvailableAt(job);
+        const values = { guideId, id: job.id, batchId: job.batchId, status: job.status, payload: job,
+          availableAt: available === null ? null : new Date(available) };
+        const written = jobs.some(j => j.id === job.id)
+          ? await tx.update(publicationJobs).set(values).where(and(eq(publicationJobs.guideId, guideId), eq(publicationJobs.id, job.id))).returning()
+          : await tx.insert(publicationJobs).values(values).returning();
+        if (written.length !== 1) throw new RepositoryDataError("Publication job write was not acknowledged.");
+      }
+      return next.job;
+    });
+  }
+
+  async stopPublication(guideId: string, raw: PublicationStop, now?: Date) {
+    const command = publicationStopSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
+      if (!guide) return null;
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      const state = await loadPublicationState(tx, guideId, jobs);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId))).map(row => {
+        const batch = privacyAssetBatchSchema.parse(row.payload);
+        if (batch.guideId !== guideId || batch.id !== row.id) throw new RepositoryDataError("Invalid private asset identity.");
+        return batch;
+      });
+      const next = preparePublicationStop({ ...guideFromRow(guide), steps: [] }, state, jobs, assets, command, await analysisWorkClock(tx, fixed));
+      if (!next) return null;
+      if (next.result.changed) {
+        const acknowledged = (rows: unknown[]) => { if (rows.length !== 1) throw new RepositoryDataError("Publication stop was not acknowledged."); };
+        if (next.result.head) acknowledged(await tx.update(publicationHeads).set({ activePublicationId: null,
+          version: next.result.head.version, updatedAt: new Date(next.result.head.updatedAt) }).where(eq(publicationHeads.guideId, guideId)).returning());
+        for (const job of next.jobs) acknowledged(await tx.update(publicationJobs).set({ status: job.status, payload: job, availableAt: null })
+          .where(and(eq(publicationJobs.guideId, guideId), eq(publicationJobs.id, job.id))).returning());
+        for (const batch of next.assets) acknowledged(await tx.update(guideAssets).set({ payload: batch })
+          .where(and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, batch.id))).returning());
+      }
+      return next.result;
+    });
+  }
+
+  async getAccessiblePublication(raw: PublicationAccess, now?: Date) {
+    const query = publicationAccessSchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const [candidate] = await tx.select({ guideId: publicationHeads.guideId }).from(publicationHeads)
+        .where(eq(publicationHeads.publicSlug, query.slug)).limit(1);
+      if (!candidate) return null;
+      const [guide] = await tx.select().from(guides).where(eq(guides.id, candidate.guideId)).limit(1).for("share");
+      if (!guide) return null;
+      // Re-read after the parent lock; a pre-lock head/image lookup is not authority.
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guide.id))).map(publicationJobFromRow);
+      const state = await loadPublicationState(tx, guide.id, jobs);
+      const assets = (await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guide.id))).map(row => {
+        const batch = privacyAssetBatchSchema.parse(row.payload);
+        if (batch.guideId !== guide.id || batch.id !== row.id) throw new RepositoryDataError("Invalid private asset identity.");
+        return batch;
+      });
+      return selectAccessiblePublication({ ...guideFromRow(guide), steps: [] }, state, assets, query, await analysisWorkClock(tx, fixed));
+    });
+  }
+
+  async listExpiredPublications(raw: PublicationExpiryQuery, now?: Date) {
+    const query = publicationExpiryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const at = await analysisWorkClock(tx, fixed);
+      const rows = await tx.select().from(publicationHeads).where(and(lte(publicationHeads.expiresAt, at),
+        or(isNotNull(publicationHeads.activePublicationId), sql`exists (select 1 from ${publicationJobs}
+          where ${publicationJobs.guideId} = ${publicationHeads.guideId} and ${publicationJobs.status} in ('queued', 'running'))`),
+        query.after ? or(gt(publicationHeads.expiresAt, new Date(query.after.expiresAt)),
+          and(eq(publicationHeads.expiresAt, new Date(query.after.expiresAt)), sql`${publicationHeads.publicSlug} collate "C" > ${query.after.publicSlug}`)) : undefined))
+        .orderBy(asc(publicationHeads.expiresAt), sql`${publicationHeads.publicSlug} collate "C"`).limit(query.limit);
+      return rows.map(row => ({ guideId: row.guideId, version: row.version, expiresAt: row.expiresAt.toISOString(), publicSlug: row.publicSlug }));
+    });
   }
 
   async listPrivacyAssetBatches(guideId: string): Promise<PrivacyAssetBatch[]> {
@@ -1417,12 +1943,30 @@ export class PostgresGuideRepository implements GuideRepository {
     });
   }
 
+  async listPublicationRecovery(raw: PublicationRecoveryQuery, now?: Date) {
+    const query = publicationRecoveryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
+    return this.database.transaction(async tx => {
+      const at = await analysisWorkClock(tx, fixed);
+      const rows = await tx.select({ job: publicationJobs }).from(publicationJobs)
+        .leftJoin(guideAssets, and(eq(guideAssets.id, publicationJobs.batchId), eq(guideAssets.guideId, publicationJobs.guideId)))
+        .where(and(query.after ? gt(publicationJobs.batchId, query.after) : undefined, query.kind === "queued" ? eq(publicationJobs.status, "queued") : query.kind === "expired"
+          ? and(eq(publicationJobs.status, "running"), lte(publicationJobs.availableAt, at))
+          : and(or(inArray(publicationJobs.status, ["failed", "cancelled"]),
+            and(eq(publicationJobs.status, "succeeded"), sql`${guideAssets.payload}->>'status' = 'cleanup'`)), isNotNull(guideAssets.id))))
+        .orderBy(asc(publicationJobs.batchId)).limit(query.limit);
+      return rows.map(row => { const { guideId, id, version, batchId } = publicationJobFromRow(row.job);
+        return { guideId, id, version, batchId }; });
+    });
+  }
+
   async executePrivacyAssetCommand(guideId: string, command: PrivacyAssetCommand): Promise<PrivacyAssetBatch | null> {
     command = structuredClone(command);
     return this.database.transaction(async tx => {
       const [guide] = await tx.select().from(guides).where(eq(guides.id, guideId)).limit(1).for("update");
       if (!guide) return null;
       const rows = await tx.select().from(guideAssets).where(eq(guideAssets.guideId, guideId));
+      const jobs = (await tx.select().from(publicationJobs).where(eq(publicationJobs.guideId, guideId))).map(publicationJobFromRow);
+      if (publicationProtectsAsset({ ...guideFromRow(guide), steps: [] }, await loadPublicationState(tx, guideId, jobs), command.id)) return null;
       if (command.type === "reserve" && rows.length >= 4) return null;
       const existing = rows.find(row => row.id === command.id);
       if (existing && (existing.payload.id !== existing.id || existing.payload.guideId !== guideId)) {
@@ -1433,9 +1977,10 @@ export class PostgresGuideRepository implements GuideRepository {
         await loadAnalysisRows(tx, guideId), existing?.payload, command, await analysisWorkClock(tx));
       if (!next) return null;
       const where = and(eq(guideAssets.guideId, guideId), eq(guideAssets.id, command.id));
-      if (next.remove) await tx.delete(guideAssets).where(where);
-      else if (existing) await tx.update(guideAssets).set({ payload: next.batch }).where(where);
-      else await tx.insert(guideAssets).values({ guideId, id: command.id, payload: next.batch });
+      const written = next.remove ? await tx.delete(guideAssets).where(where).returning()
+        : existing ? await tx.update(guideAssets).set({ payload: next.batch }).where(where).returning()
+        : await tx.insert(guideAssets).values({ guideId, id: command.id, payload: next.batch }).returning();
+      if (written.length !== 1) throw new RepositoryDataError("Private asset write was not acknowledged.");
       return next.batch;
     });
   }
@@ -2066,6 +2611,8 @@ export class PostgresGuideRepository implements GuideRepository {
     const expectedAttemptId = update?.expectedProcessingAttemptId;
     const predicate = and(
       eq(guides.id, guideId),
+      status === "failed" && ["DELETION_PENDING", "DELETION_PENDING_ACTIVE"].includes(update?.errorCode ?? "") ? undefined
+        : or(isNull(guides.errorCode), sql`${guides.errorCode} <> ${PRIVATE_MEDIA_EXPIRED}`),
       update?.expectedUpdatedAt === undefined
         ? undefined
         : eq(guides.updatedAt, new Date(update.expectedUpdatedAt)),
@@ -2145,7 +2692,7 @@ export class PostgresGuideRepository implements GuideRepository {
       if (!row) return null;
 
       const current = guideFromRow(row);
-      if (!options.expectedStatuses.includes(current.status)) return null;
+      if (privateMediaExpired(current) || !options.expectedStatuses.includes(current.status)) return null;
       if (
         !matchesExpectedAttempt(
           current,
@@ -2266,7 +2813,8 @@ export class PostgresGuideRepository implements GuideRepository {
       if (!matchesExpectedErrorCode(guide, options?.expectedErrorCode)) return false;
       if (options?.expectedUpdatedAt !== undefined && guide.updatedAt !== options.expectedUpdatedAt) return false;
 
-      if ((await transaction.select({ id: guideAssets.id }).from(guideAssets).where(eq(guideAssets.guideId, guideId)).limit(1)).length) return false;
+      if ((await transaction.select({ id: guideAssets.id }).from(guideAssets).where(eq(guideAssets.guideId, guideId)).limit(1)).length ||
+        (await transaction.select({ id: privateMediaCleanup.id }).from(privateMediaCleanup).where(eq(privateMediaCleanup.guideId, guideId)).limit(1)).length) return false;
       await transaction.delete(guideSteps).where(eq(guideSteps.guideId, guideId));
       // Preserve maximum accounting + opaque IDs, remove consent/media/policy details.
       await transaction.update(analysisReservations).set({ details: null }).where(eq(analysisReservations.guideId, guideId));
@@ -2366,12 +2914,13 @@ export class PostgresGuideRepository implements GuideRepository {
 
     return this.database.transaction(async (transaction) => {
       const [guide] = await transaction
-        .select({ id: guides.id })
+        .select({ id: guides.id, status: guides.status, errorCode: guides.errorCode })
         .from(guides)
         .where(eq(guides.id, guideId))
         .limit(1)
         .for("update");
       if (!guide) throw new GuideNotFoundError(guideId);
+      if (privateMediaExpired(guide)) throw new GuideNotFoundError(guideId);
 
       await transaction.delete(guideSteps).where(eq(guideSteps.guideId, guideId));
       const created = nextSteps.length

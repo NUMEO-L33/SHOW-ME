@@ -299,13 +299,14 @@ test("v3 upgrades on write without resetting queued work and rejects downgraded 
   const body = await h.begin();
   const old = await h.state(); old.version = 3;
   delete old.privacyAssets;
+  delete old.publicationJobs; delete old.publications; delete old.publicationHeads; delete old.privateCleanup;
   for (const r of old.funding.reservations) { delete r.released; delete r.closedAt; }
   await writeFile(h.repository.filePath, JSON.stringify(old));
   assert.equal((await new JsonGuideRepository(h.repository.filePath).getAnalysisState(h.guideId))?.runs[0].attemptCount, 1);
   assert.equal((await h.state()).version, 3); // Read-only migration does not rewrite disk.
   await h.complete(body);
   const saved = await h.state();
-  assert.equal(saved.version, 6);
+  assert.equal(saved.version, 9);
   assert.deepEqual(saved.funding.reservations.map(({ released, closedAt, ...r }: Record<string, unknown>) => {
     void released; void closedAt; return r;
   }), old.funding.reservations);

@@ -5,7 +5,7 @@ import { getTableConfig } from "drizzle-orm/pg-core";
 
 import { analysisManifest, ANALYSIS_CONSENT_VERSION } from "../src/processor/analysis-contract.js";
 import { AnalysisFundingError, parseFundingLedger, type AnalysisFundingCommand, type AnalysisFundingPolicy } from "../src/processor/analysis-funding.js";
-import { analysisBatchesTable, analysisBudgetWindows, analysisReservations, analysisRuns, guides, guideSteps, guideAssets } from "../src/processor/db/schema.js";
+import { analysisBatchesTable, analysisBudgetWindows, analysisReservations, analysisRuns, guides, guideSteps, guideAssets, privateMediaCleanup } from "../src/processor/db/schema.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { JsonGuideRepository, PostgresGuideRepository, type ProcessorDatabase } from "../src/processor/repository.js";
 import { createAnalysisHarness } from "./helpers/analysis-fixtures.js";
@@ -38,7 +38,7 @@ test("funding atomically saves the draft, run, six bounded batches and both budg
   assert.deepEqual(result.batches[0].contextIds, ["step-4"]);
   assert.deepEqual(result.batches[1].contextIds, ["step-3", "step-8"]);
   const saved = await h.state();
-  assert.equal(saved.version, 6);
+  assert.equal(saved.version, 9);
   assert.equal(saved.funding.reservations.length, 1);
   assert.equal(saved.funding.windows.length, 2);
   for (const window of saved.funding.windows) assert.deepEqual(window.used, result.reservation.maximum);
@@ -212,11 +212,12 @@ test("legacy files upgrade on write and malformed accounting is never reset on r
   const legacy = await h.state();
   legacy.version = 1;
   delete legacy.privacyAssets;
+  delete legacy.publicationJobs; delete legacy.publications; delete legacy.publicationHeads; delete legacy.privateCleanup;
   delete legacy.funding;
   await writeFile(h.repository.filePath, JSON.stringify(legacy));
   assert.ok(await h.reserve());
   const saved = await h.state();
-  assert.equal(saved.version, 6);
+  assert.equal(saved.version, 9);
   const invalid = [ { ...saved, funding: null }, { ...saved, funding: undefined }, { ...saved, version: 1 } ];
   const tampered = structuredClone(saved);
   tampered.funding.windows[0].used.requests = 0;
@@ -269,7 +270,7 @@ test("Postgres deletion orchestration redacts reservation details only after gua
   // Verifies repository call placement only, not SQL, locks, rollback or cascades.
   const transaction = {
     select: () => ({ from: (table: unknown) => {
-      if (table === guideAssets) return { where: () => ({ limit: async () => [] }) };
+      if (table === guideAssets || table === privateMediaCleanup) return { where: () => ({ limit: async () => [] }) };
       assert.equal(table, guides);
       return { where: () => ({ limit: () => ({ for: async () => [row] }) }) };
     } }),

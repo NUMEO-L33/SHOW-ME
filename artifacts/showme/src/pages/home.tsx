@@ -42,6 +42,7 @@ import { DraftAutosave } from "@/lib/draft-autosave";
 import { applyAnalysisPreview, type AnalysisPreview } from "@/lib/analysis-review";
 import { AnalysisWorkflow } from "@/components/analysis-workflow";
 import { PrivacyEditor } from "@/components/privacy-editor";
+import { PublicationWorkflow } from "@/components/publication-workflow";
 import type { DraftIdentity } from "@/lib/draft-client";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -87,6 +88,7 @@ function persistActiveJob(job: ActiveJob, fileName: string): void {
 
 function clearActiveJobCredentials(guideId: string): void {
   try { window.localStorage.removeItem(recoverableCredentialKey(guideId)); } catch { /* no-op */ }
+  try { window.localStorage.removeItem(`showme:publication-request:${guideId}`); } catch { /* no-op */ }
   try {
     if (window.sessionStorage.getItem(ACTIVE_JOB_SESSION_KEY) === guideId) {
       window.sessionStorage.removeItem(ACTIVE_JOB_SESSION_KEY);
@@ -347,9 +349,10 @@ type ReviewScreenProps = {
   privacyIdentity?: DraftIdentity;
   privacyBase?: DraftSnapshot;
   onPrivacySaved: (before: DraftSnapshot, saved: DraftSnapshot) => boolean;
+  publicationControl?: React.ReactNode;
 };
 
-function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview, privacyIdentity, privacyBase, onPrivacySaved }: ReviewScreenProps) {
+function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActiveIndex, onPreview, onPublished, onDeleteDraft, isLiveDraft, onFrameError, intent, onIntentApply, onSave, onReload, draftDirty, draftSaving, draftLoading, draftError, onCompositionChange, analysisReview, privacyIdentity, privacyBase, onPrivacySaved, publicationControl }: ReviewScreenProps) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [regenerating, setRegenerating] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -494,20 +497,13 @@ function ReviewScreen({ title, setTitle, steps, setSteps, activeIndex, setActive
                 <Trash2 className="size-4" /><span className="hidden lg:inline">전체 삭제</span>
               </Button>
             )}
-            <Button variant="outline" className="h-10 rounded-[12px] border-[#dce1ea] px-3 font-extrabold sm:px-4" aria-label="받는 화면" onClick={onPreview}><Eye className="size-4" /><span className="hidden sm:inline">받는 화면</span></Button>
-            <Button
+            <Button variant="outline" className="h-10 rounded-[12px] border-[#dce1ea] px-3 font-extrabold sm:px-4" aria-label={isLiveDraft ? "편집 미리보기" : "받는 화면"} onClick={onPreview}><Eye className="size-4" /><span className="hidden sm:inline">{isLiveDraft ? "편집 미리보기" : "받는 화면"}</span></Button>
+            {isLiveDraft ? publicationControl : <Button
               className="h-10 rounded-[12px] px-4 font-extrabold shadow-[0_8px_20px_rgba(255,105,78,.2)]"
-              onClick={() => {
-                if (isLiveDraft) {
-                  toast.info("개인정보 영구 가림과 공유를 연결한 뒤 공개할 수 있어요. 현재 초안은 비공개입니다.");
-                  return;
-                }
-                setPrivacyConfirmed(false);
-                setPublishOpen(true);
-              }}
+              onClick={onPreview}
             >
-              {isLiveDraft ? "공개 준비 중" : "공개하기"}<ArrowRight className="size-4" />
-            </Button>
+              예시 화면 보기<ArrowRight className="size-4" />
+            </Button>}
           </div>
         </div>
       </header>
@@ -1426,7 +1422,7 @@ export default function Home() {
   };
 
   if (mode === "viewer") {
-    return <PublicGuide title={previewTitle} steps={steps} onExit={() => setMode(previousMode.current)} />;
+    return <PublicGuide title={previewTitle} steps={steps} privatePreview={processingKind === "video"} onExit={() => setMode(previousMode.current)} />;
   }
 
   return (
@@ -1447,6 +1443,7 @@ export default function Home() {
           onCheck={() => { setJobIssue(null); setHasServerStatus(false); setCheckVersion((value) => value + 1); }}
         />
       )}
+      {mode === "processing" && processingError && activeJob && activeJob.phase !== "deleting" && <div className="flex justify-center p-4"><PublicationWorkflow key={activeJob.guideId} identity={activeJob} blocked /></div>}
       {mode === "review" && (
         <ReviewScreen
           title={title}
@@ -1471,6 +1468,8 @@ export default function Home() {
           onCompositionChange={onDraftCompositionChange}
           privacyIdentity={processingKind === "video" && activeJob ? activeJob : undefined}
           privacyBase={draftSnapshot ?? undefined}
+          publicationControl={processingKind === "video" && activeJob ? <PublicationWorkflow key={activeJob.guideId} identity={activeJob} base={draftSnapshot ?? undefined}
+            blocked={draftDirty || draftSaving || draftLoading || Boolean(draftError) || draftComposing || activeJob.phase === "deleting"} /> : undefined}
           onPrivacySaved={(before, saved) => Boolean(activeJobRef.current?.guideId === before.guideId && activeJobRef.current.phase !== "deleting" &&
             draftAutosaveRef.current?.acceptPrivacySave(before, saved))}
           analysisReview={processingKind === "video" && activeJob && draftSnapshot ? <AnalysisWorkflow

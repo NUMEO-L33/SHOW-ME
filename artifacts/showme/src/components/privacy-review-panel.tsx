@@ -57,7 +57,7 @@ export function PrivacyReviewPanel({ identity, base, stepId, disabled, previewVe
       <Button variant="outline" disabled={blocked} onClick={() => void act({ type: "text", stepId, confirmed: !step.textConfirmed })}>{step.textConfirmed ? "이 단계 문구 확인 취소" : "이 단계 문구의 개인정보를 확인했어요"}</Button>
       <p className="text-sm break-words">가이드 제목: {base.document.title}</p>
       <Button variant="outline" disabled={blocked} onClick={() => void act({ type: "title", confirmed: !review!.titleConfirmed })}>{review?.titleConfirmed ? "제목 확인 취소" : "제목의 개인정보를 확인했어요"}</Button>
-      <p role="status" className="text-sm">{busy ? "확인 저장 중…" : review?.complete ? "모든 단계의 직접 확인이 저장됐어요. 공개 공유는 준비 중입니다." : "아직 직접 확인할 항목이 남아 있어요."}</p>
+      <p role="status" className="text-sm">{busy ? "확인 저장 중…" : review?.complete ? "모든 단계의 직접 확인이 저장됐어요. ‘게시·공유 관리’에서 공개 준비 상태를 확인하세요." : "아직 직접 확인할 항목이 남아 있어요."}</p>
     </>}
   </section>;
 }

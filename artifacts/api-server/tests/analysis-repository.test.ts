@@ -12,6 +12,7 @@ test("analysis state initializes lazily and survives reopening a legacy JSON rep
   const legacy = JSON.parse(await readFile(repository.filePath, "utf8"));
   legacy.version = 1;
   delete legacy.privacyAssets;
+  delete legacy.publicationJobs; delete legacy.publications; delete legacy.publicationHeads; delete legacy.privateCleanup;
   delete legacy.funding;
   delete legacy.analysis;
   await writeFile(repository.filePath, JSON.stringify(legacy));

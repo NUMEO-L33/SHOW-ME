@@ -56,7 +56,7 @@ export function PrivacyEditor({ step, onChange, disabled: editorDisabled, previe
       <p className="flex items-center gap-2 font-black"><ShieldCheck className="size-4" />개인정보 가림</p>
       <p className="leading-6 text-muted-foreground">가림 영역 {masks.length}개 · 켜짐 {masks.filter(m => m.enabled).length}개. 자동 탐지 결과나 안전 판정이 아닙니다.</p>
       <Button variant="outline" className="min-h-11 w-full" disabled={disabled} onClick={() => setOpen(true)}>가림 영역 편집</Button>
-      <p className="text-xs leading-5 text-muted-foreground">영역은 자동 저장됩니다. 처리본은 비공개로 확인하며 원본·AI 전송 이미지에는 적용되지 않습니다. 공개 공유는 준비 중입니다.</p>
+      <p className="text-xs leading-5 text-muted-foreground">영역은 자동 저장됩니다. 처리본은 비공개로 확인하며 원본·AI 전송 이미지에는 적용되지 않습니다. 공개 여부는 ‘게시·공유 관리’에서 따로 확인하세요.</p>
     </div>
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-h-[90dvh] max-w-3xl overflow-y-auto [&_button]:min-h-11 [&_input]:min-h-11">

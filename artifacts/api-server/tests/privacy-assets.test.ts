@@ -155,13 +155,13 @@ test("timeout holds writer ownership until late storage settles; deletion never 
 
 test("legacy JSON v5 upgrades without rewriting on read; malformed asset identities fail closed", async t => {
   const h = await fixture(t), file = JSON.parse(await readFile(h.repository.filePath, "utf8"));
-  file.version = 5; delete file.privacyAssets;
+  file.version = 5; delete file.privacyAssets; delete file.publicationJobs; delete file.publications; delete file.publicationHeads; delete file.privateCleanup;
   await writeFile(h.repository.filePath, JSON.stringify(file));
   const before = await readFile(h.repository.filePath);
   assert.deepEqual(await h.repository.listPrivacyAssetBatches(h.guideId), []);
   assert.deepEqual(await readFile(h.repository.filePath), before);
   const batch = (await h.reserve())!;
-  assert.equal(JSON.parse(await readFile(h.repository.filePath, "utf8")).version, 6);
+  assert.equal(JSON.parse(await readFile(h.repository.filePath, "utf8")).version, 9);
   assert.throws(() => privacyAssetBatchSchema.parse({ ...batch, status: "ready" }));
   assert.throws(() => privacyAssetBatchSchema.parse({ ...batch, frames: [...batch.frames, batch.frames[0]] }));
   assert.throws(() => privacyAssetBatchSchema.parse({ ...batch, frames: [{ ...batch.frames[0], sourceKey: "guides/another/private.jpg" }] }));
