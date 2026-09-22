@@ -2,7 +2,19 @@
 
 사용자가 Docker 오류 확인 후 `저장해`라고 요청하여 진행 상황을 저장했고, 이후 `docker 실행 완료`를 알려 실제 DB 검사를 재개했다. 이 문서는 최신 인계 기록이다. 원래 개발 계획의 목표나 완료 조건은 바꾸지 않는다. 아래 결과는 저장 시점의 관측이며 재개 시 최신 상태를 확인한다.
 
-## 최신 점검 — 2026-09-22 Replit 반영 전 읽기 전용 확인
+## 최신 반영 — 2026-09-22 Replit 개발 코드·DB·권한·재시작 완료
+
+사용자가 직전 제안한 커밋·푸시 → Replit 개발환경 업데이트 → migration/기존 역할 최소 권한 → API 재시작 범위를 승인했다. 기능 작업 `feb29ec`와 검사 보완 `227a7ef`를 기존 `codex/replit-migration-hardening` 브랜치로 푸시·반영했다. 원래 개발 MD의 목표·완료 조건은 변경하지 않았다.
+
+첫 Replit 전체 검사의 CLI 시작 timeout, 비추적 실제 JPEG 읽기 오류, 비동기 read 개수 경합 3건은 기록하고 DB 반영을 보류했다. CLI 지연 import, 테스트 실제 시작 신호/모의 시계, 파일 단위 직렬 실행을 보완한 후 로컬과 Replit 일반 전체 **1,044개**(이관 100 / 서버 828 / 클라이언트 116), 실패·취소·생략 없이 통과했다. 로컬 API 타입/빌드, Replit workspace 타입 검사와 전체 빌드도 통과했다. PostgreSQL 135개는 앞선 별도 일회용 DB 검증 결과이며 이번에 다시 실행한 것으로 표기하지 않는다.
+
+Replit API/web를 중지하고 정확한 프로젝트·DB 대상·기존 13개 이력을 검증한 뒤 migration **0013–0017 적용 및 18개 이력 일치**를 확인했다. 기존 guides/guide_steps/guide_drafts 행 수는 전후 각각 **1/1/1**이다. 새 5개 테이블의 필요한 권한만 기존 runtime 계정에 부여했고 publication UPDATE와 과도한 권한 거부 및 기존 역할 전체 검사를 실제 연결로 확인했다. 새 계정·키·비밀번호·.env는 변경하지 않았다.
+
+API/web 재시작 후 API 프로세스 **1개**, runtime binding 일치, migration `verify-only`, AI `off`, AI 키/별도 관리자 DB 환경 없음, health **200**, Preview 새로고침 초기 화면을 확인했다. 공개 실행기와 외부 AI는 계속 **OFF**이며 Replit Publish는 누르지 않았다. 초기 UI 재시작 확인 중 API 0개가 관측된 상태는 완료로 취급하지 않고 재실행 후 검증했다. 상세와 남은 제한은 `REPLIT_PUBLICATION_READINESS.md`.
+
+**다음은 합성 자료만 쓰는 Replit 저장소 쓰기·재읽기·정리 및 게시/철회 실환경 검증 범위 확정과 활성화 검토다.** 아직 공개 서비스나 E3/F1 전체 완료가 아니다. IAM/ACL 확인, 불확실 원격 쓰기의 운영 해소, 실제 수신자/모바일 검증도 남는다. 이번 반영에서는 신규 합성 업로드·개인 영상·실제 외부 AI 전송을 하지 않았다.
+
+## 이전 점검 — 2026-09-22 Replit 반영 전 읽기 전용 확인
 
 기존 SHOW-ME 개발환경을 조회했다. Replit은 변경 파일 없는 `a2aecd9`이며 현재 DB migration 13개(0000–0012)가 해당 소스와 정확히 일치한다. 로컬 새 코드에 필요한 0013–0017과 새 테이블 5개는 미반영이다. 기존 앱 DB 계정 연결·전체 최소 권한 검사, 실행 API 1개의 runtime binding/verify-only/AI off 확인, health 200, 명시적 Replit bucket의 인증 목록 조회를 통과했다. 저장소는 임의의 빈 진단 prefix만 조회했고 개인 객체 내용은 읽지 않았다. 전체 IAM 감사나 처리본 쓰기/삭제 검증은 아니다. 상세는 `REPLIT_PUBLICATION_READINESS.md`.
 
