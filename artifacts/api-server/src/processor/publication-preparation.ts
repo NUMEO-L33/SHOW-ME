@@ -41,6 +41,7 @@ export async function preparePublicationAssets(raw: PublicationPreparationOption
   const cancelled = new AbortController(), parent = AbortSignal.any([options.signal, cancelled.signal]);
   return privateAssetSession(parent, options.timeoutMs ?? 120_000, async signal => {
     const leaseId = randomUUID();
+    const writes = { unconfirmed: false };
     let observed: PublicationJob | null = null, claimed: PublicationJob | null = null, completionStarted = false;
     let monitor: NodeJS.Timeout | undefined, checking: Promise<void> | undefined, finishing = false;
     const stopMonitor = () => { if (monitor) clearInterval(monitor); monitor = undefined; };
@@ -75,7 +76,7 @@ export async function preparePublicationAssets(raw: PublicationPreparationOption
       const batch = privacyAssetBatchSchema.parse(rawBatch);
       if (batch.guideId !== guideId || batch.writerId !== leaseId || batch.status !== "writing" || batch.writerSettled)
         throw new PrivacyAssetWriteError();
-      const receipts = await renderOwnedPrivateAssets(options, batch, leaseId, signal, check);
+      const receipts = await renderOwnedPrivateAssets(options, batch, leaseId, signal, writes, check);
       // Drain a concurrent monitor check before the atomic final write. No late
       // read of the old version may abort an already completed preparation.
       finishing = true; stopMonitor(); await checking; signal.throwIfAborted();
@@ -100,9 +101,9 @@ export async function preparePublicationAssets(raw: PublicationPreparationOption
       const owned = claimed ?? (latest?.leaseId === leaseId ? latest : null);
       if (owned) {
         await repository.executePublicationCommand(guideId, { type: "abandon", id: jobId, leaseId }).catch(() => undefined);
-        // Only reached once this invocation's actual render/storage operation
-        // settled. Caller timeout alone never sets writerSettled=true.
-        await repository.executePrivacyAssetCommand(guideId, { type: "settle", id: owned.batchId, writerId: leaseId, receipts: null })
+        // A rejected SDK promise is not evidence that remote writes ended.
+        // Keep unknown writers durable even when deleting their keys succeeds.
+        if (!writes.unconfirmed) await repository.executePrivacyAssetCommand(guideId, { type: "settle", id: owned.batchId, writerId: leaseId, receipts: null })
           .catch(() => undefined);
         await cleanupPublicationPreparation(repository, storage, guideId, jobId).catch(() => undefined);
       } else if (observed && terminal(latest)) {

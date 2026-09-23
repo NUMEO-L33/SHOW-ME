@@ -14,6 +14,7 @@ import { privacyAssetDigest, privacyAssetKeys } from "../src/processor/privacy-a
 import { privacyAfterEdit } from "../src/processor/privacy-review.js";
 import { renderPrivateRedaction } from "../src/processor/privacy-render.js";
 import { JsonGuideRepository } from "../src/processor/repository.js";
+import { StorageWriteSettledError } from "../src/processor/storage.js";
 
 const deferred = () => {
   let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve };
@@ -137,7 +138,7 @@ for (const failure of ["partial-put", "corrupt-read", "render-error"] as const)
 test(`publication ${failure} never advances preparation and never falls back to source pixels`, async t => {
   const h = await fixture(t), put = h.storage.putFile.bind(h.storage), read = h.storage.openRead.bind(h.storage);
   t.mock.method(h.storage, "putFile", async (key: string, file: string) => { await put(key, file);
-    if (failure === "partial-put") throw new Error("private storage details"); });
+    if (failure === "partial-put") throw new StorageWriteSettledError(); });
   t.mock.method(h.storage, "openRead", async (key: string) => failure === "corrupt-read" && key.includes("private-redactions")
     ? Readable.from([Buffer.from("invalid")]) : read(key));
   await assert.rejects(preparePublicationAssets({ ...h.options, render: failure === "render-error"
@@ -183,7 +184,8 @@ test("failed deletion remains retryable after restart and never cleans another r
   const h = await fixture(t);
   const other = (await h.repository.executePrivacyAssetCommand(h.guideId, { type: "reserve", id: randomUUID(), ...h.request }))!;
   const put = h.storage.putFile.bind(h.storage);
-  t.mock.method(h.storage, "putFile", async (key: string, file: string) => { await put(key, file); throw new Error("uncertain put"); });
+  // Local write is definitely finished; only the following deletion is failing.
+  t.mock.method(h.storage, "putFile", async (key: string, file: string) => { await put(key, file); throw new StorageWriteSettledError(); });
   t.mock.method(h.storage, "delete", async () => { throw new Error("delete failed"); });
   await assert.rejects(preparePublicationAssets({ ...h.options, render: h.fastRender })); await idle();
   const batch = (await h.repository.listPrivacyAssetBatches(h.guideId)).find(b => b.id === h.job.batchId)!;

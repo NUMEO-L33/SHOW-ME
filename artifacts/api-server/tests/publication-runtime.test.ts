@@ -18,6 +18,7 @@ import { privateAssetWriterBusy } from "../src/processor/privacy-asset-session.j
 import { createProcessorApp } from "../src/processor/server.js";
 import { startProcessor } from "../src/processor/index.js";
 import { privacyAfterEdit } from "../src/processor/privacy-review.js";
+import { StorageWriteSettledError } from "../src/processor/storage.js";
 
 const gate = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 async function until(check: () => boolean | Promise<boolean>) {
@@ -163,21 +164,31 @@ test("timed-out repository scan holds the lane, does not create new queries and 
   assert.equal((await h.repository.getPublicationJob(h.guideId, h.job.id))!.status, "queued"); await runtime.stop();
 });
 
-test("a storage error cannot release the writer slot while its concurrent DB monitor is still pending", async t => {
+for (const outcome of ["settled", "unknown"] as const)
+test(`${outcome} storage errors cannot release the writer slot while a concurrent DB monitor is still pending`, async t => {
   const h = await fixture(t), monitorEntered = gate(), release = gate(), runtime = h.runtime({ timeoutMs: 1000, shutdownTimeoutMs: 30 });
   const execute = h.repository.executePublicationCommand.bind(h.repository); let putStarted = false;
   t.mock.method(h.repository, "executePublicationCommand", async (...args: Parameters<typeof execute>) => {
     if (putStarted && args[1].type === "check-writer") { monitorEntered.resolve(); await release.promise; }
     return execute(...args);
   });
-  t.mock.method(h.storage, "putFile", async () => { putStarted = true; await monitorEntered.promise; throw new Error("synthetic write failure"); });
+  t.mock.method(h.storage, "putFile", async () => {
+    putStarted = true; await monitorEntered.promise;
+    // Only the explicitly settled fixture supplies evidence of no future writes.
+    throw outcome === "settled" ? new StorageWriteSettledError() : new Error("synthetic write failure");
+  });
   try {
     const pending = runtime.tick(); await monitorEntered.promise; await delay(20);
     assert.equal(privateAssetWriterBusy(), true); assert.equal((await runtime.stop()).pendingIO, true);
     assert.equal((await pending).status, "stopped");
   } finally { release.resolve(); await until(() => !runtime.getStatus().pendingIO); }
   assert.equal((await h.repository.getPublicationState(h.guideId))!.head, null);
-  assert.equal((await h.repository.listPrivacyAssetBatches(h.guideId)).length, 0);
+  const batches = await h.repository.listPrivacyAssetBatches(h.guideId);
+  if (outcome === "settled") assert.deepEqual(batches, []);
+  else {
+    assert.equal(batches.length, 1); assert.equal(batches[0].status, "cleanup");
+    assert.equal(batches[0].writerSettled, false); assert.equal(await h.repository.deleteGuide(h.guideId), false);
+  }
 });
 
 test("bounded admission retains timed-out write slots, copies input and recovers accepted work by the same ID", async t => {

@@ -9,7 +9,9 @@ import { Client, type RequestError, type Result } from "@replit/object-storage";
 import type { ProcessorConfig } from "./config.js";
 
 export interface Storage {
-  /** Persist a local file under an application-owned object key. */
+  /** Persist a local file under an application-owned object key. Rejection does
+   * NOT prove the write cannot commit later. Only StorageWriteSettledError is
+   * trusted adapter evidence of that; success also means the write finished. */
   putFile(key: string, sourcePath: string): Promise<void>;
   /** Copy an object to a local path so ffmpeg/sharp can work with it. */
   materialize(
@@ -21,6 +23,16 @@ export interface Storage {
   openRead(key: string): Promise<Readable>;
   /** Delete one object. Missing objects are treated as already deleted. */
   delete(key: string): Promise<void>;
+}
+
+/** Adapter-only evidence: this invocation cannot make any further writes.
+ * Existing/partial output still needs deletion. Never infer this from a remote
+ * error code, an absent object, elapsed time, or a caller's cancellation. */
+export class StorageWriteSettledError extends Error {
+  constructor() {
+    super("STORAGE_WRITE_FAILED_SETTLED");
+    this.name = "StorageWriteSettledError";
+  }
 }
 
 export class StorageOperationError extends Error {
@@ -100,11 +112,15 @@ export class LocalStorage implements Storage {
   }
 
   async putFile(key: string, sourcePath: string): Promise<void> {
-    const source = await assertRegularFile(sourcePath);
-    const destination = resolveInside(this.root, key);
-    if (source === destination) return;
-
-    await writeViaStagingFile(destination, (staging) => copyFile(source, staging));
+    try {
+      const source = await assertRegularFile(sourcePath);
+      const destination = resolveInside(this.root, key);
+      if (source === destination) return;
+      await writeViaStagingFile(destination, (staging) => copyFile(source, staging));
+    } catch {
+      // All filesystem operations are awaited; there is no remote uploader.
+      throw new StorageWriteSettledError();
+    }
   }
 
   async materialize(
@@ -169,8 +185,16 @@ export class ReplitObjectStorage implements Storage {
   }
 
   async putFile(key: string, sourcePath: string): Promise<void> {
-    const source = await assertRegularFile(sourcePath);
-    const objectName = this.objectName(key);
+    let source: string, objectName: string;
+    try {
+      source = await assertRegularFile(sourcePath);
+      objectName = this.objectName(key);
+    } catch {
+      // No SDK request has been issued, so this write cannot commit remotely.
+      throw new StorageWriteSettledError();
+    }
+    // The SDK exposes no upload session completion/cancellation evidence on
+    // failure. Neither a thrown error nor an error result proves remote quiescence.
     const result = await this.client.uploadFromFilename(objectName, source, { compress: false });
     assertReplitResult("putFile", objectName, result);
   }

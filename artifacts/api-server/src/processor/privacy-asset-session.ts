@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { GuideRepository } from "./domain.js";
-import type { Storage } from "./storage.js";
+import { StorageWriteSettledError, type Storage } from "./storage.js";
 import { privacyAssetKeys, privacyAssetDigest, type PrivacyAssetBatch, type PrivacyAssetReceipt } from "./privacy-assets.js";
 import { renderPrivateRedaction } from "./privacy-render.js";
 
@@ -13,6 +13,9 @@ export type PrivateAssetRenderOptions = {
   /** Trusted config.dataDir/work, never supplied by HTTP. */
   workDir: string; render?: typeof renderPrivateRedaction;
 };
+/** Per invocation, retained outside the renderer so later cleanup/query errors
+ * cannot mask an unconfirmed remote write. Unknown failures stay unconfirmed. */
+export type PrivateAssetWriteState = { unconfirmed: boolean };
 let active = false;
 export const privateAssetWriterBusy = () => active;
 
@@ -55,7 +58,8 @@ async function readBounded(storage: Storage, key: string, maximum: number, signa
 /** Internal only: caller must hold a freshly acknowledged, non-replayable
  * writer claim and the shared session. This neither reserves nor settles. */
 export async function renderOwnedPrivateAssets(options: PrivateAssetRenderOptions, batch: PrivacyAssetBatch,
-  writerId: string, signal: AbortSignal, checkOwner?: () => Promise<void>): Promise<PrivacyAssetReceipt[]> {
+  writerId: string, signal: AbortSignal, writes: PrivateAssetWriteState,
+  checkOwner?: () => Promise<void>): Promise<PrivacyAssetReceipt[]> {
   const { repository, storage, guideId } = options;
   const guard = async () => {
     signal.throwIfAborted();
@@ -84,8 +88,17 @@ export async function renderOwnedPrivateAssets(options: PrivateAssetRenderOption
           throw new PrivacyAssetWriteError();
         const key = keys[index * 2 + offset], file = join(directory, "render.png");
         await writeFile(file, png, { mode: 0o600 }); await guard();
-        // Never retry this call. Await the real SDK settlement even after abort.
-        await storage.putFile(key, file); await guard();
+        // Never retry this call. A rejected SDK promise may still commit later;
+        // only success or trusted adapter evidence allows ledger settlement.
+        writes.unconfirmed = true;
+        try {
+          await storage.putFile(key, file);
+          writes.unconfirmed = false;
+        } catch (error) {
+          if (error instanceof StorageWriteSettledError) writes.unconfirmed = false;
+          throw error;
+        }
+        await guard();
         const stored = await readBounded(storage, key, png.length, signal);
         if (stored.length !== png.length || privacyAssetDigest(stored) !== privacyAssetDigest(png)) throw new PrivacyAssetWriteError();
         receipts.push({ key, size: png.length, sha256: privacyAssetDigest(png) });

@@ -14,7 +14,7 @@ import { writePrivateRedactions } from "../src/processor/privacy-asset-writer.js
 import { cleanupPrivateRedactions } from "../src/processor/privacy-asset-cleanup.js";
 import { privacyAfterEdit } from "../src/processor/privacy-review.js";
 import { encodePrivacyPng, renderPrivateRedaction } from "../src/processor/privacy-render.js";
-import { LocalStorage } from "../src/processor/storage.js";
+import { LocalStorage, StorageWriteSettledError } from "../src/processor/storage.js";
 import { JsonGuideRepository } from "../src/processor/repository.js";
 import { syntheticAnalysisInput } from "../src/processor/gemini/synthetic.js";
 import request from "supertest";
@@ -109,7 +109,8 @@ test(`private asset ${mode} fails closed, cleans ownership and never falls back 
   const h = await fixture(t), put = h.storage.putFile.bind(h.storage), read = h.storage.openRead.bind(h.storage);
   const keys: string[] = [];
   t.mock.method(h.storage, "putFile", async (key: string, file: string) => { keys.push(key); await put(key, file);
-    if (mode === "partial-write") throw new Error("private storage secret"); });
+    // The awaited local write has ended; this controlled failure cannot commit later.
+    if (mode === "partial-write") throw new StorageWriteSettledError(); });
   t.mock.method(h.storage, "openRead", async (key: string) => {
     if (mode === "source-error") throw new Error("private key");
     if (mode === "oversize-read") return Readable.from([Buffer.alloc(2 * 1024 * 1024 + 1)]);

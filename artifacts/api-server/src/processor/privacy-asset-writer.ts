@@ -13,6 +13,7 @@ export async function writePrivateRedactions(options: PrivateAssetRenderOptions 
   return privateAssetSession(options.signal, options.timeoutMs ?? 120_000, async signal => {
     const { repository, storage, guideId } = options;
     const writerId = randomUUID(), batchId = randomUUID(); let claimed = false, reserved = false;
+    const writes = { unconfirmed: false };
     try {
       signal.throwIfAborted();
       const batch = await repository.executePrivacyAssetCommand(guideId, { type: "reserve", id: batchId,
@@ -22,13 +23,15 @@ export async function writePrivateRedactions(options: PrivateAssetRenderOptions 
       if (!await repository.executePrivacyAssetCommand(guideId, { type: "claim", id: batch.id, version: batch.version, writerId }))
         throw new PrivacyAssetWriteError();
       claimed = true; signal.throwIfAborted();
-      const receipts = await renderOwnedPrivateAssets(options, batch, writerId, signal);
+      const receipts = await renderOwnedPrivateAssets(options, batch, writerId, signal, writes);
       signal.throwIfAborted();
       const ready = await repository.executePrivacyAssetCommand(guideId, { type: "settle", id: batch.id, writerId, receipts });
       if (ready?.status !== "ready") throw new PrivacyAssetWriteError();
       signal.throwIfAborted(); return ready;
     } catch {
-      if (claimed) await repository.executePrivacyAssetCommand(guideId,
+      // A successful delete now cannot rule out an unconfirmed put committing
+      // later. Keep its durable owner/keys and let cleanup retry, never re-put.
+      if (claimed && !writes.unconfirmed) await repository.executePrivacyAssetCommand(guideId,
         { type: "settle", id: batchId, writerId, receipts: null }).catch(() => undefined);
       if (reserved) await cleanupPrivateRedactions(repository, storage, guideId, { batchId }).catch(() => undefined);
       throw new PrivacyAssetWriteError();

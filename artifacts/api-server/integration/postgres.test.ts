@@ -49,7 +49,10 @@ import { reviewedAssetFixture } from "../tests/helpers/privacy-assets-fixture.js
 import { privacyAssetDigest, privacyAssetKeys } from "../src/processor/privacy-assets.js";
 import { PUBLICATION_LEASE_MS, type PublicationRequest } from "../src/processor/publication-jobs.js";
 import { publicationPreparationFixture } from "../tests/helpers/publication-preparation-fixture.js";
+import { lateStorageFixture } from "../tests/helpers/late-storage-fixture.js";
 import { preparePublicationAssets, cleanupPublicationPreparation } from "../src/processor/publication-preparation.js";
+import { writePrivateRedactions } from "../src/processor/privacy-asset-writer.js";
+import { cleanupPrivateRedactions } from "../src/processor/privacy-asset-cleanup.js";
 import { privateAssetWriterBusy } from "../src/processor/privacy-asset-session.js";
 import { PublicationRecoveryWorker } from "../src/processor/publication-recovery.js";
 import { PUBLICATION_LIFETIME_MS } from "../src/processor/publication-commit.js";
@@ -610,6 +613,44 @@ test("real PostgreSQL: independent recovery workers converge on exact cancelled 
   assert.equal((await h.repository.getPublicationJob(h.guide.id, h.job.id))!.status, "cancelled");
   assert.deepEqual(await h.repository.getAnalysisState(h.guide.id), h.state);
   const stream = await h.storage.openRead(h.guide.steps[0].representativeFrameKey!); stream.destroy();
+});
+
+for (const lane of ["standalone", "publication"] as const)
+test(`real PostgreSQL: ${lane} rejected SDK write remains owned across connections and repeated late commits`, async t => {
+  const h = await preparationFixture(t), guideId = h.guide.id;
+  if (lane === "standalone") {
+    await h.repository.executePublicationCommand(guideId, { type: "cancel", id: h.job.id });
+    assert.equal(await cleanupPublicationPreparation(h.repository, h.storage, guideId, h.job.id), true);
+  }
+  const sourceKey = h.guide.steps[0].representativeFrameKey!;
+  const remote = lateStorageFixture(sourceKey, h.source, "result", 2);
+  const options = { ...h.options, storage: remote.storage, render: h.fastRender };
+  await assert.rejects(lane === "publication" ? preparePublicationAssets(options)
+    : writePrivateRedactions({ ...options, ...h.request }), /PRIVACY_ASSET_WRITE_UNAVAILABLE/);
+  const reopened = PostgresGuideRepository.fromPool(h.pool);
+  const batches = await reopened.listPrivacyAssetBatches(guideId); assert.equal(batches.length, 1);
+  const [batch] = batches, keys = privacyAssetKeys(batch);
+  assert.equal(batch.status, "cleanup"); assert.equal(batch.writerSettled, false);
+  const cleanup = () => lane === "publication"
+    ? cleanupPublicationPreparation(reopened, remote.storage, guideId, h.job.id)
+    : cleanupPrivateRedactions(reopened, remote.storage, guideId);
+  assert.equal(await cleanup(), false); assert.equal(await reopened.deleteGuide(guideId), false);
+  for (let i = 0; i < 2; i++) {
+    remote.commitLate(); assert.ok(remote.bytes(keys[1]));
+    if (lane === "publication") {
+      const worker = new PublicationRecoveryWorker({ repository: reopened, storage: remote.storage });
+      const report = await worker.tick();
+      assert.equal(report.status, "pending"); assert.equal(report.pending, 1); assert.equal(report.cleaned, 0);
+      await worker.stop();
+    } else assert.equal(await cleanup(), false);
+    for (const key of keys) assert.equal(remote.bytes(key), undefined);
+  }
+  assert.equal(remote.puts.length, 2);
+  assert.ok(remote.deletes.every(k => keys.map(remote.name).includes(k)));
+  assert.equal((await reopened.listPrivacyAssetBatches(guideId))[0].writerSettled, false);
+  assert.equal(await reopened.deleteGuide(guideId), false);
+  assert.deepEqual(remote.bytes(sourceKey), h.source);
+  assert.deepEqual(await reopened.getAnalysisState(guideId), h.state);
 });
 
 test("real PostgreSQL: actual redacted PNG preparation reuses its reservation and persists private receipts across connections", async t => {
