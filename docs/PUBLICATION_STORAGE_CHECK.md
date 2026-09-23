@@ -34,4 +34,4 @@ node --import tsx scripts/check-publication-storage.ts --replit-development=<현
 
 ## 이 검사로 완료되지 않는 것
 
-실제 PostgreSQL과 Replit Storage를 함께 쓰는 앱의 통합 게시, bucket 전체 IAM/공개 ACL 감사, 인터넷 공개 링크/실제 수신자/모바일 검증, 운영 배포 및 기본 공개 활성화는 별도다. 합성 전체 가림 검사는 임의 개인정보 자동 탐지 성능이나 모든 유출 위험이 없음을 증명하지 않는다. 원래 개발 계획의 목표와 완료 조건은 변경하지 않는다.
+실제 PostgreSQL과 Replit Storage를 함께 쓰는 앱의 통합 게시는 별도 [명시적 통합 검사](PUBLICATION_INTEGRATION_CHECK.md)로 진행한다. 기본 저장소 단독 명령은 여전히 JSON만 사용한다. bucket 전체 IAM/공개 ACL 감사, 인터넷 공개 링크/실제 수신자/모바일 검증, 운영 배포 및 기본 공개 활성화는 별도다. 합성 전체 가림 검사는 임의 개인정보 자동 탐지 성능이나 모든 유출 위험이 없음을 증명하지 않는다. 원래 개발 계획의 목표와 완료 조건은 변경하지 않는다.

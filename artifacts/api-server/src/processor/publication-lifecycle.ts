@@ -24,7 +24,8 @@ export type AccessiblePublication = { head: PublicationHead; publication: GuideP
 export type PublicationOwnerStatus = { head: PublicationHead | null; job: PublicationJob | null;
   pendingJobId: string | null; active: boolean; expired: boolean; editable: boolean };
 export const publicationExpiryQuerySchema = z.object({ limit: z.number().int().min(1).max(20).default(20),
-  after: z.object({ expiresAt: z.string().datetime(), publicSlug: slug }).strict().optional() }).strict();
+  after: z.object({ expiresAt: z.string().datetime(), publicSlug: slug }).strict().optional(),
+  guideId: z.string().min(1).max(128).regex(/^[a-zA-Z0-9_-]+$/).optional() }).strict();
 export type PublicationExpiryQuery = z.input<typeof publicationExpiryQuerySchema>;
 export type PublicationExpiryCandidate = Pick<PublicationHead, "guideId" | "version" | "expiresAt" | "publicSlug">;
 export interface PublicationLifecycleRepository {

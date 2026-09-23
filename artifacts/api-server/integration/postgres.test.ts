@@ -16,7 +16,7 @@ import { loadConfig } from "../src/processor/config.js";
 import { analysisBootstrapSettings, configuredAnalysisFactory, verifyAnalysisRuntimeRole } from "../src/processor/analysis-bootstrap.js";
 import { createRuntimeRole } from "../src/processor/runtime-role-setup.js";
 import { createOperatorRole, verifyOperatorRole } from "../src/processor/operator-role-setup.js";
-import { PostgresGuideRepository } from "../src/processor/repository.js";
+import { PostgresGuideRepository, type ProcessorDatabase } from "../src/processor/repository.js";
 import { GEMINI_PROMPT_VERSION, GEMINI_TEST_MODEL } from "../src/processor/gemini/request.js";
 import { fakeOutput } from "../tests/helpers/analysis-fixtures.js";
 import { PostgresAnalysisQuotaStore } from "../src/processor/analysis-quota-store.js";
@@ -57,6 +57,8 @@ import request from "supertest";
 import { createProcessorApp } from "../src/processor/server.js";
 import { DurablePublicationRuntime } from "../src/processor/publication-runtime.js";
 import { cleanupExpiredPrivateMedia, PRIVATE_MEDIA_EXPIRED, PRIVATE_RETENTION_MS } from "../src/processor/private-retention.js";
+import { runPublicationStorageCheck } from "../scripts/check-publication-storage.js";
+import { verifyPublicationCheckRemoved } from "../scripts/publication-check-scope.js";
 
 const run = process.env.SHOWME_PG_TEST_RUN;
 const rawUrl = process.env.SHOWME_PG_TEST_URL;
@@ -156,6 +158,30 @@ async function preparationFixture(t: TestContext, id = "prepared-guide", editTok
 
 const commitOwner = (job: Awaited<ReturnType<typeof preparePublicationAssets>>) => ({
   id: job.id, leaseId: job.leaseId!, expectedVersion: job.version,
+});
+
+for (const failRender of [false, true]) test(`real PostgreSQL: isolated publication storage acceptance and cleanup preserve a different guide (render failure=${failRender})`, async t => {
+  const h = await fixture(t), { guide } = await h.seed(randomUUID(), 1, true), logs: string[] = [];
+  const reviewed = await reviewedAssetFixture(h.repository, guide);
+  const job = (await h.repository.executePublicationCommand(guide.id, { type: "request", id: randomUUID(),
+    expectedDraftRevision: reviewed.request.revision, expectedInputFingerprint: reviewed.request.inputFingerprint,
+    expectedReviewFingerprint: reviewed.request.reviewFingerprint, originalSharingEnabled: false }))!;
+  const before = await h.repository.getGuideById(guide.id);
+  const execute = () => runPublicationStorageCheck(["--local-synthetic"], { NODE_ENV: "test",
+    SHOWME_TEST_FFMPEG_PATH: process.env.SHOWME_TEST_FFMPEG_PATH, SHOWME_TEST_FFPROBE_PATH: process.env.SHOWME_TEST_FFPROBE_PATH,
+    ...(failRender ? { FFMPEG_PATH: "showme-nonexistent-decoder" } : {}) }, line => logs.push(line),
+    { repository: PostgresGuideRepository.fromPool(h.pool), verifyRemoved: id => verifyPublicationCheckRemoved(h.pool, id),
+      seedTransaction: work => h.repository.database.transaction(tx => work(new PostgresGuideRepository(tx as unknown as ProcessorDatabase))) });
+  if (failRender) await assert.rejects(execute());
+  else { const result = await execute(); assert.equal(result.passed, true); assert.equal(result.databaseFixtureRemoved, true); }
+  assert.ok(logs.includes("PUBLICATION_STORAGE_CHECK POSTGRES_FIXTURE_REMOVED"), logs.join("\n"));
+  assert.equal(logs.some(line => line.includes("CLEANUP_PENDING")), false);
+  assert.deepEqual(await h.repository.getGuideById(guide.id), before);
+  assert.deepEqual(await h.repository.getPublicationJob(guide.id, job.id), job);
+  assert.equal((await h.pool.query("SELECT count(*)::int AS n FROM guides")).rows[0].n, 1);
+  assert.deepEqual(await h.repository.listPublicationRecovery({ kind: "queued", guideId: randomUUID(), limit: 1 }), []);
+  assert.deepEqual(await h.repository.listPublicationRecovery({ kind: "queued", guideId: guide.id, limit: 1 }),
+    [{ guideId: guide.id, id: job.id, version: job.version, batchId: job.batchId }]);
 });
 
 test("real PostgreSQL: owner publication HTTP and public PNG authority survive reconnect and revoke before physical deletion", async t => {
@@ -480,6 +506,8 @@ test("real PostgreSQL: first-publication withdrawal fences work and expiry of a 
   await h.repository.executePublicationCommand(h.guide.id, { type: "claim", id: job.id, expectedVersion: 1, leaseId: randomUUID() }, at);
   const expiry = new Date(first.head.expiresAt), page = await h.repository.listExpiredPublications({ limit: 1 }, expiry);
   assert.equal(page.length, 1);
+  assert.deepEqual(await h.repository.listExpiredPublications({ guideId: h.guide.id, limit: 1 }, expiry), page);
+  assert.deepEqual(await h.repository.listExpiredPublications({ guideId: "different", limit: 1 }, expiry), []);
   assert.deepEqual(await h.repository.listExpiredPublications({ after: { expiresAt: page[0].expiresAt, publicSlug: page[0].publicSlug } }, expiry), []);
   const result = await new PublicationRecoveryWorker({ repository: h.repository, storage: h.storage, clock: () => expiry }).tick();
   assert.equal(result.publicationsExpired, 1); assert.equal(result.pending, 1);

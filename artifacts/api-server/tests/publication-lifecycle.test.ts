@@ -185,6 +185,9 @@ test("expiry discovery is bounded, compares full cursors and rejects malformed c
   const h = await fixture(t), first = await h.publish(), at = new Date(first.head.expiresAt);
   const page = await h.repository.listExpiredPublications({ limit: 1 }, at);
   assert.equal(page.length, 1); assert.equal(page[0].guideId, h.guideId);
+  assert.deepEqual(await h.repository.listExpiredPublications({ guideId: h.guideId, limit: 1 }, at), page);
+  assert.deepEqual(await h.repository.listExpiredPublications({ guideId: "different", limit: 1 }, at), []);
+  await assert.rejects(h.repository.listExpiredPublications({ guideId: "" }, at));
   assert.deepEqual(await h.repository.listExpiredPublications({ after: { expiresAt: page[0].expiresAt, publicSlug: page[0].publicSlug } }, at), []);
   assert.equal((await h.repository.listExpiredPublications({ after: { expiresAt: new Date(at.getTime() - 1).toISOString(), publicSlug: page[0].publicSlug } }, at)).length, 1);
   await assert.rejects(h.repository.listExpiredPublications({ limit: 21 }, at));

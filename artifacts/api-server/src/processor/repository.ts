@@ -795,7 +795,7 @@ export class JsonGuideRepository implements GuideRepository, PublicationJobRepos
     const query = publicationExpiryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
     return this.serialize(async () => {
       const state = await this.readState(), at = publicationTime(fixed);
-      return state.publicationHeads.filter(h => (!query.after || comparePublicationExpiry(h, query.after) > 0) &&
+      return state.publicationHeads.filter(h => (!query.guideId || h.guideId === query.guideId) && (!query.after || comparePublicationExpiry(h, query.after) > 0) &&
         publicationExpiryCandidate(h, state.publicationJobs, at)).sort(comparePublicationExpiry).slice(0, query.limit)
         .map(({ guideId, version, expiresAt, publicSlug }) => ({ guideId, version, expiresAt, publicSlug }));
     });
@@ -844,7 +844,7 @@ export class JsonGuideRepository implements GuideRepository, PublicationJobRepos
     const query = publicationRecoveryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
     return this.serialize(async () => {
       const at = publicationTime(fixed), state = await this.readState();
-      return state.publicationJobs.filter(j => (!query.after || j.batchId > query.after) && (query.kind === "queued" ? j.status === "queued" : query.kind === "expired"
+      return state.publicationJobs.filter(j => (!query.guideId || j.guideId === query.guideId) && (!query.after || j.batchId > query.after) && (query.kind === "queued" ? j.status === "queued" : query.kind === "expired"
         ? j.status === "running" && Date.parse(j.leaseExpiresAt!) <= at.getTime()
         : state.privacyAssets.some(b => b.guideId === j.guideId && b.id === j.batchId &&
           (["failed", "cancelled"].includes(j.status) || (j.status === "succeeded" && b.status === "cleanup")))))
@@ -1924,7 +1924,7 @@ export class PostgresGuideRepository implements GuideRepository, PublicationJobR
     const query = publicationExpiryQuerySchema.parse(raw), fixed = now === undefined ? undefined : publicationTime(now);
     return this.database.transaction(async tx => {
       const at = await analysisWorkClock(tx, fixed);
-      const rows = await tx.select().from(publicationHeads).where(and(lte(publicationHeads.expiresAt, at),
+      const rows = await tx.select().from(publicationHeads).where(and(query.guideId ? eq(publicationHeads.guideId, query.guideId) : undefined, lte(publicationHeads.expiresAt, at),
         or(isNotNull(publicationHeads.activePublicationId), sql`exists (select 1 from ${publicationJobs}
           where ${publicationJobs.guideId} = ${publicationHeads.guideId} and ${publicationJobs.status} in ('queued', 'running'))`),
         query.after ? or(gt(publicationHeads.expiresAt, new Date(query.after.expiresAt)),
@@ -1949,7 +1949,8 @@ export class PostgresGuideRepository implements GuideRepository, PublicationJobR
       const at = await analysisWorkClock(tx, fixed);
       const rows = await tx.select({ job: publicationJobs }).from(publicationJobs)
         .leftJoin(guideAssets, and(eq(guideAssets.id, publicationJobs.batchId), eq(guideAssets.guideId, publicationJobs.guideId)))
-        .where(and(query.after ? gt(publicationJobs.batchId, query.after) : undefined, query.kind === "queued" ? eq(publicationJobs.status, "queued") : query.kind === "expired"
+        .where(and(query.guideId ? eq(publicationJobs.guideId, query.guideId) : undefined,
+          query.after ? gt(publicationJobs.batchId, query.after) : undefined, query.kind === "queued" ? eq(publicationJobs.status, "queued") : query.kind === "expired"
           ? and(eq(publicationJobs.status, "running"), lte(publicationJobs.availableAt, at))
           : and(or(inArray(publicationJobs.status, ["failed", "cancelled"]),
             and(eq(publicationJobs.status, "succeeded"), sql`${guideAssets.payload}->>'status' = 'cleanup'`)), isNotNull(guideAssets.id))))

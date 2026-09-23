@@ -84,7 +84,7 @@ export interface PublicationJobRepository {
   listPublicationRecovery(query: PublicationRecoveryQuery, now?: Date): Promise<PublicationRecoveryCandidate[]>;
 }
 export const publicationRecoveryQuerySchema = z.object({ kind: z.enum(["expired", "cleanup", "queued"]),
-  limit: z.number().int().min(1).max(20).default(20), after: uuid.optional() }).strict();
+  limit: z.number().int().min(1).max(20).default(20), after: uuid.optional(), guideId: id.optional() }).strict();
 export type PublicationRecoveryQuery = z.input<typeof publicationRecoveryQuerySchema>;
 export type PublicationRecoveryCandidate = Pick<PublicationJob, "guideId" | "id" | "version" | "batchId">;
 export function publicationTime(now = new Date()): Date {
