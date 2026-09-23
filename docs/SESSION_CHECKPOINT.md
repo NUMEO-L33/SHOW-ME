@@ -2,7 +2,19 @@
 
 사용자가 Docker 오류 확인 후 `저장해`라고 요청하여 진행 상황을 저장했고, 이후 `docker 실행 완료`를 알려 실제 DB 검사를 재개했다. 이 문서는 최신 인계 기록이다. 원래 개발 계획의 목표나 완료 조건은 바꾸지 않는다. 아래 결과는 저장 시점의 관측이며 재개 시 최신 상태를 확인한다.
 
-## 최신 구현 — 2026-09-23 실패한 원격 쓰기의 정리 원장 보존
+## 최신 반영 — 2026-09-23 미확정 저장 실패 보완을 Replit 개발 API에 적용
+
+사용자의 다음 단계 승인으로 로컬 검증본을 `135a61c`로 커밋·푸시하고, 기존 `codex/replit-migration-hardening` Replit 개발 작업본을 `18c9533`에서 fast-forward했다. 반영 전 정확한 프로젝트/브랜치, 변경 파일 없음, post-merge hook 없음, 기존 API 한 개와 health 200을 확인했다. main 병합·강제 덮어쓰기·의존성 교체는 없었다.
+
+Replit에서 일반 전체 **1,072/1,072**(이관 101 / API 855 / 화면 116), 각 실패·취소·생략 0, runner exit 0과 `REPLIT_ROLLOUT_TESTS passed:true`를 확인했다. 신규 늦은 저장 회귀 8개도 포함된다. 앱 환경은 allowlist로 제외했고 실제 외부 AI·개인 영상·운영 DB/버킷 장애 주입은 하지 않았다. 로컬 PostgreSQL 139개는 앞선 검증 결과이며 이번 Replit 단계에서 다시 실행한 수치가 아니다.
+
+기존 **API Server workflow만** 중지하고 실제 API 프로세스 0개를 확인한 뒤 API 제품/테스트 타입 검사와 빌드를 통과했다. `REPLIT_ROLLOUT_BUILD typecheckPassed:true,hasFix:true` 확인 후 같은 workflow로 재시작했다. 웹/mockup workflow는 중단하거나 변경하지 않았다. Shell에서 API 서버를 따로 중복 실행하지 않았다.
+
+재시작 후 정확한 API 작업 폴더/entrypoint의 새 프로세스 **1개**, 새 번들의 보완 코드 포함, 기존 비공개 runtime DB binding과 실행 연결 일치, AI `off`, migration `verify-only`, Replit 저장소, API 내 AI 키와 별도 operator/migration DB URL 없음, health **200 / ok**를 확인했다. `REPLIT_ROLLOUT_READY passed:true`이며 Replit git도 깨끗했다. Preview 새로고침 뒤 초기 화면과 외부 AI/공개 공유 비활성 안내가 정상 표시된다.
+
+공개 실행기 활성화·운영 Publish·새 migration/권한·.env/키 변경은 하지 않았다. 원래 개발 MD 목표·완료 조건은 유지한다. **현재 보완은 개발 API에 반영 완료이며, 원격 미확정 업로드의 지원되는 종료 확인/운영 해소와 전체 IAM/객체 ACL 확인은 여전히 남는다.** 그 조건을 정리한 뒤 별도 승인 범위의 공개 활성화·수신자/모바일 검증으로 진행한다. 원장 보존 성공을 업로드 세션 취소나 유출 불가능 보장으로 확대하지 않는다.
+
+## 이전 구현 — 2026-09-23 실패한 원격 쓰기의 정리 원장 보존
 
 사용자의 후속 진행 승인으로 E2/게시 가림 자산에서 SDK 실패 응답을 쓰기 종료로 잘못 처리하던 부분을 로컬에서 보완했다. `StorageWriteSettledError`는 완료된 로컬 파일 작업이나 SDK 호출 전 실패에만 쓰며, SDK 호출 이후 오류는 결과 불명으로 남긴다. renderer 외부에 미확정 상태를 보존하고 양쪽 catch의 `settle`을 막는다. 정확한 key 삭제는 재시도하지만 원장은 유지하여 늦은 commit도 다시 정리할 수 있고 guide 최종 삭제는 완료로 보고하지 않는다. 업로드 재시도/강제 settle/새 schema는 추가하지 않았다.
 

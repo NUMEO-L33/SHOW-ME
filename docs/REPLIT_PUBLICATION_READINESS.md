@@ -2,9 +2,9 @@
 
 ## 최신 후속 상태 — 2026-09-23
 
-`PUBLICATION_INTEGRATION_CHECK.md`의 실제 PostgreSQL + Replit Storage 정상 통합 검사와 자체 정리는 통과했다. 이어 `STORAGE_OPERATIONS_REVIEW.md`의 읽기 전용 접근/장애 점검에서 익명 목록 HTTP 401, 소유자만 표시되는 협업자 목록을 확인했다. 전체 IAM/개별 객체 ACL은 미확인이다. 실패 응답 뒤 늦은 저장의 원장 소실은 후속 승인으로 로컬 보완했고 신규 회귀의 수정 전 실패/수정 후 통과와 실제 PostgreSQL 139개 통과를 확인했다. **보완본은 아직 Replit에 반영하지 않았으며 원격 업로드 종료 확인까지 해결한 것은 아니다.** 공개 실행기 OFF 유지. 후속은 보완본 반영·검증과 지원되는 미확정 업로드 해소/권한 확인이다. 아래 2026-09-22 기록을 최신 전체 완료 판정으로 읽지 않는다.
+`PUBLICATION_INTEGRATION_CHECK.md`의 실제 PostgreSQL + Replit Storage 정상 통합 검사와 자체 정리는 통과했다. 이어 `STORAGE_OPERATIONS_REVIEW.md`의 읽기 전용 접근/장애 점검에서 익명 목록 HTTP 401, 소유자만 표시되는 협업자 목록을 확인했다. 전체 IAM/개별 객체 ACL은 미확인이다. 실패 응답 뒤 늦은 저장의 원장 소실은 보완했고, 신규 회귀의 수정 전 실패/수정 후 통과와 실제 로컬 PostgreSQL 139개 통과를 확인했다. **후속 승인으로 `135a61c`를 Replit 개발 API에 반영·재시작·검증했다. 원격 업로드 종료 확인까지 해결한 것은 아니다.** 공개 실행기 OFF 유지. 후속은 지원되는 미확정 업로드 해소/권한 확인이다. 아래 2026-09-22 기록을 최신 전체 완료 판정으로 읽지 않는다.
 
-최종 로컬 일반 전체 **1,072개**(이관 101 / API 855 / 화면 116), API 제품/테스트 타입 검사와 API 빌드도 통과했다. Replit 자체에서 이 새 보완본을 실행한 결과는 아니다.
+로컬과 Replit에서 각각 일반 전체 **1,072개**(이관 101 / API 855 / 화면 116), API 제품/테스트 타입 검사와 API 빌드를 통과했다. Replit 검사의 각 실패·취소·생략은 0이다. API workflow만 중지/재시작했으며 웹/mockup은 그대로다. 새 API 프로세스 한 개, 기존 runtime DB binding 일치, 보완 번들 포함, health 200 / ok와 Preview 초기 화면을 확인했다. AI off, migration verify-only, .env/키/권한/DB schema 불변이다. 이번에는 실제 Replit DB+Storage 합성 통합이나 로컬 PostgreSQL 검사를 다시 실행하지 않았다.
 
 ## 합성 저장소 검사 완료 — 2026-09-22
 
