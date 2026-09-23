@@ -41,4 +41,25 @@ node --import tsx scripts/check-publication-integration.mjs --replit-development
 
 컨테이너 `showme-b5-5bbbb3ef35c443b48a0d15e20db29be1`은 이번 실행의 고유 소유권 label을 확인한 뒤 runner가 정리했다. `postgres_fixture_removed`와 `disposableDataRemoved:true`를 확인했다. 기존 이미지로만 실행했고 다운로드·영구 호스트 마운트·다른 컨테이너 삭제는 없었다.
 
-**Replit DB+Storage 통합 실행·코드 반영·공개 활성화는 아직 하지 않았다.** 이번 검사는 실제 로컬 PostgreSQL과 임시 LocalStorage를 사용한 결과다. 일반 1,056개/타입 검사/빌드는 직전 단계 결과이며 이번 DB 재개 때 다시 실행했다고 표기하지 않는다. 변경은 로컬 미커밋·미푸시이며 원래 개발 MD 목표·완료 조건은 변경하지 않았다.
+위 137개는 실제 로컬 PostgreSQL과 임시 LocalStorage 결과다. 일반 1,056개/타입 검사/빌드는 그 이전 단계 결과이며 DB 재개 때 다시 실행했다고 표기하지 않는다. 원래 개발 MD 목표·완료 조건은 변경하지 않았다.
+
+## 실제 Replit 결합 검사 — 2026-09-23
+
+검증본 `b4efa09`를 기존 개발 브랜치에 푸시하고, 변경 없는 SHOW-ME 개발 작업본 `75774cf`에서 fast-forward했다. 확인한 프로젝트의 기존 runtime binding으로 위 명령을 한 번 실행했다. 새 역할·권한·migration·키를 만들거나 변경하지 않았다.
+
+확보한 결과:
+
+```text
+PUBLICATION_INTEGRATION_CHECK RUNTIME_ROLE_AND_SCHEMA_OK
+PUBLICATION_STORAGE_CHECK POSTGRES_GUIDE_CREATED
+PUBLICATION_STORAGE_CHECK SOURCE_ROUNDTRIP_OK
+PUBLICATION_STORAGE_CHECK PROCESSED_PIXELS_AND_SOURCE_PRESERVATION_OK
+PUBLICATION_STORAGE_CHECK WITHDRAWAL_AND_PROCESSED_DELETION_OK
+PUBLICATION_STORAGE_CHECK POSTGRES_FIXTURE_REMOVED
+PUBLICATION_INTEGRATION_CHECK PASS
+PUBLICATION_INTEGRATION_EXIT 0
+```
+
+최종 저장소 결과도 PASS이며 `applicationDatabaseUsed:true`, `database:"postgres"`, `databaseFixtureRemoved:true`, `remoteObjectsRemoved:true`, `localFixtureRemoved:true`, `pendingIO:false`다. 시험 가이드/연관 행과 전용 객체 네 개 및 임시 파일 정리를 확인했다. `externalAIUsed:false`, `publicListener:false`이며 개인 영상은 사용하지 않았다.
+
+검사 후 기존 앱 health 200, 정확한 API 작업 폴더/entrypoint의 프로세스 한 개, AI off, migration verify-only, Replit 저장소, AI 키/별도 operator·migration DB URL 없음과 깨끗한 git 상태를 확인했다. 기존 서버의 재빌드·재시작·공개 실행기 활성화·운영 Publish는 하지 않았다. 최신 소스로 실행한 별도 진단의 결과이지 운영 공개/인터넷 수신자/실제 모바일 검증은 아니다. 저장소 전체 IAM/ACL 확인과 불확실 원격 쓰기 해소, 공개 활성화 승인/외부 수신 검증은 남는다.

@@ -2,7 +2,17 @@
 
 사용자가 Docker 오류 확인 후 `저장해`라고 요청하여 진행 상황을 저장했고, 이후 `docker 실행 완료`를 알려 실제 DB 검사를 재개했다. 이 문서는 최신 인계 기록이다. 원래 개발 계획의 목표나 완료 조건은 바꾸지 않는다. 아래 결과는 저장 시점의 관측이며 재개 시 최신 상태를 확인한다.
 
-## 최신 작업 — 2026-09-23 실제 PostgreSQL 137개 통과, Replit 결합 검사 대기
+## 최신 검증 — 2026-09-23 실제 Replit DB + Storage 결합 검사 통과
+
+사용자의 다음 단계 진행 승인에 따라 검증본 `b4efa09`를 기존 `codex/replit-migration-hardening` 브랜치에 커밋·푸시했다. 변경 없는 Replit 개발 작업본 `75774cf`를 같은 커밋으로 fast-forward했고, 해당 SHOW-ME 프로젝트에서 합성 통합 검사를 한 번 실행했다. 기존 post-merge hook이 없음을 확인했으며 의존성 설치·서버 재시작은 하지 않았다.
+
+기존 runtime 계정·migration 이력·정리 권한 검증 후 새 UUID 합성 가이드 한 개와 진단 prefix의 네 객체만 사용했다. 실제 PostgreSQL + Replit Storage에서 원본 저장/재읽기, 실제 가림 PNG/썸네일, 원본 바이트/상태 보존, 게시 후 공유 철회와 JSON/이미지 404를 확인했다. **`PUBLICATION_INTEGRATION_CHECK PASS`, `PUBLICATION_INTEGRATION_EXIT 0`**이다. `applicationDatabaseUsed:true`, `database:"postgres"`, `databaseFixtureRemoved:true`, `remoteObjectsRemoved:true`, `localFixtureRemoved:true`, `pendingIO:false`를 모두 확보했다. 시험 가이드/연관 DB 행, 객체 네 개, 자체 임시 자료는 정리됐다.
+
+검사 후 기존 API health **200**, 정확한 작업 폴더/entrypoint의 API 프로세스 **1개**, AI `off`, migration `verify-only`, Replit 저장소, AI 키/별도 operator·migration DB URL 없음과 깨끗한 git 상태를 확인했다. 새 소스의 진단 프로세스를 실행한 것이며 기존 앱 번들 재빌드/재시작까지 했다는 뜻은 아니다. 공개 실행기는 계속 OFF이고 진단 HTTP는 loopback만 사용했다. 개인 영상·외부 AI·운영 Publish, .env·키·권한·migration 변경은 없었다.
+
+일반 1,056개/타입·빌드와 실제 로컬 PostgreSQL 137개는 앞선 단계의 결과다. 이번에는 이를 재실행했다고 표기하지 않는다. 원래 개발 MD의 목표·완료 조건을 바꾸지 않고 진행 기록만 갱신했다. **다음은 저장소 IAM/ACL 및 미확정 원격 쓰기의 운영 해소 조건 확인 → 공개 기능 활성화 범위 승인 → 실제 수신자/모바일 검증**이다. 이 통합 검사만으로 전체 E3/F1·공개 서비스·출시 완료로 표시하지 않는다.
+
+## 이전 검증 — 2026-09-23 실제 PostgreSQL 137개 통과, Replit 결합 검사 준비
 
 사용자의 점검 후 다음 단계 요청에 따라 `check-publication-integration.mjs`를 추가했다. 기존 개발 runtime binding/역할/이력과 정리 권한을 읽기 전용으로 확인하고, 새 UUID 합성 가이드 한 개와 진단 prefix의 네 객체로 기존 게시·철회·PNG 검사 경로를 실제 PostgreSQL에 연결한다. 세부 범위와 실행 인수는 `PUBLICATION_INTEGRATION_CHECK.md`.
 
