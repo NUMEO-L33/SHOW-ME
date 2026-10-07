@@ -2,7 +2,29 @@
 
 원래 개발 MD의 목표·완료 조건은 변경하지 않았다. 기존 소유자/공개 HTTP와 게시 실행기에 화면을 연결했다. 기본 서버 bootstrap은 여전히 실행기를 주입하지 않으며, **Replit 운영 공개 기능을 켜거나 배포한 것이 아니다.**
 
-## 최신 재검증 — 2026-10-07 개발환경 반영 준비
+## 최신 구현 — 2026-10-07 링크 공유 미리보기 (로컬 검증 완료)
+
+- `/g/:slug`를 API의 읽기 전용 HTML 경로로 연결했다. 자바스크립트 실행 전 최초 응답에 현재 공개 스냅샷의 제목, 첫 단계 설명, 처리된 첫 단계 썸네일의 OG/Twitter 태그를 넣는다. 비공개 제작 의도·초안·원본/객체 key·편집 키는 넣지 않는다. 일반 수신자도 같은 HTML에서 기존 React 뷰어를 사용한다.
+- 대표 이미지는 기존 버전별 `/api/public/guides/.../assets/.../step-1/thumbnail`이다. 버킷을 공개하거나 새 이미지 파일·서명 URL·원본 영상 경로를 만들지 않는다. 기존 이미지 접근/해시 검증을 그대로 사용한다.
+- HTML 읽기 전과 후에 공개 권한을 확인한다. 그 사이 철회/만료/재게시가 있으면 이전 정보를 내보내지 않는다. `no-store`, `no-referrer`, `noindex/nofollow/noarchive`, ETag/304 미사용, 문자열 escape, 크기/시간/동시성 상한, 일반 오류 HTML을 적용했다. 비공개 편집은 게시 미리보기를 바꾸지 않는다.
+- **운영 준비 설정:** `SHOWME_PUBLIC_ORIGIN=https://실제-공유-도메인`을 명시해야 한다. 경로·쿼리·인증정보는 허용하지 않으며 HTTP는 비운영 loopback 시험만 허용한다. Host/forwarded 헤더나 CORS에서 추정하지 않는다. 미설정 시 활성 게시가 있더라도 HTML은 503이고 정보를 내보내지 않는다. 이번에 `.env`/Replit Secrets를 변경하지 않았다.
+- 개발 Vite와 preview는 `/g`를 API 8080으로 프록시한다. 개발 API는 고정된 `http://127.0.0.1:20116/`의 Vite 셸만 읽으며 방문자 URL/쿠키/헤더/영상을 전달하거나 redirect를 따라가지 않는다. production/test는 빌드된 `artifacts/showme/dist/public/index.html`을 로컬 파일로 읽는다. 서비스 manifest에 API `/g`를 추가했고 프런트 정적 자산은 기존 웹 서비스에서 제공한다. **배포 전 프런트 빌드 파일의 API 실행환경 포함과 실제 `/g` 라우팅을 확인해야 한다.** 현재 Replit에 적용한 결과가 아니다.
+- 카카오 스크랩은 OG 정보를 사용하며 캐시가 남을 수 있다. 게시 확인에 “제목·첫 단계 설명·처리 이미지가 메신저 미리보기에 표시될 수 있고, 공유 중지 시 즉시 지워지지 않을 수 있음”을 추가했다. 참고: [Open Graph 공식 규격](https://ogp.me/), [카카오 메시지 템플릿](https://developers.kakao.com/docs/ko/message-template/common), [카카오 캐시 FAQ](https://developers.kakao.com/docs/ko/message-template/faq). 실제 링크를 외부 스크랩 도구나 메신저에 제출하지 않았다.
+- 새 회귀 15개 포함, 집중 **31/31**, 일반 전체 **1,096/1,096**(이관 101 / API 870 / 화면 125), 실패·취소·생략 0, 종료 코드 0. API/화면 제품·테스트 TypeScript 각각 통과, 두 production 빌드 통과. 화면 601.70 kB 청크 및 기존 sourcemap 경고는 유지된다. 실제 PostgreSQL/원격 Storage는 이번에 검사하지 않았다.
+- 최초 제한된 실행은 Windows 임시 파일 rename EPERM으로 검사 준비에서 실패했다. 권한 있는 실행에서 진행했다. 빈 `?`를 시험 클라이언트가 제거하여 발생한 테스트 기대 오류는 실제 전송되는 `?key=` 사례로 바꿨고, 새 fetch mock의 명시적 타입도 보완한 뒤 재검증했다. 이 실패들을 제품 수정 전 회귀 재현 성공으로 계산하지 않는다.
+- 컴퓨터 사용 스킬로 loopback 일회용 합성 fixture의 게시 확인 문구, 새 HTML 경로의 뷰어/처리 이미지, 다음 단계, 공유 중지 후 재접근 차단을 확인했다. 별도 HTTP로 JS 없는 최초 HTML의 제목·설명·canonical·처리 PNG·실제 JS 번들·no-store **PASS**, 철회 후 **404 / no-metadata / no-store PASS**다. 증빙: `screenshots/share-preview-consent-20261007.jpg`(Git 제외, 합성 자료). 시험 탭 2개를 닫고 fixture 전용 종료 경로로 `PUBLICATION_UI_FIXTURE_REMOVED`와 종료 코드 0을 확인했다.
+- 원래 개발 MD의 목표/완료 기준은 변경하지 않았다. 공개 실행기는 OFF 유지, 변경은 로컬 미커밋·미푸시이며 Replit 반영/재시작/운영 Publish·권한/키·외부 AI·개인 영상 사용은 없다. 다음은 **검증본의 개발환경 반영과 명시적 공유 origin/라우팅 확인**, 이후 승인된 공개 활성화 및 실제 수신자·휴대폰·카카오톡 검증이다. 저장소 기술 조건(#561126)도 별도로 남는다.
+
+## 이전 반영 — 2026-10-07 Replit 개발환경 검증 완료
+
+- 사용자 재개 요청 후 같은 SHOW-ME 탭에서 결제 안내가 더 이상 표시되지 않아 프로젝트에 접근했다. 결제 수단·플랜·자동 충전은 조작하지 않았고 안내가 해소된 원인은 확인하지 않았다.
+- `/home/runner/workspace`, `codex/replit-migration-hardening`, 기존 HEAD `67917a3`, 미커밋 변경 없음, post-merge hook 없음, 기존 GitHub 원격 저장소를 확인했다. 원격 URL은 `.git` 접미사 없는 동일 저장소였다. 가져온 커밋을 정확히 대조한 뒤 **`fef525b`**로 fast-forward했고 깨끗한 작업본을 확인했다. 강제 덮어쓰기·의존성 설치·API 변경은 없다.
+- Replit에서 클라이언트 **125/125**, 실패·취소·생략 0과 제품/테스트 타입 검사 각각 종료 코드 0을 확인했다. 첫 검증 묶음은 테스트 환경으로 빌드했으므로 최종 배포용 결과와 구분한다. 이어 앱 환경/비밀값을 제외하고 `NODE_ENV=production`, `PORT=20116`, `BASE_PATH=/`를 명시해 빌드를 다시 실행하여 종료 코드 0, JS 601.42 kB를 확인했다. 기존 sourcemap·청크 크기 경고는 남는다.
+- `SHOWME_UI_ROLLOUT_READY`: API health **200 / ok**, 실행 중인 Vite의 페이지/탐색 모듈 GET 각각 **200**, `pageUsesFix:true`, `helperHasGuards:true`, 정확한 HEAD, `clean:true`. Preview 새로고침 후 초기 화면·외부 AI/공개 공유 비활성 안내도 확인했다.
+- 기존 API/웹 workflow를 재시작하지 않았다. 공개 실행기·운영 Publish·외부 AI·개인 영상·DB/Storage 데이터·키/환경/권한/과금 설정을 변경하거나 사용하지 않았다. 원래 개발 계획 목표와 완료 조건은 유지했다. 이번 결과는 **화면 보완의 개발환경 반영 완료**이며 실제 공개 활성화·모바일/수신자/카카오톡 검증 완료가 아니다.
+- 증빙: `screenshots/replit-ui-rollout-ready-20261007.jpg`(Git 제외). API 전체/실제 DB/합성 공개 가이드 브라우저 동작은 이번에 재검사하지 않았다. 다음은 별도 범위의 공유 미리보기 구현이며 저장소 기술 답변(#561126)은 계속 대기한다.
+
+## 이전 재검증 — 2026-10-07 개발환경 반영 준비
 
 - 사용자가 검증된 화면 수정의 Replit 개발환경 반영을 요청했다. 대상은 아래 확대/방향키 보완과 회귀 검사이며 API·DB·공개 활성화 코드는 바꾸지 않았다.
 - 클라이언트 **125/125**를 다시 실행해 실패·취소·생략 0, 종료 코드 0을 확인했다. 제품/테스트 TypeScript 검사와 production 빌드도 종료 코드 0이다. 기존 sourcemap 경고와 601.42 kB JS 청크 경고는 남는다.

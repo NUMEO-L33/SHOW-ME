@@ -15,8 +15,10 @@ import { createProcessorApp } from "../src/processor/server.js";
 import { loadConfig } from "../src/processor/config.js";
 import { createPublicationRouter, type PublicationAdmission } from "../src/processor/publication-api.js";
 import { createPublicPublicationRouter } from "../src/processor/publication-public-api.js";
+import { createPublicationPageRouter, renderPublicationPage } from "../src/processor/publication-page.js";
 
 const deferred = <T>() => { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; };
+const pageShell = async () => '<!doctype html><html><head><!-- showme:metadata:start --><title>generic</title><!-- showme:metadata:end --></head><body><div id="root"></div><script type="module" src="/assets/app.js"></script></body></html>';
 async function fixture(t: TestContext) {
   const token = randomBytes(32).toString("base64url"), h = await createAnalysisHarness(t, 1, { guideId: randomUUID(), editToken: token });
   await h.repository.replaceSteps(h.guideId, h.guide.steps.map((s, index) => ({ ...s, id: `${h.guideId}-private-step-${index}`,
@@ -26,8 +28,8 @@ async function fixture(t: TestContext) {
   const admission: PublicationAdmission = { isAccepting: () => enabled, async request(id, command, signal) {
     calls++; signal.throwIfAborted(); return h.repository.executePublicationCommand(id, command);
   } };
-  const config = loadConfig({ NODE_ENV: "test", DATA_DIR: h.root, SHOWME_STORAGE: "local" });
-  const app = (withAdmission = false) => createProcessorApp({ config, repository: h.repository, storage: f.storage,
+  const config = loadConfig({ NODE_ENV: "test", DATA_DIR: h.root, SHOWME_STORAGE: "local", SHOWME_PUBLIC_ORIGIN: "https://showme.example" });
+  const app = (withAdmission = false, publicPageShell = pageShell) => createProcessorApp({ config, repository: h.repository, storage: f.storage, publicPageShell,
     ...(withAdmission ? { publicationAdmission: admission } : {}),
     pipeline: { async process() { assert.fail("no media processing"); }, async processClaimed() { assert.fail("no media processing"); } } });
   const body = { publicationId: f.job.id, baseDraftRevision: f.request.revision, inputFingerprint: f.request.inputFingerprint,
@@ -257,4 +259,130 @@ test("HTTP throttling is separate for mutation and lookup and makes no excess ad
   for (let i = 0; i < 20; i++) await post().expect(202);
   await post().expect(429).expect("Cache-Control", "no-store");
   await request(app).get(`${h.url}/publications`).set("Authorization", h.auth).expect(200); assert.equal(h.calls(), 0);
+});
+
+test("share HTML contains escaped metadata from the same public snapshot, not private draft or request authority", async t => {
+  const h = await fixture(t), p = await h.publish(), app = h.app();
+  const before = await readFile(h.repository.filePath);
+  const view = await request(app).get(`/api/public/guides/${p.head.publicSlug}`).expect(200);
+  const response = await request(app).get(`/g/${p.head.publicSlug}`).set("Host", "attacker.invalid")
+    .set("X-Forwarded-Host", "attacker.invalid").set("X-Forwarded-Proto", "http").set("If-None-Match", "*")
+    .expect(200).expect("Content-Type", /text\/html/).expect("Cache-Control", "no-store")
+    .expect("Referrer-Policy", "no-referrer").expect("X-Robots-Tag", /noindex/);
+  assert.equal(response.headers.etag, undefined);
+  assert.match(response.text, /<meta property="og:title"/);
+  assert.ok(response.text.includes(`https://showme.example/g/${p.head.publicSlug}`));
+  assert.ok(response.text.includes(`https://showme.example${view.body.guide.steps[0].thumbnailUrl}`));
+  assert.match(response.text, /<script type="module" src="\/assets\/app.js"/);
+  for (const secret of [h.guideId, h.token, h.guide.originalObjectKey, h.guide.sourceFilename, h.job.batchId,
+    "attacker.invalid", "sourceKey", "inputFingerprint", "reviewFingerprint", "leaseId", "og:video", "generic"])
+    assert.ok(!response.text.includes(secret), secret);
+  assert.deepEqual(await readFile(h.repository.filePath), before);
+  await request(app).head(`/g/${p.head.publicSlug}`).expect(200).expect("Cache-Control", "no-store");
+});
+
+test("share HTML refuses private IDs, malformed slugs and all query strings before reading a shell", async t => {
+  const h = await fixture(t), p = await h.publish(); let reads = 0;
+  const app = h.app(false, async () => { reads++; return pageShell(); });
+  for (const path of [h.guideId, h.guide.slug, "short", "A".repeat(32), `${p.head.publicSlug}?editToken=${h.token}`, `${p.head.publicSlug}?key=`]) {
+    const response = await request(app).get(`/g/${path}`).expect(404).expect("Content-Type", /text\/html/);
+    assert.ok(!response.text.includes("og:image")); assert.ok(!response.text.includes(h.token));
+  }
+  assert.equal(reads, 0);
+});
+
+test("share HTML and its versioned image disappear on withdrawal and at exact expiry", async t => {
+  const h = await fixture(t), p = await h.publish(), app = h.app(), url = `/g/${p.head.publicSlug}`;
+  const response = await request(app).get(url).expect(200);
+  const image = new URL(/property="og:image" content="([^"]+)"/.exec(response.text)![1]).pathname;
+  await request(app).get(image).expect(200);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse(p.head.expiresAt) });
+  const expired = await request(app).get(url).expect(404);
+  assert.ok(!expired.text.includes("og:image")); await request(app).head(url).expect(404);
+  await request(app).get(image).expect(404);
+  t.mock.timers.reset();
+  await h.repository.stopPublication(h.guideId, { type: "withdraw", expectedHeadVersion: 1, expectedJobId: null });
+  await request(app).get(url).set("If-Modified-Since", new Date().toUTCString()).expect(404);
+});
+
+test("withdrawal while loading HTML cannot send stale metadata", async t => {
+  const h = await fixture(t), p = await h.publish();
+  const app = h.app(false, async () => {
+    await h.repository.stopPublication(h.guideId, { type: "withdraw", expectedHeadVersion: 1, expectedJobId: null });
+    return pageShell();
+  });
+  const response = await request(app).get(`/g/${p.head.publicSlug}`).expect(404);
+  assert.ok(!response.text.includes("og:image")); assert.ok(!response.text.includes(p.publication.id));
+});
+
+test("republish replaces preview image identity while retaining the canonical link", async t => {
+  const h = await fixture(t), first = await h.publish(), app = h.app(true), url = `/g/${first.head.publicSlug}`;
+  const before = await request(app).get(url).expect(200), id = randomUUID();
+  await request(app).post(`${h.url}/publish`).set("Authorization", h.auth).send({ ...h.body, publicationId: id }).expect(202);
+  const second = await h.publish((await h.repository.getPublicationJob(h.guideId, id))!);
+  const after = await request(app).get(url).expect(200);
+  assert.ok(before.text.includes(first.publication.id)); assert.ok(!after.text.includes(first.publication.id));
+  assert.ok(after.text.includes(second.publication.id)); assert.ok(after.text.includes(`https://showme.example${url}`));
+});
+
+test("unavailable shell and repository return generic HTML, never raw errors or private fallback", async t => {
+  const h = await fixture(t), p = await h.publish(), url = `/g/${p.head.publicSlug}`;
+  for (const shell of [async () => { throw new Error(h.token); }, async () => "no markers"] ) {
+    const response = await request(h.app(false, shell)).get(url).expect(503).expect("Content-Type", /text\/html/);
+    assert.ok(!response.text.includes(h.token)); assert.ok(!response.text.includes("og:image"));
+  }
+  t.mock.method(h.repository, "getAccessiblePublication", async () => { throw new Error(h.token); });
+  const response = await request(h.app()).get(url).expect(503);
+  assert.ok(!response.text.includes(h.token));
+});
+
+test("metadata escapes HTML and never duplicates generic tags or interprets replacement tokens", async t => {
+  const h = await fixture(t), p = await h.publish();
+  const hostile = '</title><script>alert("x")</script> & \' $&';
+  const publication = structuredClone(p.publication);
+  publication.content.title = hostile;
+  publication.content.steps[0].instruction = '<img src=x onerror="x">\n설명';
+  publication.content.steps[0].shortLabel = '\" onload=\"x';
+  const html = renderPublicationPage(await pageShell(), { head: p.head, publication }, "https://showme.example");
+  assert.ok(!html.includes(hostile)); assert.ok(!html.includes('<img src=x'));
+  assert.match(html, /&lt;\/title&gt;&lt;script&gt;alert\(&quot;x&quot;\)/);
+  assert.match(html, /&amp; &#39; \$&/);
+  assert.equal((html.match(/<title>/g) ?? []).length, 1);
+  assert.equal((html.match(/property="og:title"/g) ?? []).length, 1);
+  for (const bad of [(await pageShell()).repeat(2), "x".repeat(65537), '<!-- showme:metadata:end --><!-- showme:metadata:start -->'])
+    assert.throws(() => renderPublicationPage(bad, p, "https://showme.example"));
+});
+
+test("unsaved private edits cannot change share title or description", async t => {
+  const h = await fixture(t), p = await h.publish(), app = h.app(), url = `/g/${p.head.publicSlug}`;
+  const before = await request(app).get(url).expect(200);
+  const document = structuredClone(h.state.draft!.document); document.title = "PRIVATE_TITLE_NOT_PUBLISHED";
+  document.steps[0].instruction = "PRIVATE_INSTRUCTION_NOT_PUBLISHED";
+  document.privacy = privacyAfterEdit(h.state.draft!.document, document);
+  await h.repository.executeAnalysisCommand(h.guideId, { type: "save-editor-draft", expectedRevision: h.state.draft!.revision,
+    expectedInputFingerprint: h.manifest.fingerprint, document });
+  const after = await request(app).get(url).expect(200);
+  assert.equal(after.text, before.text); assert.ok(!after.text.includes("NOT_PUBLISHED"));
+});
+
+test("unconfigured origin serves no guide metadata and never loads a shell", async t => {
+  const h = await fixture(t), p = await h.publish(), app = express();
+  app.use("/g", createPublicationPageRouter({ repository: h.repository, loadShell: async () => { assert.fail("no shell read"); } }));
+  const response = await request(app).get(`/g/${p.head.publicSlug}`).expect(503);
+  assert.ok(!response.text.includes("og:title"));
+});
+
+test("slow HTML requests retain their concurrency slots until I/O settles and do not send late metadata", async t => {
+  const h = await fixture(t), p = await h.publish(), app = express(), gate = deferred<void>(), opened = deferred<void>();
+  let reads = 0; const signals: AbortSignal[] = [];
+  t.after(() => gate.resolve()); t.mock.timers.enable({ apis: ["setTimeout"] });
+  app.use("/g", createPublicationPageRouter({ repository: h.repository, origin: "https://showme.example", timeoutMs: 30,
+    loadShell: async signal => { signals.push(signal); if (++reads === 8) opened.resolve(); await gate.promise; return pageShell(); } }));
+  const url = `/g/${p.head.publicSlug}`;
+  const pending = Array.from({ length: 8 }, () => request(app).get(url).expect(503).then(r => r));
+  await opened.promise; t.mock.timers.tick(31);
+  const failed = await Promise.all(pending); assert.ok(failed.every(r => !r.text.includes("og:image")));
+  await request(app).get(url).expect(503); assert.equal(reads, 8); assert.ok(signals.every(s => s.aborted));
+  gate.resolve(); t.mock.timers.reset(); await delay(20);
+  await request(app).get(url).expect(200);
 });

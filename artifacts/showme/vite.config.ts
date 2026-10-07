@@ -56,6 +56,7 @@ server: {
   allowedHosts: true,
   proxy: {
     '/api': 'http://127.0.0.1:8080',
+    '/g': 'http://127.0.0.1:8080',
   },
   fs: {
     strict: true,
@@ -65,5 +66,9 @@ server: {
     port,
     host: '0.0.0.0',
     allowedHosts: true,
+    proxy: {
+      '/api': 'http://127.0.0.1:8080',
+      '/g': 'http://127.0.0.1:8080',
+    },
   },
   });

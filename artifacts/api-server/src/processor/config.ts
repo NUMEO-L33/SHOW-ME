@@ -1,5 +1,6 @@
 import path from "node:path";
 import { createRequire } from "node:module";
+import { publicPageOrigin } from "./public-origin.js";
 
 const require = createRequire(import.meta.url);
 
@@ -30,6 +31,7 @@ export type ProcessorConfig = Readonly<{
   isReplitRuntime: boolean;
   port: number;
   corsOrigins: readonly string[];
+  publicOrigin?: string;
   dataDir: string;
   ffmpegPath: string;
   ffprobePath: string;
@@ -295,6 +297,9 @@ export function loadConfig(env: Environment = process.env): ProcessorConfig {
   const resolvedStorageDriver = storageDriver(env, issues);
   const resolvedCorsOrigins = corsOrigins(env, issues);
   const resolvedDatabaseUrl = databaseUrl(env, issues);
+  let publicOrigin: string | undefined;
+  try { publicOrigin = publicPageOrigin(optionalString(env, "SHOWME_PUBLIC_ORIGIN"), resolvedNodeEnv !== "production" && !isReplitDeployment); }
+  catch { issues.push("SHOWME_PUBLIC_ORIGIN must be an HTTPS origin without credentials, path, query or fragment; non-production HTTP loopback is allowed."); }
   const migrationMode = optionalString(env, "SHOWME_DATABASE_MIGRATIONS") ?? "automatic";
   if (migrationMode !== "automatic" && migrationMode !== "verify-only") issues.push("SHOWME_DATABASE_MIGRATIONS must be automatic or verify-only.");
   if (migrationMode === "verify-only" && !resolvedDatabaseUrl) issues.push("SHOWME_DATABASE_MIGRATIONS=verify-only requires PostgreSQL.");
@@ -379,6 +384,7 @@ export function loadConfig(env: Environment = process.env): ProcessorConfig {
     isReplitRuntime,
     port: integerSetting(env, "PORT", 8788, 1, 65_535, issues),
     corsOrigins: resolvedCorsOrigins,
+    publicOrigin,
     dataDir: path.resolve(optionalString(env, "DATA_DIR") ?? "./processor/.data"),
     ffmpegPath: mediaExecutableSetting(
       env,

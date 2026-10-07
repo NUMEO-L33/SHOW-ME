@@ -72,6 +72,7 @@ export function PublicationWorkflow({ identity, base, blocked }: { identity: Dra
       </section>}
       <section className="space-y-3 border-t pt-4" aria-label="새 게시 확인">
         <p className="text-sm leading-6">편집은 비공개 초안에만 저장돼요. 다시 게시해야 공유 내용이 바뀝니다. 공유는 첫 게시부터 15일이며 다시 게시해도 연장되지 않아요.</p>
+        <p className="text-sm leading-6">공유 링크의 제목·첫 단계 설명·처리 이미지는 메신저 미리보기에도 표시될 수 있어요. 공유를 중지해도 메신저에 저장된 미리보기는 즉시 지워지지 않을 수 있어요.</p>
         {blocked || !base?.persisted ? <p className="text-sm">최신 초안의 저장 완료를 먼저 확인해 주세요. 편집할 수 없는 작업도 기존 공유는 중지할 수 있어요.</p>
           : reviewError ? <p role="alert" className="text-sm text-red-700">{reviewError}</p>
           : !currentReview ? <p className="text-sm">개인정보 확인 상태를 읽고 있어요.</p>

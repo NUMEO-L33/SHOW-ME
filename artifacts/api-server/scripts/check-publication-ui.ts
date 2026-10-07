@@ -39,12 +39,13 @@ app.get("/__synthetic_editor", (_req, res) => {
     sessionStorage.setItem('showme:active-processing-guide-id',job.guideId);location.replace('/');</script>`);
 });
 app.use(express.static(resolve("../showme/dist/public"), { index: false, setHeaders(res) { res.setHeader("Cache-Control", "no-store"); } }));
-app.get(["/", "/g/:slug"], (_req, res) => res.set("Cache-Control", "no-store").sendFile(resolve("../showme/dist/public/index.html")));
-app.use(createProcessorApp({ ...context, publicationAdmission: runtime.admission,
-  pipeline: { async process() { throw new Error("NO_MEDIA_UPLOAD"); }, async processClaimed() { throw new Error("NO_MEDIA_UPLOAD"); } } }));
+app.get("/", (_req, res) => res.set("Cache-Control", "no-store").sendFile(resolve("../showme/dist/public/index.html")));
 const server = app.listen(0, "127.0.0.1", () => {
   const address = server.address(); if (!address || typeof address === "string") throw new Error("NO_LOOPBACK");
   config.corsOrigins = [`http://127.0.0.1:${address.port}`];
+  config.publicOrigin = config.corsOrigins[0];
+  app.use(createProcessorApp({ ...context, publicationAdmission: runtime.admission,
+    pipeline: { async process() { throw new Error("NO_MEDIA_UPLOAD"); }, async processClaimed() { throw new Error("NO_MEDIA_UPLOAD"); } } }));
   runtime.start(); console.log(`PUBLICATION_UI_FIXTURE http://127.0.0.1:${address.port}/__synthetic_editor`);
   console.log(`PUBLICATION_UI_TEMP ${h.root}`);
 });

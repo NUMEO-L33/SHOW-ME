@@ -18,6 +18,8 @@ import { createDraftRouter } from "./draft-api.js";
 import { createPrivacyPreviewRouter } from "./privacy-preview-api.js";
 import { createPublicationRouter, type PublicationAdmission } from "./publication-api.js";
 import { createPublicPublicationRouter } from "./publication-public-api.js";
+import { createPublicationPageRouter } from "./publication-page.js";
+import { createPublicPageShell } from "./publication-page-shell.js";
 import { DurableAnalysisAdmission } from "./analysis-admission.js";
 import {
   cleanupStorageKeys,
@@ -71,6 +73,7 @@ export type ProcessorAppDependencies = {
   analysisAdmission?: AnalysisAdmission;
   /** Supplied only by a running publication executor; default rejects new publications. */
   publicationAdmission?: PublicationAdmission;
+  publicPageShell?: (signal: AbortSignal) => Promise<string>;
 };
 
 function cleanFilename(filename: string) {
@@ -361,6 +364,7 @@ export function createProcessorApp({
   readiness = { ready: true },
   analysisAdmission,
   publicationAdmission,
+  publicPageShell = createPublicPageShell(config.nodeEnv),
 }: ProcessorAppDependencies): Application {
   const app = express();
   const assetTicketSecret = config.assetTicketSecret
@@ -438,6 +442,7 @@ export function createProcessorApp({
   app.use("/api/guides/:guideId", createPublicationRouter({ repository, admission: publicationAdmission,
     authenticate: (request) => requireGuideAccess(request, repository) }));
   app.use("/api/public/guides", createPublicPublicationRouter({ repository, storage }));
+  app.use("/g", createPublicationPageRouter({ repository, origin: config.publicOrigin, loadShell: publicPageShell }));
 
   app.use("/api/guides/:guideId/privacy-preview", createPrivacyPreviewRouter({
     repository, storage, ffmpegPath: config.ffmpegPath,
