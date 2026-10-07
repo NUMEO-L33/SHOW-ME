@@ -3,6 +3,7 @@ import { useParams } from "wouter";
 import { Button } from "@/components/ui/button";
 import { configuredProcessorUrl } from "@/lib/processor-client";
 import { getPublicGuide, getPublicFrame, publicGuideFailure, type PublicGuideSnapshot } from "@/lib/public-guide-client";
+import { publicGuideKeyboardStep } from "@/lib/public-guide-navigation";
 
 /** Live public route never reads the private editor, localStorage or bundled sample. */
 export default function PublicGuidePage() {
@@ -67,9 +68,10 @@ export function PublishedViewer({ slug }: { slug: string }) {
   };
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (event.altKey || event.ctrlKey || event.metaKey || (event.target as HTMLElement)?.closest("input,textarea,button,a")) return;
-      if (event.key === "ArrowLeft") { event.preventDefault(); go(index - 1); }
-      if (event.key === "ArrowRight") { event.preventDefault(); go(index + 1); }
+      const next = publicGuideKeyboardStep(event, { index, stepCount: guide?.steps.length ?? 0,
+        zoomed: zoom, ready: !!shown, complete,
+        interactiveTarget: event.target instanceof Element && !!event.target.closest("input,textarea,button,a,select,[contenteditable],[role='slider'],[role='combobox'],[role='textbox']") });
+      if (next !== null) { event.preventDefault(); go(next); }
     };
     window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
   });
@@ -90,6 +92,7 @@ export function PublishedViewer({ slug }: { slug: string }) {
             : <p role="status" className="p-8 text-center text-white">공유 이미지 확인 중…</p>}
         </div>
         <Button variant="outline" className="min-h-11" aria-pressed={zoom} disabled={!shown} onClick={() => setZoom(v => !v)}>{zoom ? "전체 보기" : "누를 위치 중심 확대"}</Button>
+        {zoom && <p className="text-sm leading-6 text-muted-foreground">이미지에 초점을 두고 방향키로 움직일 수 있어요. 단계 이동은 아래 이전·다음 버튼을 눌러 주세요.</p>}
         <nav aria-label="안내 단계 이동" className="grid grid-cols-2 gap-3"><Button variant="outline" className="min-h-14 text-lg" disabled={index === 0 || checking} onClick={() => go(index - 1)}>이전</Button><Button className="min-h-14 text-lg" disabled={!shown} onClick={() => index === guide.steps.length - 1 ? setComplete(true) : go(index + 1)}>{index === guide.steps.length - 1 ? "다 했어요" : "다음"}</Button></nav>
       </>}
       <p className="text-sm leading-6 text-muted-foreground">게시자가 확인한 문구와 처리 이미지만 표시합니다. 원본 영상은 제공하지 않습니다.</p>
